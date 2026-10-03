@@ -290,11 +290,11 @@ impl LiveThread {
                 })?;
                 // The lease is checked while holding its row, so a takeover cannot slip in between
                 // this check and the commit that follows it.
-                if let Some((owner_id, token)) = fence {
+                if let Some((owner_id, token)) = fence.as_ref() {
                     let held: Option<i32> = sqlx::query_scalar(
                         "SELECT 1 FROM thread_writer_ownership \
                      WHERE thread_id = $1::uuid AND owner_id = $2::uuid AND token = $3 \
-                       AND lease_until > clock_timestamp() FOR SHARE",
+                       FOR SHARE",
                     )
                     .bind(thread_id.to_string())
                     .bind(owner_id)
@@ -312,6 +312,23 @@ impl LiveThread {
                     .map_err(|error| ThreadStoreError::Internal {
                         message: format!("failed to read thread metadata: {error}"),
                     })?;
+                // Both row waits can outlast an unchanged lease. Check the server clock only
+                // after those waits; the held ownership row excludes takeover until commit.
+                if let Some((owner_id, token)) = fence.as_ref() {
+                    let unexpired: Option<bool> = sqlx::query_scalar(
+                        "SELECT lease_until > clock_timestamp() FROM thread_writer_ownership \
+                         WHERE thread_id = $1::uuid AND owner_id = $2::uuid AND token = $3",
+                    )
+                    .bind(thread_id.to_string())
+                    .bind(owner_id)
+                    .bind(token)
+                    .fetch_optional(admitted.connection())
+                    .await
+                    .map_err(database)?;
+                    if unexpired != Some(true) {
+                        return Err(ownership_lost(thread_id));
+                    }
+                }
                 let mut metadata = match existing {
                     Some(metadata) => metadata,
                     None => {
