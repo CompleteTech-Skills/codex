@@ -52,7 +52,8 @@ async fn selected_outcomes(
     );
     original.bind_current_activation().await?;
     independent.bind_current_activation().await?;
-    for commit in [true, false] {
+    for (commit, abort_before_commit) in [(true, false), (false, false), (true, true)] {
+        let expected_commit = commit && !abort_before_commit;
         let id = format!(
             "{:032x}",
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
@@ -77,17 +78,36 @@ async fn selected_outcomes(
                 .bind(&id)
                 .execute(transaction.connection())
                 .await?;
-            if commit {
-                transaction.commit().await?;
+            let original_abort = if abort_before_commit {
+                sqlx::query("SELECT 1/0")
+                    .execute(transaction.connection())
+                    .await
+                    .err()
+            } else {
+                None
+            };
+            let original_commit = if commit {
+                let result = transaction.commit().await;
+                if !abort_before_commit {
+                    result?;
+                    None
+                } else {
+                    result.err()
+                }
             } else {
                 transaction.rollback().await?;
-            }
+                None
+            };
             let status = session.observe_original_transaction().await?;
             let correct_status = matches!(
-                (commit, status),
+                (expected_commit, status),
                 (true, OriginalTransactionOutcome::Committed)
                     | (false, OriginalTransactionOutcome::Aborted)
             );
+            let actual_ack = session.original_acknowledgment();
+            let ack_matches = actual_ack
+                .as_ref()
+                .is_some_and(|ack| ack.committed() == expected_commit);
             let mut read = independent.begin_selected_write().await?;
             let read_pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
                 .fetch_one(read.connection())
@@ -96,7 +116,14 @@ async fn selected_outcomes(
                 "SELECT token,owner_id::text,lease_until::text FROM thread_writer_ownership WHERE thread_id=$1::uuid")
                 .bind(&id).fetch_optional(read.connection()).await?;
             read.rollback().await?;
-            Ok::<_, Box<dyn Error + Send + Sync>>((original_pid, read_pid, correct_status, actual))
+            Ok::<_, Box<dyn Error + Send + Sync>>((
+                original_pid,
+                read_pid,
+                correct_status && ack_matches,
+                actual,
+                original_abort,
+                original_commit,
+            ))
         });
         let (result, late) = match tokio::time::timeout(Duration::from_secs(15), &mut body).await {
             Ok(result) => (result, false),
@@ -104,7 +131,8 @@ async fn selected_outcomes(
             Err(_) => ((&mut body).await, true),
         };
         drop(body);
-        let (original_pid, read_pid, status, actual) = match result {
+        let (original_pid, read_pid, status, actual, original_abort, original_commit) = match result
+        {
             Ok(result) => result,
             Err(error) => {
                 // Keep original session, pools, ID and original cause in this same host.
@@ -143,8 +171,9 @@ async fn selected_outcomes(
             .fetch_one(returned.connection())
             .await?;
         returned.rollback().await?;
-        let expected = commit.then_some((7, None, None));
-        if late
+        let expected = expected_commit.then_some((7, None, None));
+        if (abort_before_commit && (original_abort.is_none() || original_commit.is_none()))
+            || late
             || cleanup_late
             || !status
             || actual != expected
