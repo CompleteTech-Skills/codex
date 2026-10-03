@@ -1,4 +1,5 @@
 //! Original physical session ownership stays outside the mutation task future.
+use codex_postgres_runtime::OriginalTransactionOutcome;
 use codex_postgres_runtime::PostgresPool;
 use codex_postgres_runtime::RetainedWriteSession;
 use codex_thread_store::ThreadStoreError;
@@ -95,6 +96,55 @@ impl OriginalSessionOwner {
             _owner: Arc::clone(self),
             _permit: permit,
         })
+    }
+}
+pub(crate) enum OriginalRecoveryError {
+    Owner(ThreadStoreError),
+    Database(sqlx::Error),
+}
+/// Constructed only by status observation on the existing original connection.
+pub(crate) struct ResolvedOriginalSession {
+    loan: SessionLoan,
+    outcome: OriginalTransactionOutcome,
+}
+impl ResolvedOriginalSession {
+    pub(crate) fn committed(&self) -> bool {
+        matches!(self.outcome, OriginalTransactionOutcome::Committed)
+    }
+    pub(crate) fn return_acknowledged(mut self) {
+        self.loan.return_acknowledged();
+    }
+}
+impl OriginalSessionOwner {
+    pub(crate) async fn reconcile(
+        self: &Arc<Self>,
+    ) -> Result<ResolvedOriginalSession, OriginalRecoveryError> {
+        let permit = Arc::clone(&self.gate).acquire_owned().await.map_err(|_| {
+            OriginalRecoveryError::Owner(refusal("original recovery admission closed"))
+        })?;
+        let original = self
+            .slot
+            .take()
+            .map_err(OriginalRecoveryError::Owner)?
+            .ok_or_else(|| {
+                OriginalRecoveryError::Owner(refusal("original recovery connection unavailable"))
+            })?;
+        // Reconciliation never reacquires or substitutes another pool connection.
+        let mut loan = SessionLoan {
+            original: OriginalLoan {
+                slot: Arc::clone(&self.slot),
+                original: Some(original),
+            },
+            _owner: Arc::clone(self),
+            _permit: permit,
+        };
+        let outcome = loan
+            .session()
+            .map_err(OriginalRecoveryError::Owner)?
+            .observe_original_transaction()
+            .await
+            .map_err(OriginalRecoveryError::Database)?;
+        Ok(ResolvedOriginalSession { loan, outcome })
     }
 }
 impl SessionLoan {

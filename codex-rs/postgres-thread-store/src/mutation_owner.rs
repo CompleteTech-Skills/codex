@@ -1,4 +1,5 @@
 //! Ownership of one original SQL mutation task. Inactive until the live writer wires it.
+use crate::session_owner::OriginalRecoveryError;
 use crate::session_owner::OriginalSessionOwner;
 use crate::session_owner::SessionLoanError;
 use codex_postgres_runtime::PostgresPool;
@@ -57,6 +58,8 @@ pub(crate) struct MutationOwner {
     terminal: Option<Result<MutationOutcome, JoinError>>,
     refusals: Vec<MutationRefusal>,
     original_session: Option<Arc<OriginalSessionOwner>>,
+    reconciled_history: Vec<Result<MutationOutcome, JoinError>>,
+    recovery_failures: Vec<OriginalRecoveryError>,
     #[cfg(test)]
     original_task_id: Option<tokio::task::Id>,
 }
@@ -92,12 +95,15 @@ impl MutationOwner {
             return Err(refusal("original mutation is still owned"));
         }
         // Reserve the next cause slot before native/SQL dispatch. No history eviction.
-        if self.refusals.len() >= 4 {
+        if self.refusals.len() + self.reconciled_history.len() >= 4 {
             return Err(refusal("original mutation refusal history is full"));
         }
         self.refusals
             .try_reserve(1)
             .map_err(|_| refusal("cannot retain original mutation refusal"))?;
+        self.reconciled_history
+            .try_reserve(1)
+            .map_err(|_| refusal("cannot retain original reconciliation cause"))?;
         let task = tokio::spawn(operation);
         #[cfg(test)]
         {
@@ -122,6 +128,8 @@ impl MutationOwner {
 
     pub(crate) fn has_original_failures(&self) -> bool {
         !self.refusals.is_empty()
+            || !self.reconciled_history.is_empty()
+            || !self.recovery_failures.is_empty()
             || matches!(
                 self.terminal,
                 Some(Ok(MutationOutcome::RolledBack(_)))
@@ -146,6 +154,54 @@ impl MutationOwner {
             // No await between actual join and caching its original result.
             self.terminal = Some(result);
             self.task = None;
+        }
+        let unresolved = matches!(
+            self.terminal,
+            Some(Ok(MutationOutcome::Uncertain { .. }))
+                | Some(Ok(MutationOutcome::AdmissionUncertain { .. }))
+                | Some(Ok(MutationOutcome::OwnerUncertain { .. }))
+                | Some(Err(_))
+        );
+        if unresolved {
+            if self.recovery_failures.len() >= 4 {
+                return Err(refusal("original recovery cause history is full"));
+            }
+            self.recovery_failures
+                .try_reserve(1)
+                .map_err(|_| refusal("cannot retain original recovery cause"))?;
+            let original = self
+                .original_session
+                .as_ref()
+                .ok_or_else(|| refusal("original recovery frame absent"))?;
+            match original.reconcile().await {
+                Ok(resolved) => {
+                    // Reservation preceded original SQL dispatch. Preserve original command,
+                    // protocol and JoinError causes before handing back the actual connection.
+                    let recovered = if resolved.committed() {
+                        MutationOutcome::Committed
+                    } else {
+                        MutationOutcome::RolledBack(MutationRefusal::Command(refusal(
+                            "original mutation transaction was aborted",
+                        )))
+                    };
+                    if let Some(original) = self.terminal.replace(Ok(recovered)) {
+                        self.reconciled_history.push(original);
+                    }
+                    resolved.return_acknowledged();
+                }
+                Err(error) => {
+                    match &error {
+                        OriginalRecoveryError::Owner(original) => {
+                            let _ = original;
+                        }
+                        OriginalRecoveryError::Database(original) => {
+                            let _ = original;
+                        }
+                    }
+                    self.recovery_failures.push(error);
+                    return Err(refusal("original mutation outcome remains uncertain"));
+                }
+            }
         }
         match self.terminal.as_ref() {
             Some(Ok(MutationOutcome::Committed)) => Ok(MutationTerminal::Committed),
