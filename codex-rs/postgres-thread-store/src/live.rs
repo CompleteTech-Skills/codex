@@ -385,21 +385,17 @@ impl LiveThread {
         let memory_mode = self.memory_mode;
         let history_mode = self.history_mode;
         let default_provider = default_model_provider_id.to_string();
-        let pool = Arc::clone(pool);
+        let original = self.mutation.original_session(pool)?;
         self.mutation.start(async move {
-            let mut original = match pool.acquire_retained_write().await {
-                Ok(original) => original,
-                Err(cause) => {
-                    return MutationOutcome::AcquisitionUncertain {
-                        original_pool: pool,
-                        cause,
-                    };
-                }
+            let mut loan = match original.loan().await {
+                Ok(loan) => loan,
+                Err(cause) => return MutationOutcome::OwnerUncertain { original, cause },
             };
             enum Completion {
                 Committed,
                 RolledBack(MutationRefusal),
                 Admission(RetainedWriteAdmissionError),
+                Owner(ThreadStoreError),
                 Uncertain {
                     command: Option<ThreadStoreError>,
                     database: sqlx::Error,
@@ -407,7 +403,11 @@ impl LiveThread {
             }
             // Result owns no borrow: the original connection remains outside the transaction.
             let completed = async {
-                let mut admitted = match original.begin().await {
+                let session = match loan.session() {
+                    Ok(session) => session,
+                    Err(error) => return Completion::Owner(error),
+                };
+                let mut admitted = match session.begin().await {
                     Ok(admitted) => admitted,
                     Err(cause) => return Completion::Admission(cause),
                 };
@@ -502,8 +502,18 @@ impl LiveThread {
             }
             .await;
             match completed {
-                Completion::Committed => MutationOutcome::Committed,
-                Completion::RolledBack(error) => MutationOutcome::RolledBack(error),
+                Completion::Committed => {
+                    loan.return_acknowledged();
+                    MutationOutcome::Committed
+                }
+                Completion::RolledBack(error) => {
+                    loan.return_acknowledged();
+                    MutationOutcome::RolledBack(error)
+                }
+                Completion::Owner(cause) => MutationOutcome::OwnerUncertain {
+                    original,
+                    cause: crate::session_owner::SessionLoanError::Owner(cause),
+                },
                 Completion::Uncertain { command, database } => MutationOutcome::Uncertain {
                     command,
                     database,
@@ -515,6 +525,7 @@ impl LiveThread {
                         RetainedWriteAdmissionError::Gate { rollback: None, .. }
                     ) {
                         // Actual original rollback succeeded; preserve the original typed gate cause too.
+                        loan.return_acknowledged();
                         MutationOutcome::RolledBack(MutationRefusal::Admission {
                             cause,
                             refusal: ThreadStoreError::Internal {

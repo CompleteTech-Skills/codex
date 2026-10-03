@@ -1,7 +1,8 @@
 //! Ownership of one original SQL mutation task. Inactive until the live writer wires it.
+use crate::session_owner::OriginalSessionOwner;
+use crate::session_owner::SessionLoanError;
 use codex_postgres_runtime::PostgresPool;
 use codex_postgres_runtime::RetainedWriteAdmissionError;
-use codex_postgres_runtime::RetainedWriteSession;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::ThreadStoreResult;
 use std::future::Future;
@@ -11,12 +12,12 @@ use tokio::task::JoinHandle;
 
 pub(crate) enum MutationOutcome {
     Committed,
-    AcquisitionUncertain {
-        original_pool: Arc<PostgresPool>,
-        cause: codex_postgres_runtime::PoolError,
+    OwnerUncertain {
+        original: Arc<OriginalSessionOwner>,
+        cause: SessionLoanError,
     },
     AdmissionUncertain {
-        original: RetainedWriteSession,
+        original: Arc<OriginalSessionOwner>,
         cause: RetainedWriteAdmissionError,
     },
     /// The original command refused, and the original transaction acknowledged rollback.
@@ -25,7 +26,7 @@ pub(crate) enum MutationOutcome {
     Uncertain {
         command: Option<ThreadStoreError>,
         database: sqlx::Error,
-        original: RetainedWriteSession,
+        original: Arc<OriginalSessionOwner>,
     },
 }
 
@@ -55,6 +56,7 @@ pub(crate) struct MutationOwner {
     task: Option<JoinHandle<MutationOutcome>>,
     terminal: Option<Result<MutationOutcome, JoinError>>,
     refusals: Vec<MutationRefusal>,
+    original_session: Option<Arc<OriginalSessionOwner>>,
     #[cfg(test)]
     original_task_id: Option<tokio::task::Id>,
 }
@@ -65,6 +67,23 @@ pub(crate) enum MutationTerminal<'a> {
 }
 
 impl MutationOwner {
+    pub(crate) fn original_session(
+        &mut self,
+        pool: &Arc<PostgresPool>,
+    ) -> ThreadStoreResult<Arc<OriginalSessionOwner>> {
+        if let Some(original) = self.original_session.as_ref() {
+            if !original.belongs_to(pool) {
+                return Err(refusal(
+                    "original mutation session belongs to a different pool",
+                ));
+            }
+            return Ok(Arc::clone(original));
+        }
+        let original = OriginalSessionOwner::new(Arc::clone(pool))?;
+        self.original_session = Some(Arc::clone(&original));
+        Ok(original)
+    }
+
     pub(crate) fn start(
         &mut self,
         operation: impl Future<Output = MutationOutcome> + Send + 'static,
@@ -108,7 +127,7 @@ impl MutationOwner {
                 Some(Ok(MutationOutcome::RolledBack(_)))
                     | Some(Ok(MutationOutcome::Uncertain { .. }))
                     | Some(Ok(MutationOutcome::AdmissionUncertain { .. }))
-                    | Some(Ok(MutationOutcome::AcquisitionUncertain { .. }))
+                    | Some(Ok(MutationOutcome::OwnerUncertain { .. }))
                     | Some(Err(_))
             )
     }
@@ -133,11 +152,16 @@ impl MutationOwner {
             Some(Ok(MutationOutcome::RolledBack(error))) => {
                 Ok(MutationTerminal::RolledBack(error.error()))
             }
-            Some(Ok(MutationOutcome::AcquisitionUncertain {
-                original_pool,
-                cause,
-            })) => {
-                let _ = (original_pool, cause);
+            Some(Ok(MutationOutcome::OwnerUncertain { original, cause })) => {
+                let _ = original;
+                match cause {
+                    SessionLoanError::Owner(original) => {
+                        let _ = original;
+                    }
+                    SessionLoanError::Acquisition(original) => {
+                        let _ = original;
+                    }
+                }
                 Err(refusal(
                     "original mutation connection acquisition is uncertain",
                 ))
