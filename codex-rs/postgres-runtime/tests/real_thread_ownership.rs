@@ -49,18 +49,26 @@ async fn real_two_clients_reject_stale_thread_owners() {
         return;
     };
     let state = Path::new(&state);
-    let migrator = PostgresPool::connect(settings(state, "migrator"))
+    let migrator = PostgresPool::connect_in_namespace(settings(state, "migrator"), None)
         .await
         .expect("migrator pool");
     bootstrap_codex_storage(&migrator)
         .await
         .expect("bootstrap ownership schema");
-    let first = PostgresPool::connect(settings(state, "runtime"))
+    let first = PostgresPool::connect_in_namespace(settings(state, "runtime"), None)
         .await
         .expect("first runtime client");
-    let second = PostgresPool::connect(settings(state, "runtime"))
+    let second = PostgresPool::connect_in_namespace(settings(state, "runtime"), None)
         .await
         .expect("second runtime client");
+    first
+        .bind_current_activation()
+        .await
+        .expect("first actual original activation");
+    second
+        .bind_current_activation()
+        .await
+        .expect("second actual original activation");
     let thread_id = format!(
         "{:032x}",
         SystemTime::now()
@@ -68,28 +76,67 @@ async fn real_two_clients_reject_stale_thread_owners() {
             .expect("system time")
             .as_nanos()
     );
-    let first_owner = "00000000000000000000000000000001";
     let contender_owner = "00000000000000000000000000000002";
     let replacement_owner = "00000000000000000000000000000003";
     let reclaim_owner = "00000000000000000000000000000004";
-    let cancelled_owner = "00000000000000000000000000000005";
     let after_cancel_owner = "00000000000000000000000000000006";
     let short = Duration::from_secs(2);
     let namespace = ThreadOwnershipNamespace::Default;
+    let original_attempt = first
+        .prepare_thread_ownership_attempt(namespace.clone(), &thread_id)
+        .await
+        .expect("actual SQL generated attempt");
     let committed = first
-        .claim_thread_ownership(namespace.clone(), &thread_id, first_owner, short)
+        .claim_thread_ownership_attempt(&original_attempt, short)
         .await
-        .expect("first claim")
+        .expect("first actual attempt claim")
         .expect("first owner acquired");
+    let first_owner = committed.owner_id.clone();
     assert_eq!(committed.token, 1);
-    drop(committed); // Simulate losing the claim result before resolving it.
-    let claim = second
-        .recover_thread_ownership(namespace.clone(), &thread_id, first_owner)
+    drop(committed); // Lose only the response, retaining the actual original attempt.
+    let readback = second
+        .recover_thread_ownership(namespace.clone(), &thread_id, &first_owner)
         .await
-        .expect("read back uncertain claim")
-        .expect("recover committed ownership");
+        .expect("scalar observational readback")
+        .expect("same committed lease observed");
+    assert_eq!(readback.token, 1);
+    assert_eq!(first.observe_thread_ownership(&readback).await, Ok(true));
+    assert_eq!(second.observe_thread_ownership(&readback).await, Ok(true));
+    assert_eq!(
+        first.renew_thread_ownership(&readback, short).await,
+        Err(ThreadOwnershipError::Transaction(
+            TransactionError::Rejected
+        ))
+    );
+    assert_eq!(
+        second.release_thread_ownership(&readback).await,
+        Err(ThreadOwnershipError::Transaction(
+            TransactionError::Rejected
+        ))
+    );
+    assert_eq!(
+        second
+            .recover_thread_ownership_attempt(&original_attempt)
+            .await,
+        Err(ThreadOwnershipError::Transaction(
+            TransactionError::Rejected
+        ))
+    );
+    assert_eq!(
+        second
+            .claim_thread_ownership_attempt(&original_attempt, short)
+            .await,
+        Err(ThreadOwnershipError::Transaction(
+            TransactionError::Rejected
+        ))
+    );
+    let claim = first
+        .recover_thread_ownership_attempt(&original_attempt)
+        .await
+        .expect("recover actual original pool attempt")
+        .expect("original writable owner");
+    assert_eq!(claim.owner_id, first_owner);
     assert_eq!(claim.token, 1);
-    assert_eq!(first.observe_thread_ownership(&claim).await, Ok(true));
     assert_eq!(first.renew_thread_ownership(&claim, short).await, Ok(true));
     assert_eq!(
         second
@@ -123,7 +170,7 @@ async fn real_two_clients_reject_stale_thread_owners() {
     assert_eq!(first.observe_thread_ownership(&claim).await, Ok(false));
     assert_eq!(
         first
-            .recover_thread_ownership(namespace.clone(), &thread_id, first_owner)
+            .recover_thread_ownership(namespace.clone(), &thread_id, &first_owner)
             .await,
         Ok(None)
     );
@@ -153,15 +200,28 @@ async fn real_two_clients_reject_stale_thread_owners() {
         .fetch_one(lock.connection())
         .await
         .expect("lock ownership row");
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            second.claim_thread_ownership(namespace.clone(), &thread_id, cancelled_owner, short)
-        )
+    let canceled_attempt = second
+        .prepare_thread_ownership_attempt(namespace.clone(), &thread_id)
         .await
-        .is_err()
-    );
+        .expect("original canceled attempt retained");
+    let canceled = tokio::time::timeout(
+        Duration::from_millis(100),
+        second.claim_thread_ownership_attempt(&canceled_attempt, short),
+    )
+    .await;
+    // This fixture deliberately tests primitive SQLx request cancellation, not a store
+    // drain receipt; release the original barrier before any assertion.
     lock.rollback().await.expect("release ownership row lock");
+    assert!(
+        canceled.is_err(),
+        "actual blocked primitive request canceled"
+    );
+    assert_eq!(
+        second
+            .recover_thread_ownership_attempt(&canceled_attempt)
+            .await,
+        Ok(None)
+    );
     let after_cancel = second
         .claim_thread_ownership(namespace.clone(), &thread_id, after_cancel_owner, short)
         .await
@@ -237,18 +297,34 @@ async fn real_named_thread_ownership_is_namespace_scoped() {
     };
     let state = Path::new(&state);
     let named = NamedNamespace::new("codex_storage_isolation").expect("fixture namespace");
-    let migrator = PostgresPool::connect(settings(state, "isolation_migrator"))
-        .await
-        .expect("named migrator");
+    let migrator =
+        PostgresPool::connect_in_namespace(settings(state, "isolation_migrator"), Some(&named))
+            .await
+            .expect("named migrator");
     bootstrap_named_namespace(&migrator, &named)
         .await
         .expect("bootstrap named ownership schema");
-    let named_runtime = PostgresPool::connect(settings(state, "isolation_runtime"))
+    let named_runtime =
+        PostgresPool::connect_in_namespace(settings(state, "isolation_runtime"), Some(&named))
+            .await
+            .expect("named runtime");
+    let default_migrator = PostgresPool::connect_in_namespace(settings(state, "migrator"), None)
         .await
-        .expect("named runtime");
-    let default_runtime = PostgresPool::connect(settings(state, "runtime"))
+        .expect("actual default bootstrap owner");
+    bootstrap_codex_storage(&default_migrator)
+        .await
+        .expect("bootstrap default ownership schema");
+    let default_runtime = PostgresPool::connect_in_namespace(settings(state, "runtime"), None)
         .await
         .expect("default runtime");
+    named_runtime
+        .bind_current_activation()
+        .await
+        .expect("actual named activation");
+    default_runtime
+        .bind_current_activation()
+        .await
+        .expect("actual default activation");
     let thread_id = format!(
         "{:032x}",
         SystemTime::now()
@@ -257,17 +333,30 @@ async fn real_named_thread_ownership_is_namespace_scoped() {
             .as_nanos()
     );
     let named_namespace = ThreadOwnershipNamespace::Named(named);
-    let owner = "0000000000000000000000000000000b";
-    let named_claim = named_runtime
-        .claim_thread_ownership(
-            named_namespace.clone(),
-            &thread_id,
-            owner,
-            Duration::from_secs(2),
-        )
+    let named_attempt = named_runtime
+        .prepare_thread_ownership_attempt(named_namespace.clone(), &thread_id)
         .await
-        .expect("named claim")
+        .expect("actual named original attempt");
+    let committed = named_runtime
+        .claim_thread_ownership_attempt(&named_attempt, Duration::from_secs(2))
+        .await
+        .expect("named original claim")
         .expect("named owner acquired");
+    let owner = committed.owner_id.clone();
+    drop(committed);
+    let named_claim = named_runtime
+        .recover_thread_ownership_attempt(&named_attempt)
+        .await
+        .expect("named original pool recovery")
+        .expect("named writable owner");
+    assert_eq!(
+        default_runtime
+            .recover_thread_ownership_attempt(&named_attempt)
+            .await,
+        Err(ThreadOwnershipError::Transaction(
+            TransactionError::Rejected
+        ))
+    );
     assert_eq!(named_claim.token, 1);
     assert_eq!(
         named_runtime.observe_thread_ownership(&named_claim).await,
@@ -275,7 +364,7 @@ async fn real_named_thread_ownership_is_namespace_scoped() {
     );
     assert_eq!(
         default_runtime
-            .recover_thread_ownership(ThreadOwnershipNamespace::Default, &thread_id, owner)
+            .recover_thread_ownership(ThreadOwnershipNamespace::Default, &thread_id, &owner)
             .await,
         Ok(None)
     );
