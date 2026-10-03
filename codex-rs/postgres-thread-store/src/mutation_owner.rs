@@ -114,6 +114,18 @@ impl MutationOwner {
     }
 
     #[cfg(test)]
+    pub(crate) fn abort_original_task(&self) {
+        if let Some(original) = self.task.as_ref() {
+            original.abort();
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn reconciled_original_join_error(&self) -> Option<&JoinError> {
+        self.reconciled_history
+            .iter()
+            .find_map(|original| original.as_ref().err())
+    }
+    #[cfg(test)]
     pub(crate) fn original_task_id(&self) -> Option<tokio::task::Id> {
         self.original_task_id
     }

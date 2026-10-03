@@ -121,6 +121,8 @@ pub(crate) struct LiveThread {
     pub(crate) ownership: Option<WriterOwnership>,
     sealed: bool,
     mutation: MutationOwner,
+    #[cfg(test)]
+    mutation_fault: Option<OriginalMutationFault>,
 }
 
 impl LiveThread {
@@ -177,6 +179,8 @@ impl LiveThread {
             ownership: None,
             sealed: false,
             mutation: MutationOwner::default(),
+            #[cfg(test)]
+            mutation_fault: None,
         }
     }
 
@@ -201,6 +205,8 @@ impl LiveThread {
             ownership: None,
             sealed: false,
             mutation: MutationOwner::default(),
+            #[cfg(test)]
+            mutation_fault: None,
         }
     }
 
@@ -240,6 +246,26 @@ impl LiveThread {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_original_mutation_fault(
+        &mut self,
+        panic: bool,
+        ready: tokio::sync::oneshot::Sender<i32>,
+    ) {
+        self.mutation_fault = Some(OriginalMutationFault { panic, ready });
+    }
+    #[cfg(test)]
+    pub(crate) fn abort_original_mutation_task(&self) {
+        self.mutation.abort_original_task();
+    }
+    #[cfg(test)]
+    pub(crate) fn reconciled_original_join_error(&self) -> Option<&tokio::task::JoinError> {
+        self.mutation.reconciled_original_join_error()
+    }
+    #[cfg(test)]
+    pub(crate) fn original_staged_lines(&self) -> Option<&[(Option<u64>, String)]> {
+        self.staged.as_ref().map(|(lines, _)| lines.as_slice())
+    }
     #[cfg(test)]
     pub(crate) fn original_mutation_task_id(&self) -> Option<tokio::task::Id> {
         self.mutation.original_task_id()
@@ -386,6 +412,8 @@ impl LiveThread {
         let history_mode = self.history_mode;
         let default_provider = default_model_provider_id.to_string();
         let original = self.mutation.original_session(pool)?;
+        #[cfg(test)]
+        let fault = self.mutation_fault.take();
         self.mutation.start(async move {
             let mut loan = match original.loan().await {
                 Ok(loan) => loan,
@@ -480,6 +508,19 @@ impl LiveThread {
                     append_in(&mut admitted, thread_id, expected, &lines)
                         .await
                         .map_err(rollout_error)?;
+                    #[cfg(test)]
+                    if let Some(fault) = fault {
+                        let actual_pid: i32 =
+                            sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+                                .fetch_one(admitted.connection())
+                                .await
+                                .map_err(database)?;
+                        let _ = fault.ready.send(actual_pid);
+                        if fault.panic {
+                            panic!("actual original mutation task fault");
+                        }
+                        std::future::pending::<()>().await;
+                    }
                     Ok(())
                 }
                 .await;
@@ -650,4 +691,10 @@ fn copy_mutation_error(error: &ThreadStoreError) -> ThreadStoreError {
             message: message.clone(),
         },
     }
+}
+
+#[cfg(test)]
+struct OriginalMutationFault {
+    panic: bool,
+    ready: tokio::sync::oneshot::Sender<i32>,
 }

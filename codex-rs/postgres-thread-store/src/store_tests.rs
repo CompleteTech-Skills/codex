@@ -1764,3 +1764,5 @@ async fn original_resume_query_cancellation_control(
 }
 
 include!("mutation_sql_tests.rs");
+
+include!("original_mutation_task_tests.rs");
