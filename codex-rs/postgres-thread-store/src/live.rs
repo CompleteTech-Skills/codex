@@ -87,6 +87,8 @@ pub(crate) struct WriterOwnership {
     /// Set by the renewal task when the lease can no longer be trusted.
     pub(crate) lost: Arc<AtomicBool>,
     pub(crate) renewer: tokio::task::JoinHandle<()>,
+    pub(crate) renewal_joined: bool,
+    pub(crate) renewal_failed: bool,
 }
 
 impl Drop for WriterOwnership {
@@ -112,6 +114,7 @@ pub(crate) struct LiveThread {
     pub(crate) next_position: u64,
     ordinals: Ordinals,
     pub(crate) ownership: Option<WriterOwnership>,
+    sealed: bool,
 }
 
 impl LiveThread {
@@ -166,6 +169,7 @@ impl LiveThread {
             next_position: 0,
             ordinals: Ordinals::for_new(params.history_mode, params.history_base),
             ownership: None,
+            sealed: false,
         }
     }
 
@@ -188,11 +192,60 @@ impl LiveThread {
             next_position,
             ordinals: Ordinals::resume(history_mode, last_ordinal),
             ownership: None,
+            sealed: false,
         }
     }
 
-    pub(crate) fn queue(&mut self, items: Vec<RolloutItem>) {
+    pub(crate) fn require_writer(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
+        if self.sealed
+            || self
+                .ownership
+                .as_ref()
+                .is_none_or(|owner| owner.lost.load(AtomicOrdering::SeqCst))
+        {
+            return Err(ownership_lost(thread_id));
+        }
+        Ok(())
+    }
+
+    /// Cancellation leaves the original JoinHandle in this retained instance.
+    /// Task termination is not a receipt that remote SQL rollback has completed.
+    pub(crate) async fn finish_renewal(&mut self) -> ThreadStoreResult<()> {
+        if let Some(owner) = self.ownership.as_mut() {
+            if !owner.renewal_joined {
+                owner.renewer.abort();
+                let result = (&mut owner.renewer).await;
+                owner.renewal_joined = true;
+                owner.renewal_failed = result.is_err_and(|error| !error.is_cancelled());
+            }
+            if owner.renewal_failed {
+                return Err(ThreadStoreError::Internal {
+                    message: "writer lease renewal task failed during cleanup".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    pub(crate) fn seal(&mut self) {
+        self.sealed = true;
+        if let Some(owner) = self.ownership.as_ref() {
+            owner.renewer.abort();
+        }
+    }
+
+    pub(crate) fn queue(
+        &mut self,
+        thread_id: ThreadId,
+        items: Vec<RolloutItem>,
+    ) -> ThreadStoreResult<()> {
+        self.require_writer(thread_id)?;
         self.pending.extend(items);
+        Ok(())
     }
 
     /// True while a newly created thread has written nothing and has nothing to write.
@@ -207,6 +260,7 @@ impl LiveThread {
         thread_id: ThreadId,
         default_model_provider_id: &str,
     ) -> ThreadStoreResult<()> {
+        self.require_writer(thread_id)?;
         if self.staged.is_none() {
             let mut items = Vec::new();
             if let Some(meta) = self.meta.as_ref() {

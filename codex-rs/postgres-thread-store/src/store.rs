@@ -174,6 +174,8 @@ impl PostgresThreadStore {
             claim,
             lost,
             renewer,
+            renewal_joined: false,
+            renewal_failed: false,
         })
     }
 
@@ -582,6 +584,7 @@ impl ThreadStore for PostgresThreadStore {
             let thread_id = params.thread_id;
             let live = self.live_thread(thread_id).await?;
             let mut live = live.lock_owned().await;
+            live.require_writer(thread_id)?;
             let history_mode = live.history_mode;
             let items: Vec<RolloutItem> = params
                 .items
@@ -591,7 +594,7 @@ impl ThreadStore for PostgresThreadStore {
             if items.is_empty() {
                 return Ok(());
             }
-            live.queue(items);
+            live.queue(thread_id, items)?;
             // Once the thread is durable every append is acknowledged only after it commits.
             if live.materialized {
                 live.write(&self.pool, thread_id, &self.default_model_provider_id)
@@ -623,34 +626,44 @@ impl ThreadStore for PostgresThreadStore {
 
     fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            let live = self.live_thread(thread_id).await?;
-            {
-                let mut live = live.lock_owned().await;
+            let original = self.live_thread(thread_id).await?;
+            let mut live = original.lock().await;
+            if !live.is_sealed() {
+                live.require_writer(thread_id)?;
                 if !live.is_deferred_and_empty() {
                     live.write(&self.pool, thread_id, &self.default_model_provider_id)
                         .await?;
                 }
+                live.seal();
             }
-            let removed = self.live.lock().await.remove(&thread_id);
-            if let Some(live) = removed {
-                let ownership = live.lock().await.ownership.take();
-                self.release_writer(ownership).await;
+            // Original remains in the registry through canceled/failed release; a retry
+            // completes cleanup without reopening or rewriting the sealed instance.
+            live.finish_renewal().await?;
+            if let Some(owner) = live.ownership.as_ref() {
+                self.pool
+                    .release_thread_ownership(&owner.claim)
+                    .await
+                    .map_err(internal)?;
             }
+            self.evict_live_instance(thread_id, &original).await;
             Ok(())
         })
     }
 
     fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
+            let original = self.live_thread(thread_id).await?;
+            let mut live = original.lock().await;
+            live.seal();
+            live.finish_renewal().await?;
+            if let Some(owner) = live.ownership.as_ref() {
+                self.pool
+                    .release_thread_ownership(&owner.claim)
+                    .await
+                    .map_err(internal)?;
+            }
             self.pending_metadata.lock().await.remove(&thread_id);
-            let removed = self
-                .live
-                .lock()
-                .await
-                .remove(&thread_id)
-                .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
-            let ownership = removed.lock().await.ownership.take();
-            self.release_writer(ownership).await;
+            self.evict_live_instance(thread_id, &original).await;
             Ok(())
         })
     }
@@ -974,13 +987,16 @@ impl ThreadStore for PostgresThreadStore {
 
     fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            self.live.lock().await.remove(&params.thread_id);
-            self.pending_metadata.lock().await.remove(&params.thread_id);
+            let originals = self.seal_live_instances(&[params.thread_id]).await?;
             let deleted = self
                 .catalog
                 .delete_thread(params.thread_id)
                 .await
                 .map_err(internal)?;
+            self.pending_metadata.lock().await.remove(&params.thread_id);
+            for (id, original) in originals {
+                self.evict_live_instance(id, &original).await;
+            }
             if deleted == 0 {
                 Err(ThreadStoreError::ThreadNotFound {
                     thread_id: params.thread_id,
@@ -993,25 +1009,53 @@ impl ThreadStore for PostgresThreadStore {
 
     fn delete_threads(&self, params: DeleteThreadsParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
-            {
-                let mut live = self.live.lock().await;
-                for thread_id in &params.thread_ids {
-                    live.remove(thread_id);
-                }
-            }
+            let originals = self.seal_live_instances(&params.thread_ids).await?;
             self.catalog
                 .delete_threads_strict(&params.thread_ids)
                 .await
-                .map(|_| ())
-                .map_err(internal)
+                .map_err(internal)?;
+            for (id, original) in originals {
+                self.pending_metadata.lock().await.remove(&id);
+                self.evict_live_instance(id, &original).await;
+            }
+            Ok(())
         })
     }
 }
 
 impl PostgresThreadStore {
+    async fn seal_live_instances(
+        &self,
+        ids: &[ThreadId],
+    ) -> ThreadStoreResult<Vec<(ThreadId, Arc<Mutex<LiveThread>>)>> {
+        let originals: Vec<_> = {
+            let instances = self.live.lock().await;
+            ids.iter()
+                .filter_map(|id| instances.get(id).map(|live| (*id, Arc::clone(live))))
+                .collect()
+        };
+        for (_, original) in &originals {
+            let mut live = original.lock().await;
+            live.seal();
+            live.finish_renewal().await?;
+        }
+        Ok(originals)
+    }
+
+    async fn evict_live_instance(&self, thread_id: ThreadId, original: &Arc<Mutex<LiveThread>>) {
+        let mut instances = self.live.lock().await;
+        if instances
+            .get(&thread_id)
+            .is_some_and(|current| Arc::ptr_eq(current, original))
+        {
+            instances.remove(&thread_id);
+        }
+    }
+
     async fn flush_thread_inner(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
         let live = self.live_thread(thread_id).await?;
         let mut live = live.lock_owned().await;
+        live.require_writer(thread_id)?;
         if live.is_deferred_and_empty() {
             return Ok(());
         }
