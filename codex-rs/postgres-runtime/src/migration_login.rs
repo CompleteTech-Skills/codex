@@ -7,6 +7,7 @@ pub(crate) struct MigrationLogin {
     login: String,
     owner: String,
     quoted_owner: String,
+    causes: std::sync::Arc<crate::migration_causes::MigrationCauses>,
 }
 impl MigrationLogin {
     pub(crate) fn new(namespace: Option<&NamedNamespace>) -> Self {
@@ -15,11 +16,13 @@ impl MigrationLogin {
                 login: "codex_migrator".to_string(),
                 owner: "codex_owner".to_string(),
                 quoted_owner: "\"codex_owner\"".to_string(),
+                causes: crate::migration_causes::MigrationCauses::new(),
             },
             Some(namespace) => Self {
                 login: namespace.migrator_login().to_string(),
                 owner: namespace.owner.clone(),
                 quoted_owner: namespace.quoted_owner(),
+                causes: crate::migration_causes::MigrationCauses::new(),
             },
         }
     }
@@ -31,6 +34,17 @@ impl MigrationLogin {
         &self,
         connection: &mut PgConnection,
     ) -> Result<(), sqlx::Error> {
+        let reservation = self.causes.reserve()?;
+        let result = self.initialize_original(connection).await;
+        match result {
+            Ok(()) => {
+                reservation.success();
+                Ok(())
+            }
+            Err(original) => Err(reservation.failure(original)),
+        }
+    }
+    async fn initialize_original(&self, connection: &mut PgConnection) -> Result<(), sqlx::Error> {
         let admitted: bool = sqlx::query_scalar(
             "SELECT session_user::text=$1 AND EXISTS(SELECT 1 FROM pg_catalog.pg_roles \
              WHERE rolname=session_user AND rolcanlogin AND NOT rolinherit AND NOT rolsuper \

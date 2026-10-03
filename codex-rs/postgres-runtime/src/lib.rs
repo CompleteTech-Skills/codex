@@ -33,6 +33,7 @@ use tokio::time::timeout;
 use zeroize::Zeroizing;
 
 mod activation_gate;
+mod migration_causes;
 mod migration_login;
 mod session_binding;
 pub use activation_gate::ActivationGateError;
