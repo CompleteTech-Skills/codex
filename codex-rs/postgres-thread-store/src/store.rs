@@ -140,12 +140,16 @@ impl PostgresThreadStore {
         let busy = || ThreadStoreError::InvalidRequest {
             message: format!("thread {thread_id} already has a live writer"),
         };
-        let owner_id = uuid::Uuid::new_v4().to_string();
         let namespace = self.namespace.clone();
         let id = thread_id.to_string();
+        let attempt = self
+            .pool
+            .prepare_thread_ownership_attempt(namespace, &id)
+            .await
+            .map_err(internal)?;
         let claim = match self
             .pool
-            .claim_thread_ownership(namespace.clone(), &id, &owner_id, self.writer_lease)
+            .claim_thread_ownership_attempt(&attempt, self.writer_lease)
             .await
         {
             Ok(Some(claim)) => claim,
@@ -153,7 +157,7 @@ impl PostgresThreadStore {
             // An unknown commit outcome is resolved by reading back this attempt's owner id.
             Err(_) => self
                 .pool
-                .recover_thread_ownership(namespace, &id, &owner_id)
+                .recover_thread_ownership_attempt(&attempt)
                 .await
                 .map_err(internal)?
                 .ok_or_else(busy)?,

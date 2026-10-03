@@ -62,6 +62,7 @@ pub use transaction::PostgresTransaction;
 pub use transaction::TransactionError;
 mod thread_ownership;
 pub use thread_ownership::ThreadOwnership;
+pub use thread_ownership::ThreadOwnershipAttempt;
 pub use thread_ownership::ThreadOwnershipError;
 pub use thread_ownership::ThreadOwnershipNamespace;
 mod verified_target;
@@ -176,7 +177,7 @@ pub struct PostgresPool {
     pool: PgPool,
     acquire_timeout: Duration,
     selected_search_path: Option<String>,
-    activation_binding: std::sync::OnceLock<session_binding::ActivationBinding>,
+    activation_binding: std::sync::OnceLock<Arc<session_binding::ActivationBinding>>,
 }
 
 impl PostgresPool {

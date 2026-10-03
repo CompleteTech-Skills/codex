@@ -4,6 +4,7 @@ use crate::PostgresPool;
 use sqlx::Acquire;
 use sqlx::PgConnection;
 use sqlx::Row;
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ActivationBinding {
@@ -63,7 +64,7 @@ impl PostgresPool {
             .await
             .map_err(|_| ActivationGateError::Unavailable)?;
         self.activation_binding
-            .set(observed)
+            .set(Arc::new(observed))
             .map_err(|_| ActivationGateError::Unavailable)
     }
 
@@ -80,14 +81,21 @@ impl PostgresPool {
         &self,
         connection: &mut PgConnection,
     ) -> Result<(), ActivationGateError> {
-        let path = self
-            .selected_search_path
-            .as_ref()
-            .ok_or(ActivationGateError::Unavailable)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *connection)
             .await
             .map_err(|_| ActivationGateError::Unavailable)?;
+        self.prepare_selected_namespace(connection).await
+    }
+
+    pub(crate) async fn prepare_selected_namespace(
+        &self,
+        connection: &mut PgConnection,
+    ) -> Result<(), ActivationGateError> {
+        let path = self
+            .selected_search_path
+            .as_ref()
+            .ok_or(ActivationGateError::Unavailable)?;
         sqlx::query("SELECT set_config('search_path', $1, true)")
             .bind(path)
             .execute(connection)
@@ -111,9 +119,27 @@ impl PostgresPool {
         match state.as_str() {
             "migrating" => Err(ActivationGateError::Migrating),
             "retired" => Err(ActivationGateError::Retired),
-            "open" if actual == *expected => Ok(()),
+            "open" if actual == **expected => Ok(()),
             "open" => Err(ActivationGateError::GenerationChanged),
             _ => Err(ActivationGateError::Unavailable),
+        }
+    }
+
+    /// Cleanup can release the original lease while its own activation is closed.
+    /// It cannot adopt a replacement dataset/generation or authorize new data writes.
+    pub(crate) async fn require_bound_storage_cleanup(
+        &self,
+        connection: &mut PgConnection,
+    ) -> Result<(), ActivationGateError> {
+        let expected = self
+            .activation_binding
+            .get()
+            .ok_or(ActivationGateError::Unavailable)?;
+        let (_, actual) = observe(connection).await?;
+        if actual == **expected {
+            Ok(())
+        } else {
+            Err(ActivationGateError::GenerationChanged)
         }
     }
 }

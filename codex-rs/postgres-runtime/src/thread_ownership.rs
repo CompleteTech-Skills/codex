@@ -9,8 +9,10 @@
 use crate::NamedNamespace;
 use crate::PostgresPool;
 use crate::TransactionError;
+use crate::session_binding::ActivationBinding;
 use sqlx::AssertSqlSafe;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -40,6 +42,17 @@ pub struct ThreadOwnership {
     pub thread_id: String,
     pub owner_id: String,
     pub token: i64,
+    // Only an actual operation on the original bound pool can construct this field.
+    original_binding: Option<Arc<ActivationBinding>>,
+}
+
+/// A fresh actual database-generated attempt retained on its original bound pool.
+/// Fields are private: scalar owner IDs cannot reconstruct mutation authority.
+pub struct ThreadOwnershipAttempt {
+    namespace: ThreadOwnershipNamespace,
+    thread_id: String,
+    owner_id: String,
+    original_binding: Arc<ActivationBinding>,
 }
 
 /// Redacted ownership error. An unknown commit outcome requires readback.
@@ -71,6 +84,114 @@ fn lease_millis(duration: Duration) -> Result<i64, ThreadOwnershipError> {
 }
 
 impl PostgresPool {
+    fn lease_binding(
+        &self,
+        namespace: &ThreadOwnershipNamespace,
+    ) -> Result<Arc<ActivationBinding>, ThreadOwnershipError> {
+        let namespace = match namespace {
+            ThreadOwnershipNamespace::Default => None,
+            ThreadOwnershipNamespace::Named(namespace) => Some(namespace),
+        };
+        if self.selected_search_path.as_deref()
+            != Some(crate::owned_namespace_search_path(namespace).as_str())
+        {
+            return Err(TransactionError::Rejected.into());
+        }
+        self.activation_binding
+            .get()
+            .cloned()
+            .ok_or_else(|| TransactionError::Rejected.into())
+    }
+
+    fn check_lease_binding(&self, claim: &ThreadOwnership) -> Result<(), ThreadOwnershipError> {
+        let original = self.lease_binding(&claim.namespace)?;
+        if claim
+            .original_binding
+            .as_ref()
+            .is_some_and(|binding| Arc::ptr_eq(&original, binding))
+        {
+            Ok(())
+        } else {
+            Err(TransactionError::Rejected.into())
+        }
+    }
+
+    /// Prepare before claim dispatch so an ambiguous outcome keeps the same original attempt.
+    pub async fn prepare_thread_ownership_attempt(
+        &self,
+        namespace: ThreadOwnershipNamespace,
+        thread_id: &str,
+    ) -> Result<ThreadOwnershipAttempt, ThreadOwnershipError> {
+        let original_binding = self.lease_binding(&namespace)?;
+        let mut connection = self
+            .acquire()
+            .await
+            .map_err(|_| TransactionError::Unavailable)?;
+        let owner_id: String = timeout(
+            self.acquire_timeout,
+            sqlx::query_scalar("SELECT pg_catalog.gen_random_uuid()::text")
+                .fetch_one(&mut *connection),
+        )
+        .await
+        .map_err(|_| TransactionError::Timeout)?
+        .map_err(|error| TransactionError::classify_statement(&error))?;
+        Ok(ThreadOwnershipAttempt {
+            namespace,
+            thread_id: thread_id.to_owned(),
+            owner_id,
+            original_binding,
+        })
+    }
+
+    pub async fn claim_thread_ownership_attempt(
+        &self,
+        attempt: &ThreadOwnershipAttempt,
+        lease: Duration,
+    ) -> Result<Option<ThreadOwnership>, ThreadOwnershipError> {
+        let binding = self.lease_binding(&attempt.namespace)?;
+        if !Arc::ptr_eq(&binding, &attempt.original_binding) {
+            return Err(TransactionError::Rejected.into());
+        }
+        self.claim_thread_ownership(
+            attempt.namespace.clone(),
+            &attempt.thread_id,
+            &attempt.owner_id,
+            lease,
+        )
+        .await
+    }
+
+    /// Recover only an opaque original attempt, with the same generation gate and lock.
+    pub async fn recover_thread_ownership_attempt(
+        &self,
+        attempt: &ThreadOwnershipAttempt,
+    ) -> Result<Option<ThreadOwnership>, ThreadOwnershipError> {
+        let binding = self.lease_binding(&attempt.namespace)?;
+        if !Arc::ptr_eq(&binding, &attempt.original_binding) {
+            return Err(TransactionError::Rejected.into());
+        }
+        let mut transaction = self.begin_serializable().await?;
+        self.prepare_selected_namespace(transaction.connection())
+            .await
+            .map_err(|_| TransactionError::Rejected)?;
+        self.require_bound_storage_open(transaction.connection())
+            .await
+            .map_err(|_| TransactionError::Rejected)?;
+        let table = attempt.namespace.table();
+        let token = timeout(self.acquire_timeout,
+            sqlx::query_scalar(AssertSqlSafe(format!("SELECT token FROM {table} WHERE thread_id=$1::uuid AND owner_id=$2::uuid AND lease_until > clock_timestamp() FOR SHARE")))
+                .bind(&attempt.thread_id).bind(&attempt.owner_id).fetch_optional(transaction.connection()),
+        ).await.map_err(|_| TransactionError::Timeout)?
+            .map_err(|error| TransactionError::classify_statement(&error))?;
+        transaction.rollback().await?;
+        Ok(token.map(|token| ThreadOwnership {
+            namespace: attempt.namespace.clone(),
+            thread_id: attempt.thread_id.clone(),
+            owner_id: attempt.owner_id.clone(),
+            token,
+            original_binding: Some(Arc::clone(&attempt.original_binding)),
+        }))
+    }
     /// Claim an absent or expired thread lease. `owner_id` must be a fresh UUID
     /// per claim attempt so an unknown COMMIT can be resolved by readback.
     /// Contention yields `None` or a serialization conflict.
@@ -82,8 +203,15 @@ impl PostgresPool {
         lease: Duration,
     ) -> Result<Option<ThreadOwnership>, ThreadOwnershipError> {
         let millis = lease_millis(lease)?;
+        let original_binding = self.lease_binding(&namespace)?;
         let table = namespace.table();
         let mut transaction = self.begin_serializable().await?;
+        self.prepare_selected_namespace(transaction.connection())
+            .await
+            .map_err(|_| TransactionError::Rejected)?;
+        self.require_bound_storage_open(transaction.connection())
+            .await
+            .map_err(|_| TransactionError::Rejected)?;
         timeout(
             self.acquire_timeout,
             sqlx::query(AssertSqlSafe(format!("INSERT INTO {table} (thread_id, token) VALUES ($1::uuid, 0) ON CONFLICT (thread_id) DO NOTHING")))
@@ -117,6 +245,7 @@ impl PostgresPool {
             thread_id: thread_id.to_owned(),
             owner_id: owner_id.to_owned(),
             token,
+            original_binding: Some(original_binding),
         }))
     }
 
@@ -127,8 +256,15 @@ impl PostgresPool {
         lease: Duration,
     ) -> Result<bool, ThreadOwnershipError> {
         let millis = lease_millis(lease)?;
+        self.check_lease_binding(claim)?;
         let table = claim.namespace.table();
         let mut transaction = self.begin_serializable().await?;
+        self.prepare_selected_namespace(transaction.connection())
+            .await
+            .map_err(|_| TransactionError::Rejected)?;
+        self.require_bound_storage_open(transaction.connection())
+            .await
+            .map_err(|_| TransactionError::Rejected)?;
         let updated = timeout(
             self.acquire_timeout,
             sqlx::query(AssertSqlSafe(format!(
@@ -155,8 +291,15 @@ impl PostgresPool {
         &self,
         claim: &ThreadOwnership,
     ) -> Result<bool, ThreadOwnershipError> {
+        self.check_lease_binding(claim)?;
         let table = claim.namespace.table();
         let mut transaction = self.begin_serializable().await?;
+        self.prepare_selected_namespace(transaction.connection())
+            .await
+            .map_err(|_| TransactionError::Rejected)?;
+        self.require_bound_storage_cleanup(transaction.connection())
+            .await
+            .map_err(|_| TransactionError::Rejected)?;
         let updated = timeout(
             self.acquire_timeout,
             sqlx::query(AssertSqlSafe(format!(
@@ -215,6 +358,7 @@ impl PostgresPool {
         thread_id: &str,
         owner_id: &str,
     ) -> Result<Option<ThreadOwnership>, ThreadOwnershipError> {
+        self.lease_binding(&namespace)?;
         let table = namespace.table();
         let mut connection = self.acquire().await.map_err(|error| {
             ThreadOwnershipError::Transaction(match error {
@@ -241,6 +385,8 @@ impl PostgresPool {
             thread_id: thread_id.to_owned(),
             owner_id: owner_id.to_owned(),
             token,
+            // Scalar readback remains observable, but cannot renew/release a lease.
+            original_binding: None,
         }))
     }
 }
