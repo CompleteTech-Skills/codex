@@ -196,11 +196,16 @@ impl PostgresPool {
 pub struct RetainedWriteSession {
     original_pool: Arc<PostgresPool>,
     connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    original_transaction: Option<String>,
 }
 
 /// Available original admission causes, not a terminal or rollback capability.
 pub enum RetainedWriteAdmissionError {
     Begin(sqlx::Error),
+    Stamp {
+        original: sqlx::Error,
+        rollback: Option<sqlx::Error>,
+    },
     Gate {
         original: ActivationGateError,
         rollback: Option<sqlx::Error>,
@@ -238,6 +243,7 @@ impl PostgresPool {
         Ok(RetainedWriteSession {
             original_pool: Arc::clone(self),
             connection,
+            original_transaction: None,
         })
     }
 }
@@ -249,6 +255,11 @@ impl RetainedWriteSession {
     /// Borrow from this original connection; first statements admit selected RC,
     /// namespace, then the one original-generation activation FOR SHARE.
     pub async fn begin(&mut self) -> Result<BoundWrite<'_>, RetainedWriteAdmissionError> {
+        if self.original_transaction.is_some() {
+            return Err(RetainedWriteAdmissionError::Begin(sqlx::Error::Protocol(
+                "original transaction identity is still retained".to_string(),
+            )));
+        }
         let mut transaction = self
             .connection
             .begin()
@@ -267,6 +278,17 @@ impl RetainedWriteSession {
             let rollback = transaction.rollback().await.err();
             return Err(RetainedWriteAdmissionError::Gate { original, rollback });
         }
+        // Capture from the actual selected transaction before application mutation.
+        let stamp = sqlx::query_scalar::<_, String>("SELECT pg_catalog.pg_current_xact_id()::text")
+            .fetch_one(&mut *transaction)
+            .await;
+        match stamp {
+            Ok(stamp) => self.original_transaction = Some(stamp),
+            Err(original) => {
+                let rollback = transaction.rollback().await.err();
+                return Err(RetainedWriteAdmissionError::Stamp { original, rollback });
+            }
+        }
         Ok(BoundWrite {
             transaction,
             _original_pool: &self.original_pool,
@@ -281,5 +303,67 @@ impl RetainedWriteSession {
             .execute(&mut *self.connection)
             .await?;
         Ok(OriginalSessionRollback { original: self })
+    }
+}
+
+/// Status of the original transaction, observed on its original physical connection.
+/// This grants no current-generation write, retirement, or all-session authority.
+pub enum OriginalTransactionOutcome {
+    Committed,
+    Aborted,
+}
+impl RetainedWriteSession {
+    /// First reconcile queued rollback, then ask about the captured xid8. Idle alone
+    /// never resolves an earlier uncertain COMMIT. NULL, in-progress, unknown status
+    /// or protocol error refuses while retaining the original connection and stamp.
+    pub async fn observe_original_transaction(
+        &mut self,
+    ) -> Result<OriginalTransactionOutcome, sqlx::Error> {
+        let stamp = self.original_transaction.as_ref().ok_or_else(|| {
+            sqlx::Error::Protocol("original transaction identity unavailable".to_string())
+        })?;
+        sqlx::query("ROLLBACK")
+            .execute(&mut *self.connection)
+            .await?;
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT pg_catalog.pg_xact_status($1::pg_catalog.xid8)")
+                .bind(stamp)
+                .fetch_one(&mut *self.connection)
+                .await?;
+        original_outcome(status.as_deref())
+    }
+}
+
+fn original_outcome(status: Option<&str>) -> Result<OriginalTransactionOutcome, sqlx::Error> {
+    match status {
+        Some("committed") => Ok(OriginalTransactionOutcome::Committed),
+        Some("aborted") => Ok(OriginalTransactionOutcome::Aborted),
+        _ => Err(sqlx::Error::Protocol(
+            "original transaction outcome remains unavailable".to_string(),
+        )),
+    }
+}
+#[cfg(test)]
+mod original_outcome_tests {
+    use super::*;
+    #[test]
+    fn unavailable_or_in_progress_history_cannot_resolve_original_commit() {
+        for status in [
+            None,
+            Some("in progress"),
+            Some("unknown"),
+            Some(""),
+            Some("COMMITTED"),
+        ] {
+            assert!(original_outcome(status).is_err());
+        }
+        assert!(matches!(
+            original_outcome(Some("committed")),
+            Ok(OriginalTransactionOutcome::Committed)
+        ));
+        assert!(matches!(
+            original_outcome(Some("aborted")),
+            Ok(OriginalTransactionOutcome::Aborted)
+        ));
     }
 }
