@@ -5,6 +5,9 @@
 //! have committed, so a retry after an ambiguous commit sends identical bytes and is recognized
 //! instead of duplicated.
 
+use crate::mutation_owner::MutationOutcome;
+use crate::mutation_owner::MutationOwner;
+use crate::mutation_owner::MutationTerminal;
 use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_git_utils::collect_git_info;
@@ -115,6 +118,7 @@ pub(crate) struct LiveThread {
     ordinals: Ordinals,
     pub(crate) ownership: Option<WriterOwnership>,
     sealed: bool,
+    mutation: MutationOwner,
 }
 
 impl LiveThread {
@@ -170,6 +174,7 @@ impl LiveThread {
             ordinals: Ordinals::for_new(params.history_mode, params.history_base),
             ownership: None,
             sealed: false,
+            mutation: MutationOwner::default(),
         }
     }
 
@@ -193,6 +198,7 @@ impl LiveThread {
             ordinals: Ordinals::resume(history_mode, last_ordinal),
             ownership: None,
             sealed: false,
+            mutation: MutationOwner::default(),
         }
     }
 
@@ -211,6 +217,7 @@ impl LiveThread {
     /// Cancellation leaves the original JoinHandle in this retained instance.
     /// Task termination is not a receipt that remote SQL rollback has completed.
     pub(crate) async fn finish_renewal(&mut self) -> ThreadStoreResult<()> {
+        self.finish_mutation_for_cleanup().await?;
         if let Some(owner) = self.ownership.as_mut() {
             if !owner.renewal_joined {
                 owner.renewer.abort();
@@ -227,6 +234,20 @@ impl LiveThread {
                     message: "writer lease renewal task failed during cleanup".to_string(),
                 });
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_mutation_failures(&self) -> bool {
+        self.mutation.has_original_failures()
+    }
+
+    pub(crate) fn require_shutdown_flushed(&self) -> ThreadStoreResult<()> {
+        if self.staged.is_some() || !self.pending.is_empty() {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "shutdown has unwritten original items; explicit discard is required"
+                    .to_string(),
+            });
         }
         Ok(())
     }
@@ -260,70 +281,78 @@ impl LiveThread {
     /// Write everything queued, materializing the thread on first use.
     pub(crate) async fn write(
         &mut self,
-        pool: &PostgresPool,
+        pool: &Arc<PostgresPool>,
         thread_id: ThreadId,
         default_model_provider_id: &str,
     ) -> ThreadStoreResult<()> {
         self.require_writer(thread_id)?;
-        if self.staged.is_none() {
-            let mut items = Vec::new();
-            if let Some(meta) = self.meta.as_ref() {
-                let git = if get_git_repo_root(&self.cwd).is_some() {
-                    collect_git_info(&self.cwd)
-                        .await
-                        .map(|info| ProtocolGitInfo {
-                            commit_hash: info.commit_hash,
-                            branch: info.branch,
-                            repository_url: info.repository_url,
-                        })
-                } else {
-                    None
-                };
-                items.push(RolloutItem::SessionMeta(SessionMetaLine {
-                    meta: meta.clone(),
-                    git,
-                }));
+        loop {
+            if self.mutation.is_present() {
+                self.resolve_mutation_for_write().await?;
             }
-            items.extend(self.pending.iter().cloned());
-            if items.is_empty() {
+            if self.staged.is_none() {
+                let mut items = Vec::new();
+                if let Some(meta) = self.meta.as_ref() {
+                    let git = if get_git_repo_root(&self.cwd).is_some() {
+                        collect_git_info(&self.cwd)
+                            .await
+                            .map(|info| ProtocolGitInfo {
+                                commit_hash: info.commit_hash,
+                                branch: info.branch,
+                                repository_url: info.repository_url,
+                            })
+                    } else {
+                        None
+                    };
+                    items.push(RolloutItem::SessionMeta(SessionMetaLine {
+                        meta: meta.clone(),
+                        git,
+                    }));
+                }
+                items.extend(self.pending.iter().cloned());
+                if items.is_empty() {
+                    return Ok(());
+                }
+                let mut ordinals = self.ordinals;
+                let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+                let mut lines = Vec::with_capacity(items.len());
+                for item in items.iter().cloned() {
+                    let ordinal = ordinals.current()?;
+                    let line = RolloutLine {
+                        timestamp: timestamp.clone(),
+                        ordinal,
+                        item,
+                    };
+                    let json = serde_json::to_string(&line).map_err(|error| {
+                        ThreadStoreError::Internal {
+                            message: format!("failed to serialize a rollout line: {error}"),
+                        }
+                    })?;
+                    lines.push((ordinal, json));
+                    ordinals.advance();
+                }
+                self.staged = Some((lines, items));
+                self.ordinals = ordinals;
+                self.meta = None;
+                self.pending.clear();
+            }
+            self.commit_staged(pool, thread_id, default_model_provider_id)
+                .await?;
+            if self.pending.is_empty() {
                 return Ok(());
             }
-            let mut ordinals = self.ordinals;
-            let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-            let mut lines = Vec::with_capacity(items.len());
-            for item in items.iter().cloned() {
-                let ordinal = ordinals.current()?;
-                let line = RolloutLine {
-                    timestamp: timestamp.clone(),
-                    ordinal,
-                    item,
-                };
-                let json =
-                    serde_json::to_string(&line).map_err(|error| ThreadStoreError::Internal {
-                        message: format!("failed to serialize a rollout line: {error}"),
-                    })?;
-                lines.push((ordinal, json));
-                ordinals.advance();
-            }
-            self.staged = Some((lines, items));
-            self.ordinals = ordinals;
-            self.meta = None;
-            self.pending.clear();
         }
-        self.commit_staged(pool, thread_id, default_model_provider_id)
-            .await
     }
 
     async fn commit_staged(
         &mut self,
-        pool: &PostgresPool,
+        pool: &Arc<PostgresPool>,
         thread_id: ThreadId,
         default_model_provider_id: &str,
     ) -> ThreadStoreResult<()> {
         let Some((lines, items)) = self.staged.clone() else {
             return Ok(());
         };
-        let count = lines.len() as u64;
         if self
             .ownership
             .as_ref()
@@ -336,16 +365,21 @@ impl LiveThread {
             .as_ref()
             .map(|ownership| (ownership.claim.owner_id.clone(), ownership.claim.token));
         let expected = self.next_position;
+        expected
+            .checked_add(lines.len() as u64)
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: "thread history position overflow".to_string(),
+            })?;
         let memory_mode = self.memory_mode;
         let history_mode = self.history_mode;
         let default_provider = default_model_provider_id.to_string();
-        let outcome: Result<(), ThreadStoreError> =
-            async {
-                let mut admitted = pool.begin_selected_write().await.map_err(|error| {
-                    ThreadStoreError::Internal {
-                        message: format!("PostgreSQL thread storage cannot accept writes: {error}"),
-                    }
-                })?;
+        let pool = Arc::clone(pool);
+        self.mutation.start(async move {
+            let mut admitted = match pool.begin_selected_write().await {
+                Ok(admitted) => admitted,
+                Err(error) => return MutationOutcome::AdmissionUncertain(error),
+            };
+            let command: ThreadStoreResult<()> = async {
                 // The lease is checked while holding its row, so a takeover cannot slip in between
                 // this check and the commit that follows it.
                 if let Some((owner_id, token)) = fence.as_ref() {
@@ -413,15 +447,66 @@ impl LiveThread {
                 append_in(&mut admitted, thread_id, expected, &lines)
                     .await
                     .map_err(rollout_error)?;
-                admitted.commit().await.map_err(database)?;
                 Ok(())
             }
             .await;
-        outcome?;
-        self.next_position = expected + count;
+            match command {
+                Ok(()) => match admitted.commit().await {
+                    Ok(()) => MutationOutcome::Committed,
+                    Err(database) => MutationOutcome::Uncertain {
+                        command: None,
+                        database,
+                    },
+                },
+                Err(command) => match admitted.rollback().await {
+                    Ok(()) => MutationOutcome::RolledBack(command),
+                    Err(database) => MutationOutcome::Uncertain {
+                        command: Some(command),
+                        database,
+                    },
+                },
+            }
+        })?;
+        self.resolve_mutation_for_write().await
+    }
+
+    fn apply_committed_batch(&mut self) -> ThreadStoreResult<()> {
+        let count = self
+            .staged
+            .as_ref()
+            .map_or(0, |(lines, _)| lines.len() as u64);
+        self.next_position =
+            self.next_position
+                .checked_add(count)
+                .ok_or_else(|| ThreadStoreError::Internal {
+                    message: "thread history position overflow".to_string(),
+                })?;
         self.staged = None;
         self.materialized = true;
-        Ok(())
+        self.mutation.acknowledge_commit()
+    }
+
+    async fn resolve_mutation_for_write(&mut self) -> ThreadStoreResult<()> {
+        match self.mutation.observe().await? {
+            MutationTerminal::Committed => self.apply_committed_batch(),
+            MutationTerminal::RolledBack(error) => {
+                let error = copy_mutation_error(error);
+                self.mutation.prepare_retry()?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn finish_mutation_for_cleanup(&mut self) -> ThreadStoreResult<()> {
+        if !self.mutation.is_present() {
+            return Ok(());
+        }
+        match self.mutation.observe().await? {
+            MutationTerminal::Committed => self.apply_committed_batch(),
+            // Actual command refusal is not SQL uncertainty: rollback already acknowledged.
+            // Keep that original cause in this frame while completing lease cleanup.
+            MutationTerminal::RolledBack(_) => Ok(()),
+        }
     }
 }
 
@@ -475,5 +560,23 @@ pub(crate) fn canonical_history_mode(items: &[RolloutItem]) -> ThreadHistoryMode
 fn ownership_lost(thread_id: ThreadId) -> ThreadStoreError {
     ThreadStoreError::Conflict {
         message: format!("the writer lease for thread {thread_id} was lost"),
+    }
+}
+
+fn copy_mutation_error(error: &ThreadStoreError) -> ThreadStoreError {
+    match error {
+        ThreadStoreError::ThreadNotFound { thread_id } => ThreadStoreError::ThreadNotFound {
+            thread_id: *thread_id,
+        },
+        ThreadStoreError::InvalidRequest { message } => ThreadStoreError::InvalidRequest {
+            message: message.clone(),
+        },
+        ThreadStoreError::Conflict { message } => ThreadStoreError::Conflict {
+            message: message.clone(),
+        },
+        ThreadStoreError::Unsupported { operation } => ThreadStoreError::Unsupported { operation },
+        ThreadStoreError::Internal { message } => ThreadStoreError::Internal {
+            message: message.clone(),
+        },
     }
 }

@@ -7,6 +7,7 @@ use tokio::task::JoinHandle;
 
 pub(crate) enum MutationOutcome {
     Committed,
+    AdmissionUncertain(codex_postgres_runtime::ActivationGateError),
     /// The original command refused, and the original transaction acknowledged rollback.
     RolledBack(ThreadStoreError),
     /// No physical completion acknowledgment exists. Keep every original cause.
@@ -49,6 +50,17 @@ impl MutationOwner {
         Ok(())
     }
 
+    pub(crate) fn has_original_failures(&self) -> bool {
+        !self.refusals.is_empty()
+            || matches!(
+                self.terminal,
+                Some(Ok(MutationOutcome::RolledBack(_)))
+                    | Some(Ok(MutationOutcome::Uncertain { .. }))
+                    | Some(Ok(MutationOutcome::AdmissionUncertain(_)))
+                    | Some(Err(_))
+            )
+    }
+
     pub(crate) fn is_present(&self) -> bool {
         self.task.is_some() || self.terminal.is_some()
     }
@@ -67,6 +79,12 @@ impl MutationOwner {
         match self.terminal.as_ref() {
             Some(Ok(MutationOutcome::Committed)) => Ok(MutationTerminal::Committed),
             Some(Ok(MutationOutcome::RolledBack(error))) => Ok(MutationTerminal::RolledBack(error)),
+            Some(Ok(MutationOutcome::AdmissionUncertain(error))) => {
+                let _ = error;
+                Err(refusal(
+                    "original mutation admission completion is uncertain",
+                ))
+            }
             Some(Ok(MutationOutcome::Uncertain { command, database })) => {
                 // Retain both originals; never interpolate database/command payload in logs.
                 let _ = (command, database);

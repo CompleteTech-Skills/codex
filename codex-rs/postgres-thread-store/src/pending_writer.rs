@@ -29,6 +29,7 @@ const MAX_REFUSAL_OBSERVATIONS: usize = 4;
 pub(super) struct PendingWriters {
     originals: RegistryMutex<HashMap<ThreadId, Arc<PendingWriter>>>,
     failed_history: RegistryMutex<Vec<Arc<PendingWriter>>>,
+    mutation_frames: RegistryMutex<Vec<Arc<Mutex<LiveThread>>>>,
 }
 
 pub(super) struct PendingWriter {
@@ -138,6 +139,55 @@ pub(super) struct WriterLaunch {
 }
 
 impl PendingWriters {
+    /// Reserve this exact registered original before its first SQL mutation dispatch.
+    pub(super) fn reserve_mutation(
+        &self,
+        original: &Arc<Mutex<LiveThread>>,
+    ) -> ThreadStoreResult<()> {
+        let pending = self
+            .originals
+            .lock()
+            .map_err(|_| internal("pending writer registry poisoned"))?;
+        let failures = self
+            .failed_history
+            .lock()
+            .map_err(|_| internal("pending failure history poisoned"))?;
+        let mut frames = self
+            .mutation_frames
+            .lock()
+            .map_err(|_| internal("original mutation ledger poisoned"))?;
+        if frames.iter().any(|frame| Arc::ptr_eq(frame, original)) {
+            return Ok(());
+        }
+        admit_population(pending.len().saturating_add(frames.len()), failures.len())?;
+        frames
+            .try_reserve(1)
+            .map_err(|_| internal("original mutation ledger capacity unavailable"))?;
+        frames.push(Arc::clone(original));
+        Ok(())
+    }
+
+    /// A failure keeps the same original frame and all its causes after live-map eviction.
+    /// No allocation is needed here: the original slot was admitted before dispatch.
+    pub(super) fn complete_mutation_frame(
+        &self,
+        original: &Arc<Mutex<LiveThread>>,
+        failed: bool,
+    ) -> ThreadStoreResult<()> {
+        let mut frames = self
+            .mutation_frames
+            .lock()
+            .map_err(|_| internal("original mutation ledger poisoned"))?;
+        let position = frames.iter().position(|frame| Arc::ptr_eq(frame, original));
+        if failed && position.is_none() {
+            return Err(internal("original mutation failure reservation is absent"));
+        }
+        if !failed && let Some(position) = position {
+            frames.remove(position);
+        }
+        Ok(())
+    }
+
     /// Registry insertion precedes task creation. No await or fallible allocation is
     /// permitted between spawning the task and retaining its original JoinHandle.
     pub(super) fn start(&self, launch: WriterLaunch) -> ThreadStoreResult<Arc<PendingWriter>> {
@@ -155,7 +205,15 @@ impl PendingWriters {
             .lock()
             .map_err(|_| internal("pending failure history poisoned"))?
             .len();
-        admit_population(originals.len(), retained_failures)?;
+        let mutation_frames = self
+            .mutation_frames
+            .lock()
+            .map_err(|_| internal("original mutation ledger poisoned"))?
+            .len();
+        admit_population(
+            originals.len().saturating_add(mutation_frames),
+            retained_failures,
+        )?;
         originals
             .try_reserve(1)
             .map_err(|_| internal("pending writer registry capacity unavailable"))?;

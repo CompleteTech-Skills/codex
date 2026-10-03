@@ -218,6 +218,11 @@ impl PostgresThreadStore {
             ));
         }
         let completed = pending.cleanup().await?;
+        {
+            let live = Arc::clone(pending.original()).lock_owned().await;
+            self.pending_writers
+                .complete_mutation_frame(pending.original(), live.has_mutation_failures())?;
+        }
         self.pending_writers.remove_cleaned(thread_id, completed)?;
         self.evict_live_instance(thread_id, pending.original())
             .await;
@@ -314,6 +319,7 @@ impl PostgresThreadStore {
 
     async fn write_live(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
         let live = self.live_thread(thread_id).await?;
+        self.pending_writers.reserve_mutation(&live)?;
         let mut live = live.lock_owned().await;
         live.write(&self.pool, thread_id, &self.default_model_provider_id)
             .await
@@ -621,6 +627,7 @@ impl ThreadStore for PostgresThreadStore {
         Box::pin(async move {
             let thread_id = params.thread_id;
             let live = self.live_thread(thread_id).await?;
+            self.pending_writers.reserve_mutation(&live)?;
             let mut live = live.lock_owned().await;
             live.require_writer(thread_id)?;
             let history_mode = live.history_mode;
@@ -675,6 +682,7 @@ impl ThreadStore for PostgresThreadStore {
             if !live.is_sealed() {
                 live.require_writer(thread_id)?;
                 if !live.is_deferred_and_empty() {
+                    self.pending_writers.reserve_mutation(&original)?;
                     live.write(&self.pool, thread_id, &self.default_model_provider_id)
                         .await?;
                 }
@@ -683,6 +691,9 @@ impl ThreadStore for PostgresThreadStore {
             // Original remains in the registry through canceled/failed release; a retry
             // completes cleanup without reopening or rewriting the sealed instance.
             live.finish_renewal().await?;
+            live.require_shutdown_flushed()?;
+            self.pending_writers
+                .complete_mutation_frame(&original, live.has_mutation_failures())?;
             if let Some(owner) = live.ownership.as_ref() {
                 self.pool
                     .release_thread_ownership(&owner.claim)
@@ -706,6 +717,8 @@ impl ThreadStore for PostgresThreadStore {
             let mut live = Arc::clone(&original).lock_owned().await;
             live.seal();
             live.finish_renewal().await?;
+            self.pending_writers
+                .complete_mutation_frame(&original, live.has_mutation_failures())?;
             if let Some(owner) = live.ownership.as_ref() {
                 self.pool
                     .release_thread_ownership(&owner.claim)
@@ -1099,6 +1112,8 @@ impl PostgresThreadStore {
             let mut live = Arc::clone(&original).lock_owned().await;
             live.seal();
             live.finish_renewal().await?;
+            self.pending_writers
+                .complete_mutation_frame(&original, live.has_mutation_failures())?;
         }
         Ok(originals)
     }
@@ -1115,6 +1130,7 @@ impl PostgresThreadStore {
 
     async fn flush_thread_inner(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
         let live = self.live_thread(thread_id).await?;
+        self.pending_writers.reserve_mutation(&live)?;
         let mut live = live.lock_owned().await;
         live.require_writer(thread_id)?;
         if live.is_deferred_and_empty() {
