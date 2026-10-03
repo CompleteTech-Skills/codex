@@ -705,6 +705,9 @@ async fn real_postgres_thread_store() {
         .delete_thread(DeleteThreadParams { thread_id: shared })
         .await
         .expect("delete shared thread");
+    for history in [false, true] {
+        original_resume_query_cancellation_control(state, &provider, &cwd, history).await;
+    }
     original_metadata_refusal_control(state, &provider, &cwd).await;
     original_claim_response_loss_control(state, &provider, &cwd).await;
     canceled_original_claim_control(state, &provider, &cwd).await;
@@ -1481,4 +1484,200 @@ async fn original_metadata_refusal_control(state: &Path, provider: &str, cwd: &P
     let lease: (Option<String>, Option<bool>) = sqlx::query_as("SELECT owner_id::text, lease_until IS NOT NULL FROM codex_storage.thread_writer_ownership WHERE thread_id=$1::uuid")
         .bind(id.to_string()).fetch_one(&mut *connection).await.expect("real claimed and released metadata attempt");
     assert_eq!(lease, (None, Some(false)));
+}
+
+async fn original_resume_query_cancellation_control(
+    state: &Path,
+    provider: &str,
+    cwd: &Path,
+    history: bool,
+) {
+    let observer = connect(state, "runtime").await;
+    let seed = PostgresThreadStore::new(Arc::clone(&observer), provider.to_owned());
+    let id = ThreadId::new();
+    seed.create_thread(create_params(id, provider, cwd))
+        .await
+        .expect("seed original resume");
+    seed.append_items(AppendThreadItemsParams {
+        thread_id: id,
+        items: vec![user_message("original history remains")],
+    })
+    .await
+    .expect("seed nonempty history");
+    seed.persist_thread(id, PersistContext::Standard)
+        .await
+        .expect("persist original resume");
+    seed.shutdown_thread(id).await.expect("release seed writer");
+    let before = lease_wait_snapshot(&observer, id).await;
+    let mut selected = settings(state, "runtime");
+    selected.limits.max_connections = 1;
+    let pool = Arc::new(
+        PostgresPool::connect_in_namespace(selected, None)
+            .await
+            .expect("original selected pool"),
+    );
+    pool.bind_current_activation()
+        .await
+        .expect("actual bound activation");
+    let writer_pid: i32 = {
+        let mut connection = pool.acquire().await.expect("original physical connection");
+        sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+            .fetch_one(&mut *connection)
+            .await
+            .expect("exact original backend PID")
+    };
+    let writer = PostgresThreadStore::new(Arc::clone(&pool), provider.to_owned());
+    let migrator = connect(state, "migrator").await;
+    let mut blocker = migrator
+        .begin_serializable()
+        .await
+        .expect("original lock transaction");
+    sqlx::query("SET LOCAL ROLE codex_owner")
+        .execute(blocker.connection())
+        .await
+        .expect("owned fixture DDL authority");
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+        .fetch_one(blocker.connection())
+        .await
+        .expect("blocker PID");
+    let relation = if history {
+        "codex_storage.thread_rollout_lines"
+    } else {
+        "codex_storage.threads"
+    };
+    // Literal-only match arms avoid accepting arbitrary SQL as a safe query.
+    if history {
+        sqlx::query("LOCK TABLE codex_storage.thread_rollout_lines IN ACCESS EXCLUSIVE MODE")
+            .execute(blocker.connection())
+            .await
+            .expect("actual history table lock");
+    } else {
+        sqlx::query("LOCK TABLE codex_storage.threads IN ACCESS EXCLUSIVE MODE")
+            .execute(blocker.connection())
+            .await
+            .expect("actual metadata table lock");
+    }
+    let params = ResumeThreadParams {
+        thread_id: id,
+        rollout_path: None,
+        history: None,
+        history_revision: None,
+        include_archived: false,
+        metadata: create_params(id, provider, cwd).metadata,
+    };
+    let mut resume = Box::pin(writer.resume_thread(params));
+    let witness = async {
+        let mut connection = observer
+            .acquire()
+            .await
+            .map_err(|_| "observer unavailable")?;
+        loop {
+            let blocked: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity a WHERE a.pid=$1 AND a.xact_start IS NOT NULL AND $2=ANY(pg_catalog.pg_blocking_pids(a.pid)) AND EXISTS(SELECT 1 FROM pg_catalog.pg_locks l WHERE l.pid=a.pid AND NOT l.granted AND l.relation=$3::regclass))")
+                .bind(writer_pid).bind(blocker_pid).bind(relation).fetch_one(&mut *connection).await.map_err(|_| "actual resume wait witness failed")?;
+            if blocked {
+                return Ok::<(), &str>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let (observed, premature) = tokio::select! {
+        result = &mut resume => (Err("resume completed before actual query wait"), Some(result)),
+        result = tokio::time::timeout(Duration::from_secs(5), witness) => (result.map_err(|_| "resume wait deadline").and_then(|result| result), None),
+    };
+    let pending_before = writer.pending_writers.get(id);
+    let pending = pending_before
+        .as_ref()
+        .ok()
+        .and_then(|pending| pending.as_ref());
+    let task_id = pending.and_then(|pending| pending.original_task_id());
+    let load_task_id = pending.and_then(|pending| pending.load.original_task_id());
+    let attempt = pending.and_then(|pending| pending.original_attempt());
+    drop(resume); // Cancel the real metadata/history SELECT caller, not its claimed owner.
+    let pending_after = writer.pending_writers.get(id);
+    let same_original = match (&pending_before, &pending_after) {
+        (Ok(Some(before)), Ok(Some(after))) => {
+            Arc::ptr_eq(before, after)
+                && load_task_id.is_some()
+                && after.load.original_task_id() == load_task_id
+                && task_id.is_some()
+                && after.original_task_id() == task_id
+                && Arc::ptr_eq(after.original_pool(), &pool)
+                && matches!((&attempt, after.original_attempt()), (Some(before), Some(after)) if Arc::ptr_eq(before, &after))
+        }
+        _ => false,
+    };
+    let mut release = Box::pin(blocker.rollback());
+    let (release_late, released) =
+        match tokio::time::timeout(Duration::from_secs(10), &mut release).await {
+            Ok(result) => (false, result),
+            Err(_) => (true, (&mut release).await),
+        };
+    drop(release);
+    let mut cleanup = Box::pin(writer.discard_thread(id));
+    let (cleanup_late, cleaned) =
+        match tokio::time::timeout(Duration::from_secs(10), &mut cleanup).await {
+            Ok(result) => (false, result),
+            Err(_) => (true, (&mut cleanup).await),
+        };
+    drop(cleanup);
+    if released.is_err() || cleaned.is_err() {
+        eprintln!("resume query cleanup uncertain; original query/pool/writer host retained");
+        std::future::pending::<()>().await;
+    }
+    // A successful round trip on the exact original backend establishes protocol drain.
+    let ready = async {
+        let mut connection = pool
+            .acquire()
+            .await
+            .map_err(|_| "original connection unavailable")?;
+        sqlx::query_scalar::<_, i32>("SELECT pg_catalog.pg_backend_pid()")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| "original protocol readback failed")
+    };
+    tokio::pin!(ready);
+    let (ready_late, ready_pid) =
+        match tokio::time::timeout(Duration::from_secs(10), &mut ready).await {
+            Ok(result) => (false, result),
+            Err(_) => (true, (&mut ready).await),
+        };
+    if ready_pid.is_err() {
+        std::future::pending::<()>().await;
+    }
+    // All original SQL continuations have reconciled before failure diagnostics.
+    assert!(
+        observed.is_ok() && premature.is_none(),
+        "exact blocked query: {observed:?}"
+    );
+    assert!(same_original);
+    assert!(!release_late && !cleanup_late && !ready_late);
+    assert_eq!(ready_pid.expect("actual backend ready"), writer_pid);
+    let mut connection = observer
+        .acquire()
+        .await
+        .expect("independent physical state");
+    let idle: bool = sqlx::query_scalar(
+        "SELECT state='idle' AND xact_start IS NULL FROM pg_catalog.pg_stat_activity WHERE pid=$1",
+    )
+    .bind(writer_pid)
+    .fetch_one(&mut *connection)
+    .await
+    .expect("actual original SQL idle state");
+    assert!(idle);
+    drop(connection);
+    assert!(
+        writer
+            .pending_writers
+            .get(id)
+            .expect("pending ownership readback")
+            .is_none()
+    );
+    assert!(matches!(
+        writer.live_thread(id).await,
+        Err(ThreadStoreError::ThreadNotFound { .. })
+    ));
+    assert_eq!(lease_wait_snapshot(&observer, id).await, before);
+    seed.delete_thread(DeleteThreadParams { thread_id: id })
+        .await
+        .expect("delete owned fixture");
 }

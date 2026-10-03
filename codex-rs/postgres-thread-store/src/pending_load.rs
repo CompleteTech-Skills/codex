@@ -222,4 +222,70 @@ mod tests {
         assert!(owner.observe(true).await.is_err());
         Ok(())
     }
+    #[tokio::test]
+    async fn completed_refusal_and_never_started_load_grant_only_task_join() -> ThreadStoreResult<()>
+    {
+        let empty = PendingLoad::default();
+        let _empty_join = empty.close_join().await?;
+        assert!(
+            empty
+                .start(async { Ok(Arc::new((Vec::new(), 0, None))) })
+                .is_err()
+        );
+        let refused = PendingLoad::default();
+        refused.start(async { Err(internal("original query refusal")) })?;
+        let _actual_join = refused.close_join().await?;
+        let state = refused
+            .state
+            .lock()
+            .map_err(|_| internal("test state poisoned"))?;
+        assert!(
+            matches!(state.result.as_ref(), Some(Err(codex_thread_store::ThreadStoreError::Internal { message })) if message == "original query refusal")
+        );
+        assert!(state.task.is_none() && state.failure.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poisoned_observation_cannot_grant_terminal_ack() -> ThreadStoreResult<()> {
+        let owner = PendingLoad::default();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_task = Arc::clone(&entered);
+        let release_task = Arc::clone(&release);
+        owner.start(async move {
+            entered_task.notify_one();
+            release_task.notified().await;
+            Ok(Arc::new((Vec::new(), 0, None)))
+        })?;
+        entered.notified().await;
+        let original_id = owner.original_task_id();
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _original_guard = owner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("causal original registry poison");
+        }));
+        let refused = owner.close_join().await.is_err();
+        let mut original = owner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .task
+            .take();
+        let retained_id = original.as_ref().map(tokio::task::JoinHandle::id);
+        // Original task is always released and reaped before diagnostic assertions.
+        release.notify_one();
+        let result = match original.as_mut() {
+            Some(task) => Some(task.await),
+            None => None,
+        };
+        assert!(poisoned.is_err() && refused);
+        assert!(original_id.is_some());
+        assert_eq!(retained_id, original_id);
+        assert!(matches!(result, Some(Ok(Ok(_)))));
+        assert!(owner.close_join().await.is_err()); // Poison is never silently adopted.
+        Ok(())
+    }
 }
