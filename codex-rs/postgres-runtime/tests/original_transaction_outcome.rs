@@ -45,10 +45,11 @@ async fn selected_outcomes(
     namespace: Option<NamedNamespace>,
 ) -> ControlResult<()> {
     let original = Arc::new(
-        PostgresPool::connect_in_namespace(settings(state, role)?, namespace.clone()).await?,
+        PostgresPool::connect_in_namespace(settings(state, role)?, namespace.as_ref()).await?,
     );
-    let independent =
-        Arc::new(PostgresPool::connect_in_namespace(settings(state, role)?, namespace).await?);
+    let independent = Arc::new(
+        PostgresPool::connect_in_namespace(settings(state, role)?, namespace.as_ref()).await?,
+    );
     original.bind_current_activation().await?;
     independent.bind_current_activation().await?;
     for commit in [true, false] {
