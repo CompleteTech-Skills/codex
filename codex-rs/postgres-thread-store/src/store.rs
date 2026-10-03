@@ -94,6 +94,8 @@ pub struct PostgresThreadStore {
     rollouts: PostgresRolloutStore,
     default_model_provider_id: String,
     live: Mutex<HashMap<ThreadId, Arc<Mutex<LiveThread>>>>,
+    // Serialize local creation/closure across original-instance registry transitions.
+    writer_lifecycle: tokio::sync::Semaphore,
     pending_metadata: Mutex<HashMap<ThreadId, ThreadMetadataPatch>>,
     writer_lease: Duration,
     renew_every: Duration,
@@ -114,6 +116,7 @@ impl PostgresThreadStore {
             pool,
             default_model_provider_id: default_model_provider_id.into(),
             live: Mutex::default(),
+            writer_lifecycle: tokio::sync::Semaphore::new(1),
             pending_metadata: Mutex::default(),
             writer_lease: Duration::from_secs(30),
             renew_every: Duration::from_secs(10),
@@ -175,7 +178,7 @@ impl PostgresThreadStore {
             lost,
             renewer,
             renewal_joined: false,
-            renewal_failed: false,
+            renewal_error: None,
         })
     }
 
@@ -443,6 +446,7 @@ impl ThreadStore for PostgresThreadStore {
 
     fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
+            let _lifecycle = self.writer_lifecycle.acquire().await.map_err(internal)?;
             let thread_id = params.thread_id;
             if self.live.lock().await.contains_key(&thread_id) {
                 return Err(ThreadStoreError::InvalidRequest {
@@ -507,6 +511,7 @@ impl ThreadStore for PostgresThreadStore {
         params: ResumeThreadParams,
     ) -> ThreadStoreFuture<'_, Arc<Vec<RolloutItem>>> {
         Box::pin(async move {
+            let _lifecycle = self.writer_lifecycle.acquire().await.map_err(internal)?;
             let thread_id = params.thread_id;
             if self.live.lock().await.contains_key(&thread_id) {
                 return Err(ThreadStoreError::InvalidRequest {
@@ -626,6 +631,7 @@ impl ThreadStore for PostgresThreadStore {
 
     fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
+            let _lifecycle = self.writer_lifecycle.acquire().await.map_err(internal)?;
             let original = self.live_thread(thread_id).await?;
             let mut live = original.lock().await;
             if !live.is_sealed() {
@@ -652,6 +658,7 @@ impl ThreadStore for PostgresThreadStore {
 
     fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
+            let _lifecycle = self.writer_lifecycle.acquire().await.map_err(internal)?;
             let original = self.live_thread(thread_id).await?;
             let mut live = original.lock().await;
             live.seal();
@@ -987,6 +994,7 @@ impl ThreadStore for PostgresThreadStore {
 
     fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
+            let _lifecycle = self.writer_lifecycle.acquire().await.map_err(internal)?;
             let originals = self.seal_live_instances(&[params.thread_id]).await?;
             let deleted = self
                 .catalog
@@ -1009,6 +1017,7 @@ impl ThreadStore for PostgresThreadStore {
 
     fn delete_threads(&self, params: DeleteThreadsParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
+            let _lifecycle = self.writer_lifecycle.acquire().await.map_err(internal)?;
             let originals = self.seal_live_instances(&params.thread_ids).await?;
             self.catalog
                 .delete_threads_strict(&params.thread_ids)

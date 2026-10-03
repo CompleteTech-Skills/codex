@@ -88,7 +88,7 @@ pub(crate) struct WriterOwnership {
     pub(crate) lost: Arc<AtomicBool>,
     pub(crate) renewer: tokio::task::JoinHandle<()>,
     pub(crate) renewal_joined: bool,
-    pub(crate) renewal_failed: bool,
+    pub(crate) renewal_error: Option<tokio::task::JoinError>,
 }
 
 impl Drop for WriterOwnership {
@@ -216,9 +216,13 @@ impl LiveThread {
                 owner.renewer.abort();
                 let result = (&mut owner.renewer).await;
                 owner.renewal_joined = true;
-                owner.renewal_failed = result.is_err_and(|error| !error.is_cancelled());
+                owner.renewal_error = result.err();
             }
-            if owner.renewal_failed {
+            if owner
+                .renewal_error
+                .as_ref()
+                .is_some_and(|error| !error.is_cancelled())
+            {
                 return Err(ThreadStoreError::Internal {
                     message: "writer lease renewal task failed during cleanup".to_string(),
                 });
