@@ -33,6 +33,7 @@ use tokio::time::timeout;
 use zeroize::Zeroizing;
 
 mod activation_gate;
+mod migration_login;
 mod session_binding;
 pub use activation_gate::ActivationGateError;
 pub use activation_gate::require_storage_open;
@@ -187,7 +188,7 @@ pub struct PostgresPool {
 
 impl PostgresPool {
     pub async fn connect(settings: ConnectionSettings) -> Result<Self, PoolError> {
-        Self::connect_with_search_path(settings, None).await
+        Self::connect_with_search_path(settings, None, None).await
     }
 
     /// Connect so that unqualified table names resolve inside one namespace.
@@ -198,12 +199,33 @@ impl PostgresPool {
         settings: ConnectionSettings,
         namespace: Option<&NamedNamespace>,
     ) -> Result<Self, PoolError> {
-        Self::connect_with_search_path(settings, Some(owned_namespace_search_path(namespace))).await
+        Self::connect_with_search_path(settings, Some(owned_namespace_search_path(namespace)), None)
+            .await
+    }
+
+    /// Separately credentialed migration pool. Authenticates the genuine derived
+    /// migrator login and selects its owner role on every physical connection.
+    /// It does not bootstrap, change grants, select a backend, or grant quiescence.
+    pub async fn connect_migration_in_namespace(
+        settings: ConnectionSettings,
+        namespace: Option<&NamedNamespace>,
+    ) -> Result<Self, PoolError> {
+        let login = migration_login::MigrationLogin::new(namespace);
+        if !login.accepts_login(&settings.username) {
+            return Err(PoolError::InvalidSettings);
+        }
+        Self::connect_with_search_path(
+            settings,
+            Some(owned_namespace_search_path(namespace)),
+            Some(login),
+        )
+        .await
     }
 
     async fn connect_with_search_path(
         settings: ConnectionSettings,
         search_path: Option<String>,
+        migration_login: Option<migration_login::MigrationLogin>,
     ) -> Result<Self, PoolError> {
         let selected_search_path = search_path.clone();
         let limits = settings.limits;
@@ -261,7 +283,11 @@ impl PostgresPool {
                     move |connection, _| {
                         let rejected_version = Arc::clone(&rejected_version);
                         let search_path = search_path.clone();
+                        let migration_login = migration_login.clone();
                         Box::pin(async move {
+                            if let Some(login) = migration_login {
+                                login.initialize(&mut *connection).await?;
+                            }
                             if let Some(search_path) = search_path {
                                 sqlx::query("SELECT set_config('search_path', $1, false)")
                                     .bind(search_path)
