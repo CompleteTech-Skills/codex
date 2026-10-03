@@ -15,7 +15,7 @@ pub(crate) struct ActivationBinding {
 /// An actual admitted transaction begun internally on its original immutable bound pool.
 /// It cannot be constructed from a bare connection, tuple, or successful earlier readback.
 pub struct BoundWrite<'a> {
-    transaction: sqlx::Transaction<'static, sqlx::Postgres>,
+    transaction: sqlx::Transaction<'a, sqlx::Postgres>,
     _original_pool: &'a PostgresPool,
 }
 
@@ -187,5 +187,99 @@ impl PostgresPool {
         } else {
             Err(ActivationGateError::GenerationChanged)
         }
+    }
+}
+
+/// Owns the actual original connection outside its borrowed SQLx transaction.
+/// Failed commit/rollback cannot destroy or return that connection to the pool.
+/// Host must retain this frame across cancellation; it is not store-wide drain proof.
+pub struct RetainedWriteSession {
+    original_pool: Arc<PostgresPool>,
+    connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
+}
+
+/// Available original admission causes, not a terminal or rollback capability.
+pub enum RetainedWriteAdmissionError {
+    Begin(sqlx::Error),
+    Gate {
+        original: ActivationGateError,
+        rollback: Option<sqlx::Error>,
+    },
+}
+impl std::fmt::Debug for RetainedWriteAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RetainedWriteAdmissionError([retained causes])")
+    }
+}
+impl std::fmt::Display for RetainedWriteAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("original selected write admission failed")
+    }
+}
+impl std::error::Error for RetainedWriteAdmissionError {}
+
+/// Acknowledges ROLLBACK on this exact original connection only.
+/// Does not determine earlier uncertain COMMIT, authorize writes or generation
+/// adoption, retire storage, or establish any other session's physical closure.
+pub struct OriginalSessionRollback<'a> {
+    original: &'a RetainedWriteSession,
+}
+impl OriginalSessionRollback<'_> {
+    pub fn original_pool(&self) -> &Arc<PostgresPool> {
+        &self.original.original_pool
+    }
+}
+impl PostgresPool {
+    /// Only this genuine pool produces the owner; no supplied connection/tuple.
+    pub async fn acquire_retained_write(
+        self: &Arc<Self>,
+    ) -> Result<RetainedWriteSession, crate::PoolError> {
+        let connection = self.acquire().await?;
+        Ok(RetainedWriteSession {
+            original_pool: Arc::clone(self),
+            connection,
+        })
+    }
+}
+impl RetainedWriteSession {
+    pub fn original_pool(&self) -> &Arc<PostgresPool> {
+        &self.original_pool
+    }
+
+    /// Borrow from this original connection; first statements admit selected RC,
+    /// namespace, then the one original-generation activation FOR SHARE.
+    pub async fn begin(&mut self) -> Result<BoundWrite<'_>, RetainedWriteAdmissionError> {
+        let mut transaction = self
+            .connection
+            .begin()
+            .await
+            .map_err(RetainedWriteAdmissionError::Begin)?;
+        let admission = async {
+            self.original_pool
+                .prepare_selected_write(&mut transaction)
+                .await?;
+            self.original_pool
+                .require_bound_storage_open(&mut transaction)
+                .await
+        }
+        .await;
+        if let Err(original) = admission {
+            let rollback = transaction.rollback().await.err();
+            return Err(RetainedWriteAdmissionError::Gate { original, rollback });
+        }
+        Ok(BoundWrite {
+            transaction,
+            _original_pool: &self.original_pool,
+        })
+    }
+
+    /// Reconcile this retained connection, including queued SQLx rollback.
+    /// Earlier error or another pool roundtrip cannot produce this borrowed token.
+    /// Error/cancellation leaves the original connection in this owning frame.
+    pub async fn rollback_original(&mut self) -> Result<OriginalSessionRollback<'_>, sqlx::Error> {
+        sqlx::query("ROLLBACK")
+            .execute(&mut *self.connection)
+            .await?;
+        Ok(OriginalSessionRollback { original: self })
     }
 }
