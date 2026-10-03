@@ -705,4 +705,414 @@ async fn real_postgres_thread_store() {
         .delete_thread(DeleteThreadParams { thread_id: shared })
         .await
         .expect("delete shared thread");
+    retained_live_controls(state, &provider, &cwd).await;
+    // Same opt-in fixture/test: avoid parallel cases contaminating lifecycle list assertions.
+    for ownership_lock in [true, false] {
+        for expire in [true, false] {
+            lease_wait_control(state, &provider, &cwd, ownership_lock, expire).await;
+        }
+    }
+}
+
+// Exercise real lock waits, including a wait after the first ownership predicate.
+async fn lease_wait_control(
+    state: &Path,
+    provider: &str,
+    cwd: &Path,
+    ownership_lock: bool,
+    expire: bool,
+) {
+    let observer = connect(state, "runtime").await;
+    let migrator = connect(state, "migrator").await;
+    // One original physical connection: capture its PID before dispatch, then require the
+    // observed blocked transaction to be on that exact backend. A reconnect cannot pass.
+    let mut writer_settings = settings(state, "runtime");
+    writer_settings.limits.max_connections = 1;
+    let writer_pool = Arc::new(
+        PostgresPool::connect_in_namespace(writer_settings, None)
+            .await
+            .expect("single original writer pool"),
+    );
+    writer_pool
+        .bind_current_activation()
+        .await
+        .expect("bind original writer activation");
+    let writer = PostgresThreadStore::new(Arc::clone(&writer_pool), provider.to_string())
+        .with_writer_lease(
+            Duration::from_secs(if expire { 5 } else { 30 }),
+            Duration::from_secs(3600),
+        );
+    let id = ThreadId::new();
+    writer
+        .create_thread(create_params(id, provider, cwd))
+        .await
+        .expect("create wait fixture");
+    writer
+        .persist_thread(id, PersistContext::Standard)
+        .await
+        .expect("materialize wait fixture");
+    let before = lease_wait_snapshot(&observer, id).await;
+    let position = writer
+        .live_thread(id)
+        .await
+        .expect("live fixture")
+        .lock_owned()
+        .await
+        .next_position;
+    let mut lock = migrator
+        .begin_serializable()
+        .await
+        .expect("authenticated blocker transaction");
+    sqlx::query("SET LOCAL ROLE codex_owner")
+        .execute(lock.connection())
+        .await
+        .expect("authorized owner role for blocker");
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(lock.connection())
+        .await
+        .expect("blocker PID");
+    if ownership_lock {
+        sqlx::query("SELECT thread_id FROM codex_storage.thread_writer_ownership WHERE thread_id = $1::uuid FOR UPDATE")
+            .bind(id.to_string()).fetch_one(lock.connection()).await.expect("ownership row lock without update");
+    } else {
+        sqlx::query("SELECT id FROM codex_storage.threads WHERE id = $1::uuid FOR UPDATE")
+            .bind(id.to_string())
+            .fetch_one(lock.connection())
+            .await
+            .expect("catalog row lock without update");
+    }
+    let writer_pid: i32 = {
+        let mut original = writer_pool
+            .acquire()
+            .await
+            .expect("original exclusive writer connection");
+        sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+            .fetch_one(&mut *original)
+            .await
+            .expect("original physical writer PID")
+    };
+    // Retain the exact original future through deadline observations and reconciliation.
+    let mut write = Box::pin(writer.append_items(AppendThreadItemsParams {
+        thread_id: id,
+        items: vec![user_message("blocked lease write")],
+    }));
+    let monitor = async {
+        let mut connection = observer
+            .acquire()
+            .await
+            .map_err(|_| "observer acquire failed".to_string())?;
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity a \
+                 WHERE a.pid = $2 AND a.xact_start IS NOT NULL \
+                 AND $1 = ANY(pg_blocking_pids(a.pid)) AND EXISTS \
+                 (SELECT 1 FROM pg_locks l WHERE l.pid = a.pid AND NOT l.granted))",
+            )
+            .bind(blocker_pid)
+            .bind(writer_pid)
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| "observe native lock wait failed".to_string())?;
+            if waiting {
+                let valid: bool = sqlx::query_scalar(
+                    "SELECT lease_until > clock_timestamp() FROM codex_storage.thread_writer_ownership WHERE thread_id = $1::uuid",
+                ).bind(id.to_string()).fetch_one(&mut *connection).await.map_err(|_| "lease valid at observed lock wait failed".to_string())?;
+                if !valid {
+                    return Err("first observed lock wait was already expired".to_string());
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if expire {
+            loop {
+                let expired: bool = sqlx::query_scalar(
+                    "SELECT lease_until <= clock_timestamp() FROM codex_storage.thread_writer_ownership WHERE thread_id = $1::uuid",
+                ).bind(id.to_string()).fetch_one(&mut *connection).await.map_err(|_| "observe server-clock expiry failed".to_string())?;
+                if expired {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        } else {
+            let valid: bool = sqlx::query_scalar(
+                "SELECT lease_until > clock_timestamp() FROM codex_storage.thread_writer_ownership WHERE thread_id = $1::uuid",
+            ).bind(id.to_string()).fetch_one(&mut *connection).await.map_err(|_| "valid waiting lease failed".to_string())?;
+            if !valid {
+                return Err("control lease expired before releasing lock".to_string());
+            }
+        }
+        Ok(())
+    };
+    let (observation, completed) = tokio::select! {
+        result = &mut write => (Err(format!("writer finished before lock observation: {result:?}")), Some(result)),
+        observed = tokio::time::timeout(Duration::from_secs(15), monitor) => (observed.map_err(|_| "lock/expiry observation timed out".to_string()).and_then(|result| result), None),
+    };
+    // Release BEFORE assertions; unwind also rolls back the owned transaction and drops write.
+    let mut rollback = Box::pin(lock.rollback());
+    let rollback_deadline = tokio::time::timeout(Duration::from_secs(10), &mut rollback).await;
+    let (rollback_late, released) = match rollback_deadline {
+        Ok(result) => (false, result),
+        Err(_) => {
+            eprintln!(
+                "blocker deadline exceeded; original rollback retained pending reconciliation"
+            );
+            (true, rollback.await)
+        }
+    };
+    let (writer_late, result) = match completed {
+        Some(result) => (false, result),
+        None => match tokio::time::timeout(Duration::from_secs(10), &mut write).await {
+            Ok(result) => (false, result),
+            Err(_) => {
+                eprintln!(
+                    "writer deadline exceeded; original writer future retained pending reconciliation"
+                );
+                (true, (&mut write).await)
+            }
+        },
+    };
+    drop(write);
+    // Assertions follow reconciliation of both original SQL futures, never deadline cancellation.
+    released.expect("release owned blocker");
+    assert!(
+        !rollback_late && !writer_late,
+        "original SQL exceeded reconciliation deadline"
+    );
+    assert!(observation.is_ok(), "{observation:?}");
+    if expire {
+        assert!(
+            matches!(result, Err(ThreadStoreError::Conflict { .. })),
+            "expired blocked writer: {result:?}"
+        );
+        assert_eq!(lease_wait_snapshot(&observer, id).await, before);
+        assert_eq!(
+            writer
+                .live_thread(id)
+                .await
+                .expect("live after refusal")
+                .lock_owned()
+                .await
+                .next_position,
+            position
+        );
+        // Repeating the same staged batch cannot commit after the refusal.
+        let retry = writer.flush_thread(id).await;
+        assert!(
+            matches!(retry, Err(ThreadStoreError::Conflict { .. })),
+            "expired retry: {retry:?}"
+        );
+        assert_eq!(lease_wait_snapshot(&observer, id).await, before);
+        assert_eq!(
+            writer
+                .live_thread(id)
+                .await
+                .expect("live after retry")
+                .lock_owned()
+                .await
+                .next_position,
+            position
+        );
+    } else {
+        result.expect("valid blocked writer commits");
+        assert_eq!(
+            writer
+                .live_thread(id)
+                .await
+                .expect("live committed")
+                .lock_owned()
+                .await
+                .next_position,
+            position + 1
+        );
+        let history = writer
+            .load_history(LoadThreadHistoryParams {
+                thread_id: id,
+                include_archived: false,
+            })
+            .await
+            .expect("valid history");
+        assert_eq!(
+            history
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::EventMsg(EventMsg::UserMessage(event)) =>
+                        Some(event.message.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["blocked lease write"]
+        );
+    }
+    writer
+        .discard_thread(id)
+        .await
+        .expect("drop writer and abort renewal");
+    PostgresThreadStore::new(observer, provider.to_string())
+        .delete_thread(DeleteThreadParams { thread_id: id })
+        .await
+        .expect("delete owned wait fixture");
+}
+
+async fn lease_wait_snapshot(pool: &PostgresPool, id: ThreadId) -> Value {
+    let mut connection = pool.acquire().await.expect("snapshot connection");
+    let text: String = sqlx::query_scalar(
+        "SELECT json_build_object('catalog', (SELECT to_jsonb(t) FROM codex_storage.threads t WHERE id = $1::uuid), \
+         'rollout', (SELECT json_agg(to_jsonb(r) ORDER BY position) FROM codex_storage.thread_rollout_lines r WHERE thread_id = $1::uuid))::text",
+    ).bind(id.to_string()).fetch_one(&mut *connection).await.expect("complete catalog and ordered rollout snapshot");
+    serde_json::from_str(&text).expect("snapshot JSON")
+}
+
+// Acquired before closure: same-generation handles must not regain writable authority
+// when shutdown/discard removes the claim or a replacement writer acquires a new token.
+async fn retained_live_controls(state: &Path, provider: &str, cwd: &Path) {
+    let pool = connect(state, "runtime").await;
+    let observer = connect(state, "runtime").await;
+    let store = PostgresThreadStore::new(Arc::clone(&pool), provider.to_string());
+    for discard in [false, true] {
+        let id = ThreadId::new();
+        store
+            .create_thread(create_params(id, provider, cwd))
+            .await
+            .expect("create retained fixture");
+        store
+            .persist_thread(id, PersistContext::Standard)
+            .await
+            .expect("persist retained fixture");
+        let original = store
+            .live_thread(id)
+            .await
+            .expect("retain exact original instance");
+        let original_token = original
+            .lock()
+            .await
+            .ownership
+            .as_ref()
+            .expect("original writer")
+            .claim
+            .token;
+        if discard {
+            store.discard_thread(id).await.expect("discard original");
+        } else {
+            store.shutdown_thread(id).await.expect("shutdown original");
+        }
+        store
+            .resume_thread(ResumeThreadParams {
+                thread_id: id,
+                rollout_path: None,
+                history: None,
+                history_revision: None,
+                include_archived: false,
+                metadata: ThreadPersistenceMetadata {
+                    cwd: Some(cwd.to_path_buf()),
+                    model_provider: provider.to_string(),
+                    memory_mode: ThreadMemoryMode::Enabled,
+                },
+            })
+            .await
+            .expect("new token same-generation replacement");
+        let replacement = store.live_thread(id).await.expect("replacement instance");
+        assert!(!Arc::ptr_eq(&original, &replacement));
+        assert!(
+            replacement
+                .lock()
+                .await
+                .ownership
+                .as_ref()
+                .expect("replacement owner")
+                .claim
+                .token
+                > original_token
+        );
+        let before = lease_wait_snapshot(&observer, id).await;
+        let mut stale = original.lock().await;
+        let position = stale.next_position;
+        assert!(matches!(
+            stale.queue(id, vec![user_message("stale queued")]),
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        assert!(matches!(
+            stale.write(&pool, id, provider).await,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        assert!(matches!(
+            stale.write(&pool, id, provider).await,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        assert_eq!(stale.next_position, position);
+        drop(stale);
+        assert_eq!(lease_wait_snapshot(&observer, id).await, before);
+        // A delayed original eviction cannot erase its already-installed replacement.
+        store.evict_live_instance(id, &original).await;
+        assert!(Arc::ptr_eq(
+            &replacement,
+            &store.live_thread(id).await.expect("replacement preserved")
+        ));
+        store
+            .append_items(AppendThreadItemsParams {
+                thread_id: id,
+                items: vec![user_message("replacement writes")],
+            })
+            .await
+            .expect("replacement genuine positive");
+        store.shutdown_thread(id).await.expect("close replacement");
+        store
+            .delete_thread(DeleteThreadParams { thread_id: id })
+            .await
+            .expect("remove retained fixture");
+    }
+    for bulk in [false, true] {
+        let id = ThreadId::new();
+        store
+            .create_thread(create_params(id, provider, cwd))
+            .await
+            .expect("create deletion fixture");
+        store
+            .persist_thread(id, PersistContext::Standard)
+            .await
+            .expect("persist deletion fixture");
+        let original = store.live_thread(id).await.expect("retain before deletion");
+        if bulk {
+            store
+                .delete_threads(DeleteThreadsParams {
+                    thread_ids: vec![id],
+                })
+                .await
+                .expect("bulk deletion");
+        } else {
+            store
+                .delete_thread(DeleteThreadParams { thread_id: id })
+                .await
+                .expect("single deletion");
+        }
+        let before = lease_wait_snapshot(&observer, id).await;
+        let mut stale = original.lock().await;
+        let position = stale.next_position;
+        assert!(matches!(
+            stale.queue(id, vec![user_message("resurrection")]),
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        assert!(matches!(
+            stale.write(&pool, id, provider).await,
+            Err(ThreadStoreError::Conflict { .. })
+        ));
+        assert_eq!(stale.next_position, position);
+        drop(stale);
+        assert_eq!(lease_wait_snapshot(&observer, id).await, before);
+    }
+    let id = ThreadId::new();
+    let mut unowned = LiveThread::for_create(&create_params(id, provider, cwd));
+    let before = lease_wait_snapshot(&observer, id).await;
+    assert!(unowned.is_deferred_and_empty());
+    assert!(matches!(
+        unowned.queue(id, vec![user_message("missing owner")]),
+        Err(ThreadStoreError::Conflict { .. })
+    ));
+    assert!(matches!(
+        unowned.write(&pool, id, provider).await,
+        Err(ThreadStoreError::Conflict { .. })
+    ));
+    assert!(unowned.is_deferred_and_empty());
+    assert_eq!(lease_wait_snapshot(&observer, id).await, before);
 }
