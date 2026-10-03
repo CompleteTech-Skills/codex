@@ -34,6 +34,9 @@ use zeroize::Zeroizing;
 
 mod activation_gate;
 mod migration_causes;
+mod migration_startup;
+pub use migration_startup::MigrationStartupRefusal;
+pub use migration_startup::OriginalMigrationStartup;
 mod migration_login;
 mod session_binding;
 pub use activation_gate::ActivationGateError;
@@ -179,9 +182,27 @@ fn require_qualified_server_version(version: &str) -> Result<(), PoolError> {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct ConnectionTarget {
+    host: String,
+    port: u16,
+    database: String,
+    ca: PathBuf,
+}
+impl ConnectionTarget {
+    fn from_settings(settings: &ConnectionSettings) -> Self {
+        Self {
+            host: settings.host.clone(),
+            port: settings.port,
+            database: settings.database.clone(),
+            ca: settings.ca_certificate.clone(),
+        }
+    }
+}
 /// A standalone pool that cannot mutate SQLite or Codex storage selection.
 pub struct PostgresPool {
     pool: PgPool,
+    original_target: Option<ConnectionTarget>,
     acquire_timeout: Duration,
     selected_search_path: Option<String>,
     activation_binding: std::sync::OnceLock<Arc<session_binding::ActivationBinding>>,
@@ -228,6 +249,7 @@ impl PostgresPool {
         search_path: Option<String>,
         migration_login: Option<migration_login::MigrationLogin>,
     ) -> Result<Self, PoolError> {
+        let original_target = Some(ConnectionTarget::from_settings(&settings));
         let selected_search_path = search_path.clone();
         let limits = settings.limits;
         let valid_host = settings.host.parse::<IpAddr>().is_ok()
@@ -272,6 +294,11 @@ impl PostgresPool {
             .ssl_root_cert(&settings.ca_certificate)
             .disable_statement_logging();
         let rejected_version = Arc::new(AtomicBool::new(false));
+        let driver_reservation = migration_login
+            .as_ref()
+            .map(|login| login.reserve_driver())
+            .transpose()
+            .map_err(|_| PoolError::Unavailable)?;
         let pool = timeout(
             limits.connect_timeout,
             PgPoolOptions::new()
@@ -316,7 +343,21 @@ impl PostgresPool {
         )
         .await
         .map_err(|_| PoolError::Timeout)
-        .and_then(|result| result.map_err(|error| classify(&error)))
+        .and_then(|result| match result {
+            Ok(pool) => {
+                if let Some(reservation) = driver_reservation {
+                    reservation.success();
+                }
+                Ok(pool)
+            }
+            Err(original) => {
+                let classified = classify(&original);
+                if let Some(reservation) = driver_reservation {
+                    let _ = reservation.failure(original);
+                }
+                Err(classified)
+            }
+        })
         .map_err(|error| {
             // SQLx discards and retries failed after_connect checks. Preserve the
             // initial version rejection when no qualified connection was found.
@@ -328,6 +369,7 @@ impl PostgresPool {
         })?;
         Ok(Self {
             pool,
+            original_target,
             acquire_timeout: limits.acquire_timeout,
             selected_search_path,
             activation_binding: std::sync::OnceLock::new(),

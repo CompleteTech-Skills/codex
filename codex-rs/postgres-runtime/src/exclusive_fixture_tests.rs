@@ -244,6 +244,7 @@ fn lazy_pool() -> PostgresPool {
                 .host("127.0.0.1")
                 .port(1),
         ),
+        original_target: None,
         acquire_timeout: Duration::from_secs(1),
         selected_search_path: None,
         activation_binding: std::sync::OnceLock::new(),

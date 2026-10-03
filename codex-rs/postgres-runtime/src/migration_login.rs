@@ -26,6 +26,11 @@ impl MigrationLogin {
             },
         }
     }
+    pub(crate) fn reserve_driver(
+        &self,
+    ) -> Result<crate::migration_causes::Reservation, sqlx::Error> {
+        self.causes.reserve()
+    }
     pub(crate) fn accepts_login(&self, username: &str) -> bool {
         username == self.login
     }
