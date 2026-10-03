@@ -5,6 +5,7 @@ use codex_state::ExternalAgentConfigImportDetailsRecord;
 use codex_state::ExternalAgentConfigImportFailureRecord;
 use codex_state::ExternalAgentConfigImportHistoryRecord;
 use codex_state::ExternalAgentConfigImportSuccessRecord;
+use sqlx::Acquire;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 use std::sync::Arc;
@@ -47,8 +48,19 @@ impl PostgresExternalAgentImportStore {
         let failures =
             serde_json::to_string(failures).map_err(|_| ImportStoreError::InvalidRecord)?;
         let mut connection = self.pool.acquire().await.map_err(classify_pool)?;
-        timeout(
-            QUERY_TIMEOUT,
+        timeout(QUERY_TIMEOUT, async {
+            let mut tx = connection
+                .begin()
+                .await
+                .map_err(|_| ImportStoreError::Unavailable)?;
+            self.pool
+                .prepare_selected_write(&mut tx)
+                .await
+                .map_err(|_| ImportStoreError::Unavailable)?;
+            self.pool
+                .require_bound_storage_open(&mut tx)
+                .await
+                .map_err(|_| ImportStoreError::Unavailable)?;
             sqlx::query(
                 "INSERT INTO external_agent_config_imports \
                  (import_id, provider_id, completed_at_ms, successes, failures) \
@@ -63,8 +75,11 @@ impl PostgresExternalAgentImportStore {
             .bind(Utc::now().timestamp_millis())
             .bind(successes)
             .bind(failures)
-            .execute(&mut *connection),
-        )
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| ImportStoreError::Unavailable)?;
+            tx.commit().await.map_err(|_| ImportStoreError::Unavailable)
+        })
         .await
         .map_err(|_| ImportStoreError::Timeout)?
         .map_err(|_| ImportStoreError::Unavailable)?;

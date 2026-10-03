@@ -1,7 +1,6 @@
 use chrono::Utc;
 use codex_postgres_runtime::PoolError;
 use codex_postgres_runtime::PostgresPool;
-use codex_postgres_runtime::require_storage_open;
 use codex_protocol::ThreadId;
 use codex_state::QueuedUserSubmissionRecord;
 use codex_thread_store::MAX_QUEUE_ITEMS;
@@ -55,7 +54,12 @@ impl PostgresQueueStore {
         let mut connection = self.pool.acquire().await.map_err(classify_pool)?;
         timeout(QUERY_TIMEOUT, async {
             let mut transaction = connection.begin().await?;
-            if let Err(error) = require_storage_open(&mut transaction).await {
+            let admitted = async {
+                self.pool.prepare_selected_write(&mut transaction).await?;
+                self.pool.require_bound_storage_open(&mut transaction).await
+            }
+            .await;
+            if let Err(error) = admitted {
                 transaction.rollback().await?;
                 return Ok(Err(unavailable(&error.to_string())));
             }

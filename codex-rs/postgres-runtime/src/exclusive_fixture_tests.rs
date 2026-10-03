@@ -245,5 +245,7 @@ fn lazy_pool() -> PostgresPool {
                 .port(1),
         ),
         acquire_timeout: Duration::from_secs(1),
+        selected_search_path: None,
+        activation_binding: std::sync::OnceLock::new(),
     }
 }

@@ -33,6 +33,7 @@ use tokio::time::timeout;
 use zeroize::Zeroizing;
 
 mod activation_gate;
+mod session_binding;
 pub use activation_gate::ActivationGateError;
 pub use activation_gate::require_storage_open;
 mod bootstrap;
@@ -174,6 +175,8 @@ fn require_qualified_server_version(version: &str) -> Result<(), PoolError> {
 pub struct PostgresPool {
     pool: PgPool,
     acquire_timeout: Duration,
+    selected_search_path: Option<String>,
+    activation_binding: std::sync::OnceLock<session_binding::ActivationBinding>,
 }
 
 impl PostgresPool {
@@ -189,14 +192,14 @@ impl PostgresPool {
         settings: ConnectionSettings,
         namespace: Option<&NamedNamespace>,
     ) -> Result<Self, PoolError> {
-        let schema = namespace.map_or("codex_storage", NamedNamespace::schema);
-        Self::connect_with_search_path(settings, Some(format!("pg_catalog, \"{schema}\""))).await
+        Self::connect_with_search_path(settings, Some(owned_namespace_search_path(namespace))).await
     }
 
     async fn connect_with_search_path(
         settings: ConnectionSettings,
         search_path: Option<String>,
     ) -> Result<Self, PoolError> {
+        let selected_search_path = search_path.clone();
         let limits = settings.limits;
         let valid_host = settings.host.parse::<IpAddr>().is_ok()
             || (settings.host.len() <= 253
@@ -293,6 +296,8 @@ impl PostgresPool {
         Ok(Self {
             pool,
             acquire_timeout: limits.acquire_timeout,
+            selected_search_path,
+            activation_binding: std::sync::OnceLock::new(),
         })
     }
 

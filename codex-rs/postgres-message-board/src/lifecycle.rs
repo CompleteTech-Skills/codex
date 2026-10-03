@@ -8,7 +8,6 @@ use crate::board::pool_error;
 use crate::board::storage;
 use crate::board::storage_message;
 use codex_postgres_runtime::PostgresPool;
-use codex_postgres_runtime::require_storage_open;
 use codex_protocol::SessionId;
 use codex_protocol::error::Result;
 use sqlx::Acquire;
@@ -23,7 +22,10 @@ impl PostgresAgentMessageBoard {
         }
         let mut connection = pool.acquire().await.map_err(pool_error)?;
         let mut tx = connection.begin().await.map_err(storage)?;
-        require_storage_open(&mut tx)
+        pool.prepare_selected_write(&mut tx)
+            .await
+            .map_err(|error| storage_message(&error.to_string()))?;
+        pool.require_bound_storage_open(&mut tx)
             .await
             .map_err(|error| storage_message(&error.to_string()))?;
         sqlx::query(LOCK_WRITERS)

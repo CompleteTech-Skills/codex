@@ -14,7 +14,6 @@ use codex_postgres_memory_store::delete_thread_memory_in;
 use codex_postgres_memory_store::lock_memory_in;
 use codex_postgres_queue_store::delete_thread_queue_in;
 use codex_postgres_runtime::PostgresPool;
-use codex_postgres_runtime::require_storage_open;
 use codex_postgres_thread_rows::thread_columns;
 use codex_postgres_thread_rows::thread_metadata_from_row;
 use codex_protocol::SanitizedGitUrl;
@@ -81,7 +80,8 @@ impl PostgresThreadCatalog {
             .map_err(|error| anyhow!("PostgreSQL thread storage is unavailable: {error:?}"))?;
         timeout(QUERY_TIMEOUT, async {
             let mut tx = connection.begin().await?;
-            require_storage_open(&mut tx).await?;
+            self.pool.prepare_selected_write(&mut tx).await?;
+            self.pool.require_bound_storage_open(&mut tx).await?;
             let value = operation(&mut tx).await?;
             tx.commit().await?;
             anyhow::Ok(value)

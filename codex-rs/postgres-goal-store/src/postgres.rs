@@ -2,7 +2,6 @@ use chrono::DateTime;
 use chrono::Utc;
 use codex_postgres_runtime::PoolError;
 use codex_postgres_runtime::PostgresPool;
-use codex_postgres_runtime::require_storage_open;
 use codex_protocol::ThreadId;
 use codex_state::GoalAccountingMode;
 use codex_state::GoalAccountingOutcome;
@@ -69,7 +68,12 @@ impl PostgresGoalStore {
         let mut connection = self.pool.acquire().await.map_err(classify_pool)?;
         timeout(QUERY_TIMEOUT, async {
             let mut transaction = connection.begin().await?;
-            require_storage_open(&mut transaction)
+            self.pool
+                .prepare_selected_write(&mut transaction)
+                .await
+                .map_err(|_| sqlx::Error::PoolClosed)?;
+            self.pool
+                .require_bound_storage_open(&mut transaction)
                 .await
                 .map_err(|_| sqlx::Error::PoolClosed)?;
             sqlx::query(
@@ -127,7 +131,7 @@ impl PostgresGoalStore {
 
     async fn clear_deferral(&self, thread_id: ThreadId) -> Result<(), GoalStoreError> {
         let mut connection = self.pool.acquire().await.map_err(classify_pool)?;
-        let mut tx = begin_write(&mut connection).await?;
+        let mut tx = begin_write(&self.pool, &mut connection).await?;
         timeout(
             QUERY_TIMEOUT,
             sqlx::query(
@@ -160,7 +164,7 @@ impl PostgresGoalStore {
             ""
         };
         let mut connection = self.pool.acquire().await.map_err(classify_pool)?;
-        let mut tx = begin_write(&mut connection).await?;
+        let mut tx = begin_write(&self.pool, &mut connection).await?;
         let row = timeout(
             QUERY_TIMEOUT,
             sqlx::query(AssertSqlSafe(format!(
@@ -207,7 +211,7 @@ impl PostgresGoalStore {
         // Each variant mirrors the SQLite store's statement and binds exactly the parameters it
         // references, because PostgreSQL cannot infer the type of an unreferenced parameter.
         let mut connection = self.pool.acquire().await.map_err(classify_pool)?;
-        let mut tx = begin_write(&mut connection).await?;
+        let mut tx = begin_write(&self.pool, &mut connection).await?;
         let row = timeout(QUERY_TIMEOUT, async {
             match (status, token_budget) {
                 (Some(status), Some(token_budget)) => {
@@ -285,7 +289,7 @@ impl PostgresGoalStore {
         status: ThreadGoalStatus,
     ) -> Result<Option<ThreadGoal>, GoalStoreError> {
         let mut connection = self.pool.acquire().await.map_err(classify_pool)?;
-        let mut tx = begin_write(&mut connection).await?;
+        let mut tx = begin_write(&self.pool, &mut connection).await?;
         let row = timeout(
             QUERY_TIMEOUT,
             sqlx::query(AssertSqlSafe(format!(
@@ -308,7 +312,7 @@ impl PostgresGoalStore {
 
     async fn delete(&self, thread_id: ThreadId) -> Result<Option<ThreadGoal>, GoalStoreError> {
         let mut connection = self.pool.acquire().await.map_err(classify_pool)?;
-        let mut tx = begin_write(&mut connection).await?;
+        let mut tx = begin_write(&self.pool, &mut connection).await?;
         let row = timeout(
             QUERY_TIMEOUT,
             sqlx::query(AssertSqlSafe(format!(
@@ -366,7 +370,7 @@ impl PostgresGoalStore {
              RETURNING {GOAL_COLUMNS}"
         );
         let mut connection = self.pool.acquire().await.map_err(classify_pool)?;
-        let mut tx = begin_write(&mut connection).await?;
+        let mut tx = begin_write(&self.pool, &mut connection).await?;
         let row = timeout(
             QUERY_TIMEOUT,
             sqlx::query(AssertSqlSafe(sql))
@@ -544,14 +548,18 @@ fn goal_from_row(row: PgRow) -> Result<ThreadGoal, GoalStoreError> {
 }
 
 /// Begin a write transaction that is refused while a migration holds the store.
-async fn begin_write(
-    connection: &mut sqlx::PgConnection,
-) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, GoalStoreError> {
+async fn begin_write<'c>(
+    pool: &PostgresPool,
+    connection: &'c mut sqlx::PgConnection,
+) -> Result<sqlx::Transaction<'c, sqlx::Postgres>, GoalStoreError> {
     let mut tx = connection
         .begin()
         .await
         .map_err(|error| classify_sqlx(&error))?;
-    require_storage_open(&mut tx)
+    pool.prepare_selected_write(&mut tx)
+        .await
+        .map_err(|_| GoalStoreError::Unavailable)?;
+    pool.require_bound_storage_open(&mut tx)
         .await
         .map_err(|_| GoalStoreError::Unavailable)?;
     Ok(tx)

@@ -3,7 +3,6 @@ use anyhow::Result;
 use chrono::DateTime;
 use chrono::Utc;
 use codex_postgres_runtime::PostgresPool;
-use codex_postgres_runtime::require_storage_open;
 use codex_state::LogEntry;
 use codex_state::LogQuery;
 use codex_state::LogRow;
@@ -47,7 +46,8 @@ impl PostgresLogStore {
         let mut connection = self.pool.acquire().await?;
         timeout(QUERY_TIMEOUT, async {
             let mut tx = connection.begin().await?;
-            require_storage_open(&mut tx).await?;
+            self.pool.prepare_selected_write(&mut tx).await?;
+            self.pool.require_bound_storage_open(&mut tx).await?;
             let last_id: i64 = sqlx::query_scalar(
                 "UPDATE log_id_counter SET last_id = last_id + $1 \
                  WHERE singleton RETURNING last_id",

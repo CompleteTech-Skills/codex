@@ -7,6 +7,7 @@ use codex_postgres_log_store::PostgresLogStore;
 use codex_postgres_memory_store::PostgresMemoryStore;
 use codex_postgres_message_board::PostgresAgentMessageBoard;
 use codex_postgres_queue_store::PostgresQueueStore;
+use codex_postgres_runtime::ActivationGateError;
 use codex_postgres_runtime::ConnectionSettings;
 use codex_postgres_runtime::NamedNamespace;
 use codex_postgres_runtime::PoolLimits;
@@ -18,6 +19,7 @@ use codex_postgres_thread_store::PostgresThreadStore;
 use codex_protocol::SessionId;
 use codex_storage_authority::HostCredentialResolver;
 use codex_storage_authority::RemotePostgresProfile;
+use sqlx::Acquire;
 use sqlx::Row;
 use std::sync::Arc;
 use std::time::Duration;
@@ -129,14 +131,17 @@ impl RemoteStorage {
         check_runtime_schema(&pool)
             .await
             .map_err(RemoteStorageError::Schema)?;
-        let mut storage = Self {
+        pool.bind_current_activation()
+            .await
+            .map_err(activation_error)?;
+        let connected_generation = pool.bound_activation_generation().ok_or_else(|| {
+            RemoteStorageError::Schema(codex_postgres_runtime::RuntimeSchemaError::Unavailable)
+        })?;
+        Ok(Self {
             pool,
             namespace,
-            connected_generation: 0,
-        };
-        let activation = storage.activation().await?;
-        storage.connected_generation = activation.generation;
-        Ok(storage)
+            connected_generation,
+        })
     }
 
     /// The activation state as the dataset reports it right now.
@@ -190,17 +195,24 @@ impl RemoteStorage {
     /// calls this before it resumes work after a reconnect, so a client never keeps writing a
     /// dataset that was re-activated underneath it.
     pub async fn require_current_generation(&self) -> Result<(), RemoteStorageError> {
-        let activation = self.activation().await?;
-        if activation.retired {
-            return Err(RemoteStorageError::Retired);
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(RemoteStorageError::Connection)?;
+        let mut tx = connection.begin().await.map_err(|_| {
+            RemoteStorageError::Schema(codex_postgres_runtime::RuntimeSchemaError::Unavailable)
+        })?;
+        let observed = async {
+            self.pool.prepare_selected_write(&mut tx).await?;
+            self.pool.require_bound_storage_open(&mut tx).await
         }
-        if activation.migrating {
-            return Err(RemoteStorageError::Migrating);
-        }
-        if activation.generation != self.connected_generation {
-            return Err(RemoteStorageError::GenerationChanged);
-        }
-        Ok(())
+        .await;
+        // Refusals also finish the original read transaction before reporting the result.
+        tx.rollback().await.map_err(|_| {
+            RemoteStorageError::Schema(codex_postgres_runtime::RuntimeSchemaError::Unavailable)
+        })?;
+        observed.map_err(activation_error)
     }
 
     fn ownership_namespace(&self) -> ThreadOwnershipNamespace {
@@ -259,6 +271,17 @@ impl RemoteStorage {
     /// Close every connection. Stores built from this handle fail afterwards.
     pub async fn close(&self) {
         let _ = self.pool.close().await;
+    }
+}
+
+fn activation_error(error: ActivationGateError) -> RemoteStorageError {
+    match error {
+        ActivationGateError::Migrating => RemoteStorageError::Migrating,
+        ActivationGateError::Retired => RemoteStorageError::Retired,
+        ActivationGateError::GenerationChanged => RemoteStorageError::GenerationChanged,
+        ActivationGateError::Unavailable => {
+            RemoteStorageError::Schema(codex_postgres_runtime::RuntimeSchemaError::Unavailable)
+        }
     }
 }
 

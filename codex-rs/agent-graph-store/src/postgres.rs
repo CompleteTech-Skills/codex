@@ -1,5 +1,6 @@
 use codex_postgres_runtime::PostgresPool;
 use codex_protocol::ThreadId;
+use sqlx::Acquire;
 use sqlx::Row;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,8 +35,16 @@ impl AgentGraphStore for PostgresAgentGraphStore {
     ) -> AgentGraphStoreFuture<'_, ()> {
         Box::pin(async move {
             let mut connection = self.pool.acquire().await.map_err(|_| internal_error())?;
-            timeout(
-                QUERY_TIMEOUT,
+            timeout(QUERY_TIMEOUT, async {
+                let mut tx = connection.begin().await.map_err(|_| internal_error())?;
+                self.pool
+                    .prepare_selected_write(&mut tx)
+                    .await
+                    .map_err(|_| internal_error())?;
+                self.pool
+                    .require_bound_storage_open(&mut tx)
+                    .await
+                    .map_err(|_| internal_error())?;
                 sqlx::query(
                     "INSERT INTO thread_spawn_edges \
                      (parent_thread_id, child_thread_id, status) VALUES ($1::uuid, $2::uuid, $3) \
@@ -45,8 +54,11 @@ impl AgentGraphStore for PostgresAgentGraphStore {
                 .bind(parent_thread_id.to_string())
                 .bind(child_thread_id.to_string())
                 .bind(status_name(status))
-                .execute(&mut *connection),
-            )
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| internal_error())?;
+                tx.commit().await.map_err(|_| internal_error())
+            })
             .await
             .map_err(|_| internal_error())?
             .map_err(|_| internal_error())?;
@@ -61,16 +73,27 @@ impl AgentGraphStore for PostgresAgentGraphStore {
     ) -> AgentGraphStoreFuture<'_, ()> {
         Box::pin(async move {
             let mut connection = self.pool.acquire().await.map_err(|_| internal_error())?;
-            timeout(
-                QUERY_TIMEOUT,
+            timeout(QUERY_TIMEOUT, async {
+                let mut tx = connection.begin().await.map_err(|_| internal_error())?;
+                self.pool
+                    .prepare_selected_write(&mut tx)
+                    .await
+                    .map_err(|_| internal_error())?;
+                self.pool
+                    .require_bound_storage_open(&mut tx)
+                    .await
+                    .map_err(|_| internal_error())?;
                 sqlx::query(
                     "UPDATE thread_spawn_edges SET status = $2 \
                      WHERE child_thread_id = $1::uuid",
                 )
                 .bind(child_thread_id.to_string())
                 .bind(status_name(status))
-                .execute(&mut *connection),
-            )
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| internal_error())?;
+                tx.commit().await.map_err(|_| internal_error())
+            })
             .await
             .map_err(|_| internal_error())?
             .map_err(|_| internal_error())?;

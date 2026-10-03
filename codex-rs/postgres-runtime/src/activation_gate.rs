@@ -14,6 +14,8 @@ pub enum ActivationGateError {
     Migrating,
     /// The dataset was handed back to local storage and no longer accepts writes.
     Retired,
+    /// The namespace now contains another dataset or activation generation.
+    GenerationChanged,
     /// The activation state could not be read, so the write cannot be proven safe.
     Unavailable,
 }
@@ -26,6 +28,9 @@ impl fmt::Display for ActivationGateError {
             }
             Self::Retired => formatter
                 .write_str("storage was handed back to local storage and no longer accepts writes"),
+            Self::GenerationChanged => {
+                formatter.write_str("the connected storage identity changed")
+            }
             Self::Unavailable => {
                 formatter.write_str("the storage activation state could not be read")
             }
