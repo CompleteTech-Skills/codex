@@ -705,6 +705,7 @@ async fn real_postgres_thread_store() {
         .delete_thread(DeleteThreadParams { thread_id: shared })
         .await
         .expect("delete shared thread");
+    original_metadata_refusal_control(state, &provider, &cwd).await;
     original_claim_response_loss_control(state, &provider, &cwd).await;
     canceled_original_claim_control(state, &provider, &cwd).await;
     renewer_cancellation_control(state, &provider, &cwd).await;
@@ -1404,4 +1405,78 @@ async fn original_claim_response_loss_control(state: &Path, provider: &str, cwd:
         &writer.pending_writers.failure_history()[0],
         &retained
     ));
+}
+
+async fn original_metadata_refusal_control(state: &Path, provider: &str, cwd: &Path) {
+    let pool = connect(state, "runtime").await;
+    let writer = PostgresThreadStore::new(Arc::clone(&pool), provider.to_owned());
+    let id = ThreadId::new();
+    let before = lease_wait_snapshot(&pool, id).await;
+    let params = ResumeThreadParams {
+        thread_id: id,
+        rollout_path: None,
+        history: None,
+        history_revision: None,
+        include_archived: false,
+        metadata: create_params(id, provider, cwd).metadata,
+    };
+    let mut resume = Box::pin(writer.resume_thread(params));
+    let (late, resumed) = match tokio::time::timeout(Duration::from_secs(10), &mut resume).await {
+        Ok(result) => (false, result),
+        Err(_) => (true, (&mut resume).await),
+    };
+    drop(resume);
+    // Reconcile unexpected retained work before diagnostics; never drop its owner.
+    let needs_cleanup = match writer.pending_writers.get(id) {
+        Ok(Some(_)) => true,
+        Ok(None) => match writer.live_thread(id).await {
+            Ok(_) => true,
+            Err(ThreadStoreError::ThreadNotFound { .. }) => false,
+            Err(_) => std::future::pending::<bool>().await,
+        },
+        Err(_) => std::future::pending::<bool>().await,
+    };
+    let mut cleanup_late = false;
+    if needs_cleanup {
+        let mut cleanup = Box::pin(writer.discard_thread(id));
+        let cleaned = match tokio::time::timeout(Duration::from_secs(10), &mut cleanup).await {
+            Ok(result) => result,
+            Err(_) => {
+                cleanup_late = true;
+                (&mut cleanup).await
+            }
+        };
+        drop(cleanup);
+        if cleaned.is_err() {
+            eprintln!("metadata refusal cleanup uncertain; original SQL owner retained");
+            std::future::pending::<()>().await;
+        }
+    }
+    let history = writer.pending_writers.failure_history();
+    assert!(!late && !cleanup_late);
+    assert!(
+        matches!(resumed, Err(ThreadStoreError::ThreadNotFound { thread_id }) if thread_id == id)
+    );
+    assert_eq!(history.len(), 1);
+    let original = &history[0];
+    assert!(Arc::ptr_eq(original.original_pool(), &pool));
+    assert!(original.original_attempt().is_some());
+    assert!(!original.has_claim_failure());
+    let refusals = original.original_refusals();
+    assert_eq!(refusals.len(), 1);
+    assert!(
+        matches!(&refusals[0], ThreadStoreError::ThreadNotFound { thread_id } if *thread_id == id)
+    );
+    assert!(matches!(
+        writer.live_thread(id).await,
+        Err(ThreadStoreError::ThreadNotFound { .. })
+    ));
+    assert_eq!(lease_wait_snapshot(&pool, id).await, before);
+    let mut connection = pool
+        .acquire()
+        .await
+        .expect("metadata cleanup original readback");
+    let lease: (Option<String>, Option<bool>) = sqlx::query_as("SELECT owner_id::text, lease_until IS NOT NULL FROM codex_storage.thread_writer_ownership WHERE thread_id=$1::uuid")
+        .bind(id.to_string()).fetch_one(&mut *connection).await.expect("real claimed and released metadata attempt");
+    assert_eq!(lease, (None, Some(false)));
 }

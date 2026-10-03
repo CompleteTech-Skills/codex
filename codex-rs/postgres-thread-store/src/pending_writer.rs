@@ -453,6 +453,17 @@ impl PendingWriter {
     }
 
     #[cfg(test)]
+    pub(super) fn original_refusals(&self) -> Vec<ThreadStoreError> {
+        self.refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .errors
+            .iter()
+            .map(super::copy_error)
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(super) fn original_claim_failure(&self) -> Option<ThreadOwnershipError> {
         *self
             .claim_failure
