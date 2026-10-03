@@ -24,6 +24,8 @@ pub(crate) struct MutationOwner {
     task: Option<JoinHandle<MutationOutcome>>,
     terminal: Option<Result<MutationOutcome, JoinError>>,
     refusals: Vec<ThreadStoreError>,
+    #[cfg(test)]
+    original_task_id: Option<tokio::task::Id>,
 }
 
 pub(crate) enum MutationTerminal<'a> {
@@ -46,8 +48,26 @@ impl MutationOwner {
         self.refusals
             .try_reserve(1)
             .map_err(|_| refusal("cannot retain original mutation refusal"))?;
-        self.task = Some(tokio::spawn(operation));
+        let task = tokio::spawn(operation);
+        #[cfg(test)]
+        {
+            self.original_task_id = Some(task.id());
+        }
+        self.task = Some(task);
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_task_id(&self) -> Option<tokio::task::Id> {
+        self.original_task_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_rollback_cause(&self) -> Option<&ThreadStoreError> {
+        match self.terminal.as_ref() {
+            Some(Ok(MutationOutcome::RolledBack(error))) => Some(error),
+            _ => None,
+        }
     }
 
     pub(crate) fn has_original_failures(&self) -> bool {

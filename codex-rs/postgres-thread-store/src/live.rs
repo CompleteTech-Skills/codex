@@ -238,6 +238,16 @@ impl LiveThread {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn original_mutation_task_id(&self) -> Option<tokio::task::Id> {
+        self.mutation.original_task_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_rollback_cause(&self) -> Option<&ThreadStoreError> {
+        self.mutation.original_rollback_cause()
+    }
+
     pub(crate) fn has_mutation_failures(&self) -> bool {
         self.mutation.has_original_failures()
     }

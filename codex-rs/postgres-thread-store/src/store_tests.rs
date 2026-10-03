@@ -1762,3 +1762,5 @@ async fn original_resume_query_cancellation_control(
         .await
         .expect("delete owned fixture");
 }
+
+include!("mutation_sql_tests.rs");

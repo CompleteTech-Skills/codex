@@ -139,6 +139,18 @@ pub(super) struct WriterLaunch {
 }
 
 impl PendingWriters {
+    #[cfg(test)]
+    pub(super) fn retains_mutation_frame(
+        &self,
+        original: &Arc<Mutex<LiveThread>>,
+    ) -> ThreadStoreResult<bool> {
+        let frames = self
+            .mutation_frames
+            .lock()
+            .map_err(|_| internal("original mutation ledger poisoned"))?;
+        Ok(frames.iter().any(|frame| Arc::ptr_eq(frame, original)))
+    }
+
     /// Reserve this exact registered original before its first SQL mutation dispatch.
     pub(super) fn reserve_mutation(
         &self,
