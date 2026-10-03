@@ -40,6 +40,8 @@ pub(super) struct PendingWriter {
     no_lease_created: Arc<AtomicBool>,
     cleanup_claim: Mutex<Option<Arc<ThreadOwnership>>>,
     refusals: RegistryMutex<Refusals>,
+    #[cfg(test)]
+    task_id: RegistryMutex<Option<tokio::task::Id>>,
 }
 
 #[derive(Default)]
@@ -105,6 +107,8 @@ pub(super) struct WriterLaunch {
     pub(super) original: Arc<Mutex<LiveThread>>,
     #[cfg(test)]
     pub(super) renewal_probe: Option<Arc<super::renewal_probe::RenewalProbe>>,
+    #[cfg(test)]
+    pub(super) lose_claim_response: Option<Arc<AtomicBool>>,
 }
 
 impl PendingWriters {
@@ -145,6 +149,8 @@ impl PendingWriters {
             no_lease_created: Arc::clone(&no_lease_created),
             cleanup_claim: Mutex::new(None),
             refusals: RegistryMutex::new(Refusals::default()),
+            #[cfg(test)]
+            task_id: RegistryMutex::new(None),
         });
         // The completion slot is private and uncontended before the registry is unlocked.
         let mut completion = pending
@@ -174,11 +180,27 @@ impl PendingWriters {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&attempt));
             // Registry retains the actual opaque attempt even if recovery itself fails.
             // This original attempt lives in the retained task across every SQL await.
-            let claim = match launch
+            let response = launch
                 .pool
                 .claim_thread_ownership_attempt(&attempt, launch.lease)
-                .await
-            {
+                .await;
+            #[cfg(test)]
+            let response = match response {
+                Ok(Some(claim))
+                    if launch
+                        .lose_claim_response
+                        .as_ref()
+                        .is_some_and(|probe| probe.swap(false, Ordering::SeqCst)) =>
+                {
+                    // Only discard a genuine committed response; retain its exact attempt.
+                    drop(claim);
+                    Err(ThreadOwnershipError::Transaction(
+                        codex_postgres_runtime::TransactionError::CommitOutcomeUnknown,
+                    ))
+                }
+                response => response,
+            };
+            let claim = match response {
                 Ok(Some(claim)) => claim,
                 Ok(None) => {
                     no_lease_created.store(true, Ordering::SeqCst);
@@ -216,6 +238,13 @@ impl PendingWriters {
             launch.original.lock().await.ownership = Some(ownership);
             Ok(())
         });
+        #[cfg(test)]
+        {
+            *pending
+                .task_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task.id());
+        }
         completion.task = Some(task);
         drop(completion);
         drop(originals);
@@ -294,6 +323,14 @@ impl PendingWriters {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn failure_history(&self) -> Vec<Arc<PendingWriter>> {
+        self.failed_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(super) fn remove_cleaned(
         &self,
         id: ThreadId,
@@ -321,6 +358,14 @@ impl PendingWriters {
 }
 
 impl PendingWriter {
+    #[cfg(test)]
+    pub(super) fn original_task_id(&self) -> Option<tokio::task::Id> {
+        *self
+            .task_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(super) fn original(&self) -> &Arc<Mutex<LiveThread>> {
         &self.original
     }
@@ -405,6 +450,14 @@ impl PendingWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(Arc::clone)
+    }
+
+    #[cfg(test)]
+    pub(super) fn original_claim_failure(&self) -> Option<ThreadOwnershipError> {
+        *self
+            .claim_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(super) fn has_claim_failure(&self) -> bool {

@@ -98,6 +98,8 @@ pub struct PostgresThreadStore {
     pending_writers: pending_writer::PendingWriters,
     #[cfg(test)]
     renewal_probe: Option<Arc<renewal_probe::RenewalProbe>>,
+    #[cfg(test)]
+    lose_claim_response: Option<Arc<AtomicBool>>,
     pending_metadata: Mutex<HashMap<ThreadId, ThreadMetadataPatch>>,
     writer_lease: Duration,
     renew_every: Duration,
@@ -140,6 +142,8 @@ impl PostgresThreadStore {
             pending_writers: pending_writer::PendingWriters::default(),
             #[cfg(test)]
             renewal_probe: None,
+            #[cfg(test)]
+            lose_claim_response: None,
             pending_metadata: Mutex::default(),
             writer_lease: Duration::from_secs(30),
             renew_every: Duration::from_secs(10),
@@ -175,6 +179,8 @@ impl PostgresThreadStore {
             original,
             #[cfg(test)]
             renewal_probe: self.renewal_probe.clone(),
+            #[cfg(test)]
+            lose_claim_response: self.lose_claim_response.clone(),
         })
     }
 

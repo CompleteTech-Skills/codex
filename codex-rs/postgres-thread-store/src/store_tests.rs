@@ -705,6 +705,8 @@ async fn real_postgres_thread_store() {
         .delete_thread(DeleteThreadParams { thread_id: shared })
         .await
         .expect("delete shared thread");
+    original_claim_response_loss_control(state, &provider, &cwd).await;
+    canceled_original_claim_control(state, &provider, &cwd).await;
     renewer_cancellation_control(state, &provider, &cwd).await;
     retained_live_controls(state, &provider, &cwd).await;
     // Same opt-in fixture/test: avoid parallel cases contaminating lifecycle list assertions.
@@ -1186,5 +1188,220 @@ async fn renewer_cancellation_control(state: &Path, provider: &str, cwd: &Path) 
     assert!(matches!(
         store.live_thread(id).await,
         Err(ThreadStoreError::ThreadNotFound { .. })
+    ));
+}
+
+async fn canceled_original_claim_control(state: &Path, provider: &str, cwd: &Path) {
+    let observer = connect(state, "runtime").await;
+    let seed = PostgresThreadStore::new(Arc::clone(&observer), provider.to_string());
+    let id = ThreadId::new();
+    seed.create_thread(create_params(id, provider, cwd))
+        .await
+        .expect("create original row");
+    seed.persist_thread(id, PersistContext::Standard)
+        .await
+        .expect("materialize original row");
+    seed.shutdown_thread(id)
+        .await
+        .expect("release original seed");
+    let before = lease_wait_snapshot(&observer, id).await;
+    let mut selected = settings(state, "runtime");
+    selected.limits.max_connections = 1;
+    let pool = Arc::new(
+        PostgresPool::connect_in_namespace(selected, None)
+            .await
+            .expect("original single writer pool"),
+    );
+    pool.bind_current_activation()
+        .await
+        .expect("original selected activation");
+    let writer_pid: i32 = {
+        let mut connection = pool.acquire().await.expect("original writer connection");
+        sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+            .fetch_one(&mut *connection)
+            .await
+            .expect("exact original PID")
+    };
+    let writer = PostgresThreadStore::new(Arc::clone(&pool), provider.to_string());
+    let migrator = connect(state, "migrator").await;
+    let mut blocker = migrator
+        .begin_serializable()
+        .await
+        .expect("original blocker");
+    sqlx::query("SET LOCAL ROLE codex_owner")
+        .execute(blocker.connection())
+        .await
+        .expect("authorized owner lock");
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+        .fetch_one(blocker.connection())
+        .await
+        .expect("blocker PID");
+    sqlx::query("SELECT thread_id FROM codex_storage.thread_writer_ownership WHERE thread_id=$1::uuid FOR UPDATE").bind(id.to_string()).fetch_one(blocker.connection()).await.expect("actual unchanged original row lock");
+    let mut create = Box::pin(writer.create_thread(create_params(id, provider, cwd)));
+    let witness = async {
+        let mut connection = observer
+            .acquire()
+            .await
+            .map_err(|_| "observer unavailable")?;
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a WHERE a.pid=$1 AND a.xact_start IS NOT NULL AND $2=ANY(pg_blocking_pids(a.pid)) AND EXISTS(SELECT 1 FROM pg_locks l WHERE l.pid=a.pid AND NOT l.granted))")
+                .bind(writer_pid).bind(blocker_pid).fetch_one(&mut *connection).await.map_err(|_| "native writer wait probe failed")?;
+            if waiting {
+                return Ok::<(), &str>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let (observed, prematurely_completed) = tokio::select! {
+        result = &mut create => (Err("create completed before native claim wait"), Some(result)),
+        result = tokio::time::timeout(Duration::from_secs(5), witness) => (result.map_err(|_| "native wait deadline").and_then(|result| result), None),
+    };
+    let pending_before = writer.pending_writers.get(id);
+    let original_task_id = pending_before
+        .as_ref()
+        .ok()
+        .and_then(|pending| pending.as_ref())
+        .and_then(|pending| pending.original_task_id());
+    let original_attempt = pending_before
+        .as_ref()
+        .ok()
+        .and_then(|pending| pending.as_ref())
+        .and_then(|pending| pending.original_attempt());
+    drop(create); // Deliberately cancel ONLY the production caller, not its registered task.
+    let pending_after = writer.pending_writers.get(id);
+    let same_owner = match (&pending_before, &pending_after) {
+        (Ok(Some(before)), Ok(Some(after))) => {
+            Arc::ptr_eq(before, after)
+                && original_task_id.is_some()
+                && after.original_task_id() == original_task_id
+                && Arc::ptr_eq(after.original_pool(), &pool)
+                && matches!((&original_attempt, after.original_attempt()), (Some(before), Some(after)) if Arc::ptr_eq(before, &after))
+        }
+        _ => false,
+    };
+    // Release and reconcile every original owned SQL future before asserting diagnostics.
+    let mut release = Box::pin(blocker.rollback());
+    let deadline = tokio::time::timeout(Duration::from_secs(10), &mut release).await;
+    let (release_late, released) = match deadline {
+        Ok(result) => (false, result),
+        Err(_) => (true, (&mut release).await),
+    };
+    drop(release);
+    let mut cleanup = Box::pin(writer.discard_thread(id));
+    let deadline = tokio::time::timeout(Duration::from_secs(10), &mut cleanup).await;
+    let (cleanup_late, cleaned) = match deadline {
+        Ok(result) => (false, result),
+        Err(_) => (true, (&mut cleanup).await),
+    };
+    drop(cleanup);
+    if released.is_err() || cleaned.is_err() {
+        eprintln!("original SQL cleanup uncertain; retaining writer, pool, task and fixture host");
+        std::future::pending::<()>().await;
+    }
+    released.expect("original blocker rollback terminal");
+    assert!(
+        observed.is_ok() && prematurely_completed.is_none(),
+        "exact original claim wait: {observed:?}"
+    );
+    assert!(same_owner, "cancel retains exact task, attempt and pool");
+    assert!(!release_late && !cleanup_late);
+    cleaned.expect("actual pending claim terminal, renewer join and lease release");
+    assert!(
+        writer
+            .pending_writers
+            .get(id)
+            .expect("pending readback")
+            .is_none()
+    );
+    assert!(matches!(
+        writer.live_thread(id).await,
+        Err(ThreadStoreError::ThreadNotFound { .. })
+    ));
+    assert_eq!(lease_wait_snapshot(&observer, id).await, before);
+    let mut connection = observer
+        .acquire()
+        .await
+        .expect("actual cleanup lease readback");
+    let lease: (Option<String>, Option<bool>) = sqlx::query_as("SELECT owner_id::text, lease_until IS NOT NULL FROM codex_storage.thread_writer_ownership WHERE thread_id=$1::uuid")
+        .bind(id.to_string()).fetch_one(&mut *connection).await.expect("original lease after cleanup");
+    assert_eq!(lease, (None, Some(false)));
+    drop(connection);
+    seed.delete_thread(DeleteThreadParams { thread_id: id })
+        .await
+        .expect("delete qualification fixture");
+}
+
+async fn original_claim_response_loss_control(state: &Path, provider: &str, cwd: &Path) {
+    let pool = connect(state, "runtime").await;
+    let probe = Arc::new(AtomicBool::new(true));
+    let mut writer = PostgresThreadStore::new(Arc::clone(&pool), provider.to_owned());
+    writer.lose_claim_response = Some(Arc::clone(&probe));
+    let id = ThreadId::new();
+    let created = writer.create_thread(create_params(id, provider, cwd)).await;
+    let history = writer.pending_writers.failure_history();
+    let retained = history.first().cloned();
+    let live = writer.live_thread(id).await.ok();
+    let claim = match live.as_ref() {
+        Some(live) => live
+            .lock()
+            .await
+            .ownership
+            .as_ref()
+            .map(|owner| owner.claim.clone()),
+        None => None,
+    };
+    let recovered = match retained
+        .as_ref()
+        .and_then(|pending| pending.original_attempt())
+    {
+        Some(attempt) => pool.recover_thread_ownership_attempt(&attempt).await,
+        None => Ok(None),
+    };
+    let mut cleanup = Box::pin(writer.discard_thread(id));
+    let (late, cleaned) = match tokio::time::timeout(Duration::from_secs(10), &mut cleanup).await {
+        Ok(result) => (false, result),
+        Err(_) => (true, (&mut cleanup).await),
+    };
+    drop(cleanup);
+    if cleaned.is_err() {
+        eprintln!("lost-response cleanup uncertain; retaining original writer and SQL pool");
+        std::future::pending::<()>().await;
+    }
+    // All diagnostic assertions follow the original owned cleanup continuation.
+    assert!(
+        created.is_ok(),
+        "same original attempt must recover committed response"
+    );
+    assert!(!late);
+    assert!(!probe.load(Ordering::SeqCst));
+    assert_eq!(history.len(), 1);
+    let retained = retained.expect("original failure history owner");
+    assert!(Arc::ptr_eq(retained.original_pool(), &pool));
+    assert!(
+        matches!((live.as_ref(), retained.original()), (Some(live), original) if Arc::ptr_eq(live, original))
+    );
+    assert_eq!(
+        retained.original_claim_failure(),
+        Some(codex_postgres_runtime::ThreadOwnershipError::Transaction(
+            codex_postgres_runtime::TransactionError::CommitOutcomeUnknown
+        ))
+    );
+    assert_eq!(recovered.expect("genuine same-attempt recovery"), claim);
+    assert!(claim.is_some());
+    assert!(
+        writer
+            .pending_writers
+            .get(id)
+            .expect("pending readback")
+            .is_none()
+    );
+    assert!(matches!(
+        writer.live_thread(id).await,
+        Err(ThreadStoreError::ThreadNotFound { .. })
+    ));
+    // The failure frame remains owned after successful cleanup; no diagnostic eviction.
+    assert!(Arc::ptr_eq(
+        &writer.pending_writers.failure_history()[0],
+        &retained
     ));
 }
