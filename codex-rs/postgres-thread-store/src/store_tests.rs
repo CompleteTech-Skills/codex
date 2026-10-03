@@ -478,7 +478,7 @@ async fn scenario(
     log
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_postgres_thread_store() {
     let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_THREAD_STORE_STATE") else {
         return;
@@ -705,6 +705,7 @@ async fn real_postgres_thread_store() {
         .delete_thread(DeleteThreadParams { thread_id: shared })
         .await
         .expect("delete shared thread");
+    renewer_cancellation_control(state, &provider, &cwd).await;
     retained_live_controls(state, &provider, &cwd).await;
     // Same opt-in fixture/test: avoid parallel cases contaminating lifecycle list assertions.
     for ownership_lock in [true, false] {
@@ -1115,4 +1116,75 @@ async fn retained_live_controls(state: &Path, provider: &str, cwd: &Path) {
     ));
     assert!(unowned.is_deferred_and_empty());
     assert_eq!(lease_wait_snapshot(&observer, id).await, before);
+}
+
+// This probe enters the actual production renewal future at its original spawn.
+// Its original handle is never replaced or moved out of the retained writer owner.
+async fn renewer_cancellation_control(state: &Path, provider: &str, cwd: &Path) {
+    let probe = Arc::new(super::renewal_probe::RenewalProbe::default());
+    let mut store = PostgresThreadStore::new(connect(state, "runtime").await, provider.to_string());
+    store.renewal_probe = Some(Arc::clone(&probe));
+    let id = ThreadId::new();
+    store
+        .create_thread(create_params(id, provider, cwd))
+        .await
+        .expect("actual renewal owner");
+    let original = store.live_thread(id).await.expect("registered exact owner");
+    let task_id = original
+        .lock()
+        .await
+        .ownership
+        .as_ref()
+        .expect("actual production renewer")
+        .renewer
+        .id();
+    // No assertion may bypass the unconditional original destructor release and join.
+    let ready = tokio::time::timeout(Duration::from_secs(5), probe.ready()).await;
+    let mut close = Box::pin(store.shutdown_thread(id));
+    let pending = tokio::time::timeout(Duration::from_millis(100), &mut close).await;
+    let entered = tokio::time::timeout(Duration::from_secs(5), probe.dropping()).await;
+    drop(close); // Cancel only the waiter, never the original registered JoinHandle.
+    let registered = store.live_thread(id).await;
+    let same_handle = {
+        let live = original.lock().await;
+        live.ownership
+            .as_ref()
+            .is_some_and(|owner| owner.renewer.id() == task_id && !owner.renewal_joined)
+    };
+    let premature = probe.returned();
+    probe.release();
+    let mut retry = Box::pin(store.shutdown_thread(id));
+    let deadline = tokio::time::timeout(Duration::from_secs(10), &mut retry).await;
+    let (late, result) = match deadline {
+        Ok(result) => (false, result),
+        Err(_) => (true, (&mut retry).await),
+    };
+    drop(retry);
+    assert!(matches!(ready, Ok(())), "task readiness: {ready:?}");
+    assert!(
+        pending.is_err(),
+        "pending destructor cannot acknowledge closure"
+    );
+    assert!(
+        matches!(entered, Ok(())),
+        "actual destructor entered: {entered:?}"
+    );
+    assert!(registered.is_ok_and(|live| Arc::ptr_eq(&live, &original)));
+    assert!(same_handle && !premature);
+    assert!(!late);
+    result.expect("same original task joined and conditional lease release complete");
+    assert!(probe.returned());
+    let live = original.lock().await;
+    let owner = live.ownership.as_ref().expect("retained original claim");
+    assert!(owner.renewal_joined);
+    assert!(
+        owner
+            .renewal_error
+            .as_ref()
+            .is_some_and(|error| error.is_cancelled() && error.id() == task_id)
+    );
+    assert!(matches!(
+        store.live_thread(id).await,
+        Err(ThreadStoreError::ThreadNotFound { .. })
+    ));
 }
