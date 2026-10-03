@@ -17,6 +17,10 @@ pub(crate) struct ActivationBinding {
 pub struct BoundWrite<'a> {
     transaction: sqlx::Transaction<'a, sqlx::Postgres>,
     _original_pool: &'a PostgresPool,
+    acknowledged: Option<(
+        &'a mut Option<OriginalTransactionAcknowledgment>,
+        Arc<String>,
+    )>,
 }
 
 impl BoundWrite<'_> {
@@ -26,11 +30,53 @@ impl BoundWrite<'_> {
     }
 
     pub async fn commit(self) -> Result<(), sqlx::Error> {
-        self.transaction.commit().await
+        self.finish_original(true).await
     }
 
     pub async fn rollback(self) -> Result<(), sqlx::Error> {
-        self.transaction.rollback().await
+        self.finish_original(false).await
+    }
+    async fn finish_original(mut self, requested_commit: bool) -> Result<(), sqlx::Error> {
+        let Some((slot, identity)) = self.acknowledged else {
+            return if requested_commit {
+                self.transaction.commit().await
+            } else {
+                self.transaction.rollback().await
+            };
+        };
+        // COMMIT Ok can hide the server's ROLLBACK command tag. Resolve the
+        // pre-DML xid on the SAME still-borrowed original physical connection.
+        sqlx::query(if requested_commit {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        })
+        .execute(&mut *self.transaction)
+        .await?;
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT pg_catalog.pg_xact_status($1::pg_catalog.xid8)")
+                .bind(identity.as_str())
+                .fetch_one(&mut *self.transaction)
+                .await?;
+        let committed = matches!(
+            original_outcome(status.as_deref())?,
+            OriginalTransactionOutcome::Committed
+        );
+        // Reserve/capture identity before DML; recording the actual outcome here
+        // allocates nothing and precedes later bookkeeping or pool return.
+        *slot = Some(OriginalTransactionAcknowledgment {
+            identity,
+            committed,
+        });
+        // Resolve SQLx's owned depth bookkeeping. Idle ROLLBACK cannot undo xid;
+        // its errors remain original-session uncertainty, not physical closure.
+        self.transaction.rollback().await?;
+        if committed != requested_commit {
+            return Err(sqlx::Error::Protocol(
+                "original transaction ended with a different outcome".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -85,6 +131,7 @@ impl PostgresPool {
         Ok(BoundWrite {
             transaction,
             _original_pool: self,
+            acknowledged: None,
         })
     }
     /// Capture once from actual SQL. A retained pool can never adopt a newer activation.
@@ -196,7 +243,8 @@ impl PostgresPool {
 pub struct RetainedWriteSession {
     original_pool: Arc<PostgresPool>,
     connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
-    original_transaction: Option<String>,
+    original_transaction: Option<Arc<String>>,
+    acknowledged: Option<OriginalTransactionAcknowledgment>,
 }
 
 /// Available original admission causes, not a terminal or rollback capability.
@@ -244,6 +292,7 @@ impl PostgresPool {
             original_pool: Arc::clone(self),
             connection,
             original_transaction: None,
+            acknowledged: None,
         })
     }
 }
@@ -283,7 +332,7 @@ impl RetainedWriteSession {
             .fetch_one(&mut *transaction)
             .await;
         match stamp {
-            Ok(stamp) => self.original_transaction = Some(stamp),
+            Ok(stamp) => self.original_transaction = Some(Arc::new(stamp)),
             Err(original) => {
                 let rollback = transaction.rollback().await.err();
                 return Err(RetainedWriteAdmissionError::Stamp { original, rollback });
@@ -292,6 +341,14 @@ impl RetainedWriteSession {
         Ok(BoundWrite {
             transaction,
             _original_pool: &self.original_pool,
+            acknowledged: Some((
+                &mut self.acknowledged,
+                Arc::clone(self.original_transaction.as_ref().ok_or_else(|| {
+                    RetainedWriteAdmissionError::Begin(sqlx::Error::Protocol(
+                        "original transaction stamp missing".to_string(),
+                    ))
+                })?),
+            )),
         })
     }
 
@@ -303,6 +360,26 @@ impl RetainedWriteSession {
             .execute(&mut *self.connection)
             .await?;
         Ok(OriginalSessionRollback { original: self })
+    }
+}
+
+/// Opaque, runtime-produced proof of an actual ACK for the pre-DML original xid.
+#[derive(Clone)]
+pub struct OriginalTransactionAcknowledgment {
+    identity: Arc<String>,
+    committed: bool,
+}
+impl OriginalTransactionAcknowledgment {
+    pub fn committed(&self) -> bool {
+        self.committed
+    }
+    pub fn shares_original_transaction(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+impl RetainedWriteSession {
+    pub fn original_acknowledgment(&self) -> Option<OriginalTransactionAcknowledgment> {
+        self.acknowledged.as_ref().cloned()
     }
 }
 
@@ -327,7 +404,7 @@ impl RetainedWriteSession {
             .await?;
         let status: Option<String> =
             sqlx::query_scalar("SELECT pg_catalog.pg_xact_status($1::pg_catalog.xid8)")
-                .bind(stamp)
+                .bind(stamp.as_str())
                 .fetch_one(&mut *self.connection)
                 .await?;
         original_outcome(status.as_deref())

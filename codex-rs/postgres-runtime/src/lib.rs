@@ -43,6 +43,7 @@ pub use activation_gate::ActivationGateError;
 pub use activation_gate::require_storage_open;
 pub use session_binding::BoundWrite;
 pub use session_binding::OriginalSessionRollback;
+pub use session_binding::OriginalTransactionAcknowledgment;
 pub use session_binding::OriginalTransactionOutcome;
 pub use session_binding::RetainedWriteAdmissionError;
 pub use session_binding::RetainedWriteSession;

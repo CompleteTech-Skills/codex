@@ -104,6 +104,9 @@ impl MutationOwner {
         self.reconciled_history
             .try_reserve(1)
             .map_err(|_| refusal("cannot retain original reconciliation cause"))?;
+        if let Some(original) = self.original_session.as_ref() {
+            original.prepare_next_dispatch()?;
+        }
         let task = tokio::spawn(operation);
         #[cfg(test)]
         {

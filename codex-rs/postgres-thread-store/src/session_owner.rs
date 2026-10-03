@@ -1,4 +1,5 @@
 //! Original physical session ownership stays outside the mutation task future.
+use codex_postgres_runtime::OriginalTransactionAcknowledgment;
 use codex_postgres_runtime::OriginalTransactionOutcome;
 use codex_postgres_runtime::PostgresPool;
 use codex_postgres_runtime::RetainedWriteSession;
@@ -56,6 +57,7 @@ pub(crate) struct OriginalSessionOwner {
     pool: Arc<PostgresPool>,
     slot: Arc<OriginalSlot<RetainedWriteSession>>,
     gate: Arc<Semaphore>,
+    acknowledged: Mutex<Option<OriginalTransactionAcknowledgment>>,
 }
 /// Drop order restores the actual connection before exclusive admission reopens.
 pub(crate) struct SessionLoan {
@@ -69,7 +71,24 @@ impl OriginalSessionOwner {
             pool,
             slot: OriginalSlot::new()?,
             gate: Arc::new(Semaphore::new(1)),
+            acknowledged: Mutex::new(None),
         }))
+    }
+    pub(crate) fn prepare_next_dispatch(&self) -> ThreadStoreResult<()> {
+        if !self
+            .slot
+            .0
+            .lock()
+            .map_err(|_| refusal("original session slot poisoned"))?
+            .is_empty()
+        {
+            return Err(refusal("prior original connection is still retained"));
+        }
+        self.acknowledged
+            .lock()
+            .map_err(|_| refusal("original acknowledgment slot poisoned"))?
+            .take();
+        Ok(())
     }
     pub(crate) fn belongs_to(&self, pool: &Arc<PostgresPool>) -> bool {
         Arc::ptr_eq(&self.pool, pool)
@@ -104,7 +123,7 @@ pub(crate) enum OriginalRecoveryError {
 }
 /// Constructed only by status observation on the existing original connection.
 pub(crate) struct ResolvedOriginalSession {
-    loan: SessionLoan,
+    loan: Option<SessionLoan>,
     outcome: OriginalTransactionOutcome,
 }
 impl ResolvedOriginalSession {
@@ -112,7 +131,9 @@ impl ResolvedOriginalSession {
         matches!(self.outcome, OriginalTransactionOutcome::Committed)
     }
     pub(crate) fn return_acknowledged(mut self) {
-        self.loan.return_acknowledged();
+        if let Some(loan) = self.loan.as_mut() {
+            loan.return_acknowledged();
+        }
     }
 }
 impl OriginalSessionOwner {
@@ -122,6 +143,23 @@ impl OriginalSessionOwner {
         let permit = Arc::clone(&self.gate).acquire_owned().await.map_err(|_| {
             OriginalRecoveryError::Owner(refusal("original recovery admission closed"))
         })?;
+        let acknowledged = self
+            .acknowledged
+            .lock()
+            .map_err(|_| {
+                OriginalRecoveryError::Owner(refusal("original acknowledgment slot poisoned"))
+            })?
+            .clone();
+        if let Some(acknowledged) = acknowledged {
+            return Ok(ResolvedOriginalSession {
+                loan: None,
+                outcome: if acknowledged.committed() {
+                    OriginalTransactionOutcome::Committed
+                } else {
+                    OriginalTransactionOutcome::Aborted
+                },
+            });
+        }
         let original = self
             .slot
             .take()
@@ -138,13 +176,30 @@ impl OriginalSessionOwner {
             _owner: Arc::clone(self),
             _permit: permit,
         };
+        if let Some(acknowledged) = loan
+            .session()
+            .map_err(OriginalRecoveryError::Owner)?
+            .original_acknowledgment()
+        {
+            return Ok(ResolvedOriginalSession {
+                loan: Some(loan),
+                outcome: if acknowledged.committed() {
+                    OriginalTransactionOutcome::Committed
+                } else {
+                    OriginalTransactionOutcome::Aborted
+                },
+            });
+        }
         let outcome = loan
             .session()
             .map_err(OriginalRecoveryError::Owner)?
             .observe_original_transaction()
             .await
             .map_err(OriginalRecoveryError::Database)?;
-        Ok(ResolvedOriginalSession { loan, outcome })
+        Ok(ResolvedOriginalSession {
+            loan: Some(loan),
+            outcome,
+        })
     }
 }
 impl SessionLoan {
@@ -157,6 +212,22 @@ impl SessionLoan {
     /// Only genuine commit/rollback acknowledgment callers use this. Returning to
     /// its original pool is NOT a socket-closed or all-writers-drained receipt.
     pub(crate) fn return_acknowledged(&mut self) {
+        if let Some(original) = self.original.original.as_ref() {
+            if let Some(acknowledged) = original.original_acknowledgment() {
+                let mut saved = self
+                    ._owner
+                    .acknowledged
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if saved
+                    .as_ref()
+                    .is_some_and(|previous| !previous.shares_original_transaction(&acknowledged))
+                {
+                    return;
+                }
+                *saved = Some(acknowledged);
+            }
+        }
         self.original.original.take();
     }
 }
