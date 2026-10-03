@@ -67,6 +67,7 @@ pub async fn prepare_storage_with(
     let storage = connect(config, &authority, keyring).await?;
     let provider = config.model_provider_id.clone();
     codex_core::install_remote_backend(RemoteBackend {
+        original_pool: std::sync::Arc::clone(storage.pool()),
         thread_store: storage.thread_store(provider),
         queue_store: storage.queue_store(),
         agent_graph_store: storage.agent_graph_store(),

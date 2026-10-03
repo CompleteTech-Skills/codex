@@ -2988,6 +2988,7 @@ dependencies = [
  "codex-otel",
  "codex-plugin",
  "codex-prompts",
+ "codex-postgres-runtime",
  "codex-protocol",
  "codex-response-debug-context",
  "codex-rmcp-client",

@@ -5,6 +5,7 @@
 //! no consumer can quietly fall back to local files.
 
 use codex_agent_graph_store::AgentGraphStore;
+use codex_postgres_runtime::PostgresPool;
 use codex_thread_store::QueueStore;
 use codex_thread_store::ThreadStore;
 use std::sync::Arc;
@@ -13,6 +14,10 @@ use std::sync::OnceLock;
 /// The remote implementations of the stores consumers build from configuration.
 #[derive(Clone)]
 pub struct RemoteBackend {
+    /// The SAME original pool captured by genuine remote connection startup.
+    /// Store projections/scalar generation are not substitutes. Retention does
+    /// not itself prove current SQL admission or whole-home physical drain.
+    pub original_pool: Arc<PostgresPool>,
     pub thread_store: Arc<dyn ThreadStore>,
     pub queue_store: Arc<dyn QueueStore>,
     pub agent_graph_store: Arc<dyn AgentGraphStore>,
