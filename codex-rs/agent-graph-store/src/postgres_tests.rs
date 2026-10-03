@@ -43,10 +43,14 @@ async fn real_postgres_graph_adapter_preserves_order_and_edge_semantics() {
         .await
         .expect("bootstrap graph schema");
     let runtime = Arc::new(
-        PostgresPool::connect(settings(state, "runtime"))
+        PostgresPool::connect_in_namespace(settings(state, "runtime"), None)
             .await
             .expect("runtime pool"),
     );
+    runtime
+        .bind_current_activation()
+        .await
+        .expect("actual runtime activation binding");
     let store = PostgresAgentGraphStore::new(runtime.clone());
     let [root, first, second, third, grandchild, under_closed, other] =
         std::array::from_fn(|_| ThreadId::new());

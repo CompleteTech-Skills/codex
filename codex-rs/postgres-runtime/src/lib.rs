@@ -36,6 +36,7 @@ mod activation_gate;
 mod session_binding;
 pub use activation_gate::ActivationGateError;
 pub use activation_gate::require_storage_open;
+pub use session_binding::BoundWrite;
 mod bootstrap;
 pub use bootstrap::BootstrapError;
 pub use bootstrap::bootstrap_codex_storage;

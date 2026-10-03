@@ -5,9 +5,9 @@
 //! write at, so a batch whose commit result was lost can be retried and recognized, never
 //! duplicated, and a writer that fell behind is told instead of interleaving.
 
+use codex_postgres_runtime::BoundWrite;
 use codex_postgres_runtime::PoolError;
 use codex_postgres_runtime::PostgresPool;
-use codex_postgres_runtime::require_storage_open;
 use codex_protocol::ThreadId;
 use sqlx::Acquire;
 use sqlx::PgConnection;
@@ -93,6 +93,28 @@ impl PostgresRolloutStore {
         .map_err(|_| RolloutStoreError::Unavailable("the operation timed out".to_string()))?
     }
 
+    async fn write<T, F>(&self, operation: F) -> Result<T, RolloutStoreError>
+    where
+        F: for<'c> FnOnce(
+            &'c mut PgConnection,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, RolloutStoreError>> + Send + 'c>,
+        >,
+    {
+        timeout(QUERY_TIMEOUT, async {
+            let mut admitted = self
+                .pool
+                .begin_selected_write()
+                .await
+                .map_err(|error| RolloutStoreError::Unavailable(error.to_string()))?;
+            let value = operation(admitted.connection()).await?;
+            admitted.commit().await.map_err(database)?;
+            Ok(value)
+        })
+        .await
+        .map_err(|_| RolloutStoreError::Unavailable("the operation timed out".to_string()))?
+    }
+
     /// The position the next appended line will take.
     pub async fn next_position(&self, thread_id: ThreadId) -> Result<u64, RolloutStoreError> {
         self.run(move |connection| {
@@ -123,12 +145,18 @@ impl PostgresRolloutStore {
         expected_position: u64,
         lines: Vec<(Option<u64>, String)>,
     ) -> Result<u64, RolloutStoreError> {
-        self.run(move |connection| {
-            Box::pin(
-                async move { append_in(connection, thread_id, expected_position, &lines).await },
-            )
+        timeout(QUERY_TIMEOUT, async {
+            let mut admitted = self
+                .pool
+                .begin_selected_write()
+                .await
+                .map_err(|error| RolloutStoreError::Unavailable(error.to_string()))?;
+            let next = append_in(&mut admitted, thread_id, expected_position, &lines).await?;
+            admitted.commit().await.map_err(database)?;
+            Ok(next)
         })
         .await
+        .map_err(|_| RolloutStoreError::Unavailable("the operation timed out".to_string()))?
     }
 
     /// Read up to `limit` lines starting at `from_position`, in position order.
@@ -166,7 +194,7 @@ impl PostgresRolloutStore {
 
     /// Keep positions below `keep` and delete the rest, for reverting a thread.
     pub async fn truncate(&self, thread_id: ThreadId, keep: u64) -> Result<u64, RolloutStoreError> {
-        self.run(move |connection| {
+        self.write(move |connection| {
             Box::pin(async move {
                 lock_thread(connection, thread_id).await?;
                 Ok(sqlx::query(
@@ -191,7 +219,7 @@ impl PostgresRolloutStore {
         destination: ThreadId,
         count: u64,
     ) -> Result<(), RolloutStoreError> {
-        self.run(move |connection| {
+        self.write(move |connection| {
             Box::pin(async move {
                 lock_thread(connection, destination).await?;
                 let existing = next_position_in(connection, destination).await?;
@@ -229,11 +257,12 @@ impl PostgresRolloutStore {
 
 /// Compare-and-extend inside the caller's transaction; see [`PostgresRolloutStore::append`].
 pub async fn append_in(
-    connection: &mut PgConnection,
+    admitted: &mut BoundWrite<'_>,
     thread_id: ThreadId,
     expected_position: u64,
     lines: &[(Option<u64>, String)],
 ) -> Result<u64, RolloutStoreError> {
+    let connection = admitted.connection();
     let count = u64::try_from(lines.len())
         .map_err(|_| RolloutStoreError::Corrupt("batch is too large".to_string()))?;
     lock_thread(connection, thread_id).await?;
@@ -284,14 +313,11 @@ pub async fn append_in(
 }
 
 /// Lock the thread row, which also proves the thread exists. Every write takes this lock
-/// first, so it is also where writes are refused while a migration holds the store.
+/// first, after its caller's original transaction has taken the activation admission lock.
 async fn lock_thread(
     connection: &mut PgConnection,
     thread_id: ThreadId,
 ) -> Result<(), RolloutStoreError> {
-    require_storage_open(connection)
-        .await
-        .map_err(|error| RolloutStoreError::Unavailable(error.to_string()))?;
     sqlx::query_scalar::<_, i32>("SELECT 1 FROM threads WHERE id = $1::uuid FOR UPDATE")
         .bind(thread_id.to_string())
         .fetch_optional(connection)

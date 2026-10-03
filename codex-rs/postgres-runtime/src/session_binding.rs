@@ -12,6 +12,28 @@ pub(crate) struct ActivationBinding {
     generation: i64,
 }
 
+/// An actual admitted transaction begun internally on its original immutable bound pool.
+/// It cannot be constructed from a bare connection, tuple, or successful earlier readback.
+pub struct BoundWrite<'a> {
+    transaction: sqlx::Transaction<'static, sqlx::Postgres>,
+    _original_pool: &'a PostgresPool,
+}
+
+impl BoundWrite<'_> {
+    /// Use only data statements; transaction control remains with the original owner.
+    pub fn connection(&mut self) -> &mut PgConnection {
+        &mut self.transaction
+    }
+
+    pub async fn commit(self) -> Result<(), sqlx::Error> {
+        self.transaction.commit().await
+    }
+
+    pub async fn rollback(self) -> Result<(), sqlx::Error> {
+        self.transaction.rollback().await
+    }
+}
+
 async fn observe(
     connection: &mut PgConnection,
 ) -> Result<(String, ActivationBinding), ActivationGateError> {
@@ -41,6 +63,30 @@ async fn observe(
 }
 
 impl PostgresPool {
+    /// Begin only from this pool, then admit once before any data access. A foreign
+    /// transaction cannot be supplied even if its namespace and scalar tuple match.
+    pub async fn begin_selected_write(&self) -> Result<BoundWrite<'_>, ActivationGateError> {
+        let mut transaction = tokio::time::timeout(self.acquire_timeout, self.pool.begin())
+            .await
+            .map_err(|_| ActivationGateError::Unavailable)?
+            .map_err(|_| ActivationGateError::Unavailable)?;
+        let admission = async {
+            self.prepare_selected_write(&mut transaction).await?;
+            self.require_bound_storage_open(&mut transaction).await
+        }
+        .await;
+        if let Err(error) = admission {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| ActivationGateError::Unavailable)?;
+            return Err(error);
+        }
+        Ok(BoundWrite {
+            transaction,
+            _original_pool: self,
+        })
+    }
     /// Capture once from actual SQL. A retained pool can never adopt a newer activation.
     /// The namespace must originate from `connect_in_namespace`, not ambient role settings.
     /// Capture is an observation, including migrating/retired snapshots for status display;

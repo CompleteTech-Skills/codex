@@ -276,10 +276,14 @@ async fn real_postgres_queue_matches_sqlite() {
         .await
         .expect("bootstrap queue schema");
     let runtime = Arc::new(
-        PostgresPool::connect(settings(state, "runtime"))
+        PostgresPool::connect_in_namespace(settings(state, "runtime"), None)
             .await
             .expect("runtime pool"),
     );
+    runtime
+        .bind_current_activation()
+        .await
+        .expect("actual runtime activation binding");
     let postgres = PostgresQueueStore::new(runtime.clone());
     let sqlite_home = TempDir::new().expect("sqlite fixture home");
     let sqlite_runtime = StateRuntime::init(
@@ -311,10 +315,14 @@ async fn real_postgres_queue_serializes_writers_and_orders_versions_by_commit() 
         .await
         .expect("bootstrap queue schema");
     let runtime = Arc::new(
-        PostgresPool::connect(settings(state, "runtime"))
+        PostgresPool::connect_in_namespace(settings(state, "runtime"), None)
             .await
             .expect("runtime pool"),
     );
+    runtime
+        .bind_current_activation()
+        .await
+        .expect("actual runtime activation binding");
     let store = PostgresQueueStore::new(runtime.clone());
     let thread = ThreadId::new();
     insert_thread(&runtime, thread).await;
@@ -410,10 +418,14 @@ async fn real_postgres_queue_changes_survive_reconnect_and_thread_removal() {
         .await
         .expect("bootstrap queue schema");
     let first_pool = Arc::new(
-        PostgresPool::connect(settings(state, "runtime"))
+        PostgresPool::connect_in_namespace(settings(state, "runtime"), None)
             .await
             .expect("first runtime pool"),
     );
+    first_pool
+        .bind_current_activation()
+        .await
+        .expect("actual runtime activation binding");
     let first = PostgresQueueStore::new(first_pool.clone());
     let thread = ThreadId::new();
     insert_thread(&first_pool, thread).await;
@@ -429,10 +441,14 @@ async fn real_postgres_queue_changes_survive_reconnect_and_thread_removal() {
     first_pool.close().await.expect("close first pool");
 
     let second_pool = Arc::new(
-        PostgresPool::connect(settings(state, "runtime"))
+        PostgresPool::connect_in_namespace(settings(state, "runtime"), None)
             .await
             .expect("second runtime pool"),
     );
+    second_pool
+        .bind_current_activation()
+        .await
+        .expect("actual runtime activation binding");
     let second = PostgresQueueStore::new(second_pool.clone());
     // Other tests share the counter, so it may have moved on, but it never goes backwards.
     assert!(second.change_version().await.expect("version") >= version);

@@ -31,7 +31,6 @@ use codex_thread_store::CreateThreadParams;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::ThreadStoreResult;
 use codex_utils_absolute_path::AbsolutePathBuf;
-use sqlx::Acquire;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -282,50 +281,38 @@ impl LiveThread {
         let memory_mode = self.memory_mode;
         let history_mode = self.history_mode;
         let default_provider = default_model_provider_id.to_string();
-        let mut connection = pool
-            .acquire()
-            .await
-            .map_err(|error| ThreadStoreError::Internal {
-                message: format!("PostgreSQL thread storage is unavailable: {error:?}"),
-            })?;
-        let outcome: Result<(), ThreadStoreError> = async {
-            let mut tx = connection.begin().await.map_err(database)?;
-            pool.prepare_selected_write(&mut tx)
-                .await
-                .map_err(|error| ThreadStoreError::Internal {
-                    message: format!("PostgreSQL thread storage cannot accept writes: {error}"),
+        let outcome: Result<(), ThreadStoreError> =
+            async {
+                let mut admitted = pool.begin_selected_write().await.map_err(|error| {
+                    ThreadStoreError::Internal {
+                        message: format!("PostgreSQL thread storage cannot accept writes: {error}"),
+                    }
                 })?;
-            pool.require_bound_storage_open(&mut tx)
-                .await
-                .map_err(|error| ThreadStoreError::Internal {
-                    message: format!("PostgreSQL thread storage cannot accept writes: {error}"),
-                })?;
-            // The lease is checked while holding its row, so a takeover cannot slip in between
-            // this check and the commit that follows it.
-            if let Some((owner_id, token)) = fence {
-                let held: Option<i32> = sqlx::query_scalar(
-                    "SELECT 1 FROM thread_writer_ownership \
+                // The lease is checked while holding its row, so a takeover cannot slip in between
+                // this check and the commit that follows it.
+                if let Some((owner_id, token)) = fence {
+                    let held: Option<i32> = sqlx::query_scalar(
+                        "SELECT 1 FROM thread_writer_ownership \
                      WHERE thread_id = $1::uuid AND owner_id = $2::uuid AND token = $3 \
                        AND lease_until > clock_timestamp() FOR SHARE",
-                )
-                .bind(thread_id.to_string())
-                .bind(owner_id)
-                .bind(token)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(database)?;
-                if held.is_none() {
-                    return Err(ownership_lost(thread_id));
+                    )
+                    .bind(thread_id.to_string())
+                    .bind(owner_id)
+                    .bind(token)
+                    .fetch_optional(admitted.connection())
+                    .await
+                    .map_err(database)?;
+                    if held.is_none() {
+                        return Err(ownership_lost(thread_id));
+                    }
                 }
-            }
-            // The catalog row follows the items it summarizes, in the same transaction.
-            let existing = get_thread_in(&mut tx, thread_id, /*lock*/ true)
-                .await
-                .map_err(|error| ThreadStoreError::Internal {
-                    message: format!("failed to read thread metadata: {error}"),
-                })?;
-            let mut metadata =
-                match existing {
+                // The catalog row follows the items it summarizes, in the same transaction.
+                let existing = get_thread_in(admitted.connection(), thread_id, /*lock*/ true)
+                    .await
+                    .map_err(|error| ThreadStoreError::Internal {
+                        message: format!("failed to read thread metadata: {error}"),
+                    })?;
+                let mut metadata = match existing {
                     Some(metadata) => metadata,
                     None => {
                         let builder = builder_from_items(&items, std::path::Path::new(""))
@@ -339,22 +326,22 @@ impl LiveThread {
                         metadata
                     }
                 };
-            for item in &items {
-                apply_rollout_item(&mut metadata, item, &default_provider);
+                for item in &items {
+                    apply_rollout_item(&mut metadata, item, &default_provider);
+                }
+                metadata.updated_at = Utc::now();
+                upsert_thread_in(admitted.connection(), &metadata, memory_mode)
+                    .await
+                    .map_err(|error| ThreadStoreError::Internal {
+                        message: format!("failed to write thread metadata: {error}"),
+                    })?;
+                append_in(&mut admitted, thread_id, expected, &lines)
+                    .await
+                    .map_err(rollout_error)?;
+                admitted.commit().await.map_err(database)?;
+                Ok(())
             }
-            metadata.updated_at = Utc::now();
-            upsert_thread_in(&mut tx, &metadata, memory_mode)
-                .await
-                .map_err(|error| ThreadStoreError::Internal {
-                    message: format!("failed to write thread metadata: {error}"),
-                })?;
-            append_in(&mut tx, thread_id, expected, &lines)
-                .await
-                .map_err(rollout_error)?;
-            tx.commit().await.map_err(database)?;
-            Ok(())
-        }
-        .await;
+            .await;
         outcome?;
         self.next_position = expected + count;
         self.staged = None;

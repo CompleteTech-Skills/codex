@@ -42,11 +42,17 @@ fn settings(state: &Path, role: &str) -> ConnectionSettings {
 }
 
 async fn connect(state: &Path, role: &str) -> Arc<PostgresPool> {
-    Arc::new(
-        PostgresPool::connect(settings(state, role))
+    let pool = Arc::new(
+        PostgresPool::connect_in_namespace(settings(state, role), None)
             .await
             .unwrap_or_else(|error| panic!("{role} pool: {error:?}")),
-    )
+    );
+    if role == "runtime" {
+        pool.bind_current_activation()
+            .await
+            .unwrap_or_else(|error| panic!("actual runtime activation binding: {error}"));
+    }
+    pool
 }
 
 fn create_params(thread_id: ThreadId, provider: &str, cwd: &Path) -> CreateThreadParams {

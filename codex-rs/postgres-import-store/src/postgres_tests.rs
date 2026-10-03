@@ -48,10 +48,14 @@ async fn real_postgres_import_records_match_sqlite() {
         .await
         .expect("bootstrap import schema");
     let runtime = Arc::new(
-        PostgresPool::connect(settings(state, "runtime"))
+        PostgresPool::connect_in_namespace(settings(state, "runtime"), None)
             .await
             .expect("runtime pool"),
     );
+    runtime
+        .bind_current_activation()
+        .await
+        .expect("actual runtime activation binding");
     let postgres = PostgresExternalAgentImportStore::new(runtime.clone());
     let sqlite_home = TempDir::new().expect("sqlite fixture home");
     let sqlite = StateRuntime::init(
