@@ -388,6 +388,55 @@ impl PendingWriters {
 
 impl PendingWriter {
     #[cfg(test)]
+    pub(super) fn poison_completion_for_test(&self) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _original_guard = self
+                .completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("causal original claim registry poison");
+        }))
+        .is_err()
+    }
+
+    #[cfg(test)]
+    pub(super) async fn join_test_poisoned_original(&self) -> ThreadStoreResult<tokio::task::Id> {
+        let _join = self.completion_join.acquire().await.map_err(internal)?;
+        let task = self
+            .completion
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .task
+            .take()
+            .ok_or_else(|| internal("original poisoned task missing"))?;
+        let original_id = task.id();
+        let mut original = OriginalClaimTask {
+            owner: self,
+            task: Some(task),
+        };
+        let task = original
+            .task
+            .as_mut()
+            .ok_or_else(|| internal("original test loan missing"))?;
+        let result = task.await;
+        {
+            let mut completion = self
+                .completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match result {
+                Ok(outcome) => completion.outcome = Some(outcome),
+                Err(error) => completion.task_error = Some(error),
+            }
+            original.task = None;
+        }
+        // Test-only poison touched no data; clear only after this SAME actual JH joined.
+        // Production has no corresponding registry-adoption/recovery method.
+        self.completion.clear_poison();
+        Ok(original_id)
+    }
+
+    #[cfg(test)]
     pub(super) fn original_task_id(&self) -> Option<tokio::task::Id> {
         *self
             .task_id

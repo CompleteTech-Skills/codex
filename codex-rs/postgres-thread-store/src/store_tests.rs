@@ -710,7 +710,9 @@ async fn real_postgres_thread_store() {
     }
     original_metadata_refusal_control(state, &provider, &cwd).await;
     original_claim_response_loss_control(state, &provider, &cwd).await;
-    canceled_original_claim_control(state, &provider, &cwd).await;
+    for poison in [false, true] {
+        canceled_original_claim_control(state, &provider, &cwd, poison).await;
+    }
     renewer_cancellation_control(state, &provider, &cwd).await;
     retained_live_controls(state, &provider, &cwd).await;
     // Same opt-in fixture/test: avoid parallel cases contaminating lifecycle list assertions.
@@ -1197,7 +1199,7 @@ async fn renewer_cancellation_control(state: &Path, provider: &str, cwd: &Path) 
     ));
 }
 
-async fn canceled_original_claim_control(state: &Path, provider: &str, cwd: &Path) {
+async fn canceled_original_claim_control(state: &Path, provider: &str, cwd: &Path, poison: bool) {
     let observer = connect(state, "runtime").await;
     let seed = PostgresThreadStore::new(Arc::clone(&observer), provider.to_string());
     let id = ThreadId::new();
@@ -1285,6 +1287,43 @@ async fn canceled_original_claim_control(state: &Path, provider: &str, cwd: &Pat
         }
         _ => false,
     };
+    let original_poisoned = if poison {
+        match pending_after
+            .as_ref()
+            .ok()
+            .and_then(|pending| pending.as_ref())
+        {
+            Some(pending) => Some(pending.poison_completion_for_test()),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let mut refused_cleanup = if poison {
+        Some(Box::pin(writer.discard_thread(id)))
+    } else {
+        None
+    };
+    let mut poison_refusal = None;
+    let mut refusal_late = false;
+    if let Some(refused) = refused_cleanup.as_mut() {
+        match tokio::time::timeout(Duration::from_secs(5), refused).await {
+            Ok(result) => poison_refusal = Some(result),
+            Err(_) => refusal_late = true, // Retain this exact future through barrier release.
+        }
+    }
+    let after_refusal = writer.pending_writers.get(id);
+    let retained_after_refusal = matches!((&pending_after, &after_refusal), (Ok(Some(before)), Ok(Some(after))) if Arc::ptr_eq(before, after));
+    let original_still_blocked = if poison {
+        let probe = async {
+            let mut connection = observer.acquire().await.map_err(|_| "original mutation observer unavailable")?;
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity a WHERE a.pid=$1 AND $2=ANY(pg_catalog.pg_blocking_pids(a.pid)) AND EXISTS(SELECT 1 FROM pg_catalog.pg_locks l WHERE l.pid=a.pid AND NOT l.granted))")
+                .bind(writer_pid).bind(blocker_pid).fetch_one(&mut *connection).await.map_err(|_| "original mutation wait readback failed")
+        }.await;
+        Some(probe)
+    } else {
+        None
+    };
     // Release and reconcile every original owned SQL future before asserting diagnostics.
     let mut release = Box::pin(blocker.rollback());
     let deadline = tokio::time::timeout(Duration::from_secs(10), &mut release).await;
@@ -1293,6 +1332,40 @@ async fn canceled_original_claim_control(state: &Path, provider: &str, cwd: &Pat
         Err(_) => (true, (&mut release).await),
     };
     drop(release);
+    if poison_refusal.is_none() {
+        if let Some(refused) = refused_cleanup.as_mut() {
+            poison_refusal = Some(
+                match tokio::time::timeout(Duration::from_secs(10), &mut *refused).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        refusal_late = true;
+                        (&mut *refused).await
+                    }
+                },
+            );
+        }
+    }
+    drop(refused_cleanup); // No old waiter holds the exact original completion permit.
+    let mut repaired_id = None;
+    let mut repair_late = false;
+    if poison {
+        if let Some(pending) = pending_after
+            .as_ref()
+            .ok()
+            .and_then(|pending| pending.as_ref())
+        {
+            let mut joined = Box::pin(pending.join_test_poisoned_original());
+            repaired_id = Some(
+                match tokio::time::timeout(Duration::from_secs(10), &mut joined).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        repair_late = true;
+                        (&mut joined).await
+                    }
+                },
+            );
+        }
+    }
     let mut cleanup = Box::pin(writer.discard_thread(id));
     let deadline = tokio::time::timeout(Duration::from_secs(10), &mut cleanup).await;
     let (cleanup_late, cleaned) = match deadline {
@@ -1309,6 +1382,14 @@ async fn canceled_original_claim_control(state: &Path, provider: &str, cwd: &Pat
         observed.is_ok() && prematurely_completed.is_none(),
         "exact original claim wait: {observed:?}"
     );
+    if poison {
+        assert!(!refusal_late && !repair_late);
+        assert_eq!(original_poisoned, Some(true));
+        assert!(matches!(poison_refusal, Some(Err(_))));
+        assert!(retained_after_refusal);
+        assert!(matches!(original_still_blocked, Some(Ok(true))));
+        assert!(matches!(repaired_id, Some(Ok(id)) if Some(id) == original_task_id));
+    }
     assert!(same_owner, "cancel retains exact task, attempt and pool");
     assert!(!release_late && !cleanup_late);
     cleaned.expect("actual pending claim terminal, renewer join and lease release");
