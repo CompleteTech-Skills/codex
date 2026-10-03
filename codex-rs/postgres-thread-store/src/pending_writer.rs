@@ -19,6 +19,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 // Finite retained-frame admission, not a bound on payload bytes or native resources.
 const MAX_RETAINED_WRITERS: usize = 256;
@@ -33,12 +34,15 @@ pub(super) struct PendingWriters {
 pub(super) struct PendingWriter {
     original: Arc<Mutex<LiveThread>>,
     original_pool: Arc<PostgresPool>,
+    pub(super) load: super::pending_load::PendingLoad,
     attempt: Arc<RegistryMutex<Option<Arc<ThreadOwnershipAttempt>>>>,
-    completion: Mutex<Completion>,
+    completion: RegistryMutex<Completion>,
+    completion_join: Semaphore,
+    cleanup_gate: Semaphore,
     // Keep the actual claim failure even if same-attempt recovery succeeds.
     claim_failure: Arc<RegistryMutex<Option<ThreadOwnershipError>>>,
     no_lease_created: Arc<AtomicBool>,
-    cleanup_claim: Mutex<Option<Arc<ThreadOwnership>>>,
+    cleanup_claim: RegistryMutex<Option<Arc<ThreadOwnership>>>,
     refusals: RegistryMutex<Refusals>,
     #[cfg(test)]
     task_id: RegistryMutex<Option<tokio::task::Id>>,
@@ -94,6 +98,28 @@ struct Completion {
     task_error: Option<tokio::task::JoinError>,
 }
 
+/// Borrow-bound proof of this original claim task join, not SQL rollback proof.
+struct ClaimTaskJoined<'a> {
+    _original_owner: &'a PendingWriter,
+}
+
+// A canceled waiter restores the same original handle before releasing its permit.
+struct OriginalClaimTask<'a> {
+    owner: &'a PendingWriter,
+    task: Option<tokio::task::JoinHandle<ThreadStoreResult<()>>>,
+}
+impl Drop for OriginalClaimTask<'_> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            self.owner
+                .completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .task = Some(task);
+        }
+    }
+}
+
 /// Constructed only after the original task and renewer have terminated and its
 /// original-pool cleanup has completed (or a known no-lease command completed).
 pub(super) struct PendingCleanupCompleted(Arc<PendingWriter>);
@@ -139,15 +165,18 @@ impl PendingWriters {
         let pending = Arc::new(PendingWriter {
             original: Arc::clone(&launch.original),
             original_pool: Arc::clone(&launch.pool),
+            load: super::pending_load::PendingLoad::default(),
             attempt: Arc::clone(&retained_attempt),
-            completion: Mutex::new(Completion {
+            completion_join: Semaphore::new(1),
+            cleanup_gate: Semaphore::new(1),
+            completion: RegistryMutex::new(Completion {
                 task: None,
                 outcome: None,
                 task_error: None,
             }),
             claim_failure: Arc::clone(&failure),
             no_lease_created: Arc::clone(&no_lease_created),
-            cleanup_claim: Mutex::new(None),
+            cleanup_claim: RegistryMutex::new(None),
             refusals: RegistryMutex::new(Refusals::default()),
             #[cfg(test)]
             task_id: RegistryMutex::new(None),
@@ -373,17 +402,40 @@ impl PendingWriter {
     /// Canceling this waiter releases its mutex guard, retaining the same task handle.
     /// No pending launch is aborted or interpreted as a SQL-terminal acknowledgment.
     pub(super) async fn wait(&self) -> ThreadStoreResult<()> {
-        let mut completion = self.completion.lock().await;
-        if completion.outcome.is_none() && completion.task_error.is_none() {
-            let task = completion
-                .task
-                .as_mut()
-                .ok_or_else(|| internal("original pending task missing"))?;
-            match task.await {
+        let _join = self.completion_join.acquire().await.map_err(internal)?;
+        let task = {
+            let mut completion = self
+                .completion
+                .lock()
+                .map_err(|_| internal("original completion registry poisoned"))?;
+            if completion.outcome.is_none() && completion.task_error.is_none() {
+                Some(
+                    completion
+                        .task
+                        .take()
+                        .ok_or_else(|| internal("original pending task missing"))?,
+                )
+            } else {
+                None
+            }
+        };
+        let mut original = OriginalClaimTask { owner: self, task };
+        if let Some(task) = original.task.as_mut() {
+            let result = task.await;
+            let mut completion = self
+                .completion
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match result {
                 Ok(outcome) => completion.outcome = Some(outcome),
                 Err(error) => completion.task_error = Some(error),
             }
+            original.task = None;
         }
+        let completion = self
+            .completion
+            .lock()
+            .map_err(|_| internal("original completion registry poisoned"))?;
         match completion.outcome.as_ref() {
             Some(Ok(())) => Ok(()),
             Some(Err(error)) => Err(super::copy_error(error)),
@@ -401,10 +453,31 @@ impl PendingWriter {
         Ok(RefusalSlot(Arc::clone(self)))
     }
 
+    async fn join_claim_for_cleanup(&self) -> ThreadStoreResult<ClaimTaskJoined<'_>> {
+        let _command_outcome = self.wait().await;
+        let completion = self
+            .completion
+            .lock()
+            .map_err(|_| internal("original claim terminal registry poisoned"))?;
+        // Only this owner's actual joined result grants cleanup. An original task
+        // panic, refused observation, missing handle or poison remains uncertainty.
+        if completion.task.is_some()
+            || completion.task_error.is_some()
+            || completion.outcome.is_none()
+        {
+            return Err(internal("original claim terminal proof unavailable"));
+        }
+        Ok(ClaimTaskJoined {
+            _original_owner: self,
+        })
+    }
+
     pub(super) async fn cleanup(self: &Arc<Self>) -> ThreadStoreResult<PendingCleanupCompleted> {
+        let _cleanup = self.cleanup_gate.acquire().await.map_err(internal)?;
         // Even failed launch results must be actually joined, not aborted or detached.
-        let _observed = self.wait().await;
-        let mut original = self.original.lock().await;
+        let _claim_terminal = self.join_claim_for_cleanup().await?;
+        let _load_terminal = self.load.close_join().await?;
+        let mut original = Arc::clone(&self.original).lock_owned().await;
         original.seal();
         original.finish_renewal().await?;
         if let Some(owner) = original.ownership.as_ref() {
@@ -413,26 +486,36 @@ impl PendingWriter {
                 .await
                 .map_err(internal)?;
         } else if !self.no_lease_created.load(Ordering::SeqCst) {
-            let mut cleanup_claim = self.cleanup_claim.lock().await;
-            if cleanup_claim.is_none() {
-                let attempt = self.original_attempt().ok_or_else(|| {
-                    internal("original launch outcome unresolved without attempt")
-                })?;
-                let claim = self
-                    .original_pool
-                    .recover_thread_ownership_attempt(&attempt)
-                    .await
-                    .map_err(internal)?
-                    .ok_or_else(|| {
-                        internal("original launch outcome unresolved; no owner observed")
+            let cached = self
+                .cleanup_claim
+                .lock()
+                .map_err(|_| internal("original cleanup claim registry poisoned"))?
+                .clone();
+            let claim = match cached {
+                Some(claim) => claim,
+                None => {
+                    let attempt = self.original_attempt().ok_or_else(|| {
+                        internal("original launch outcome unresolved without attempt")
                     })?;
-                *cleanup_claim = Some(Arc::new(claim));
-            }
-            let claim = cleanup_claim
-                .as_ref()
-                .ok_or_else(|| internal("original cleanup claim missing"))?;
+                    let claim = self
+                        .original_pool
+                        .recover_thread_ownership_attempt(&attempt)
+                        .await
+                        .map_err(internal)?
+                        .ok_or_else(|| {
+                            internal("original launch outcome unresolved; no owner observed")
+                        })?;
+                    let claim = Arc::new(claim);
+                    *self
+                        .cleanup_claim
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(Arc::clone(&claim));
+                    claim
+                }
+            };
             self.original_pool
-                .release_thread_ownership(claim)
+                .release_thread_ownership(&claim)
                 .await
                 .map_err(internal)?;
         }

@@ -250,22 +250,7 @@ impl PostgresThreadStore {
             .read_all(thread_id)
             .await
             .map_err(rollout_error)?;
-        let next_position = lines.last().map_or(0, |line| line.position + 1);
-        let last_ordinal = lines.iter().rev().find_map(|line| line.ordinal);
-        let items = lines
-            .iter()
-            .map(|line| {
-                parse_rollout_line(&line.line)
-                    .map(|parsed| parsed.item)
-                    .map_err(|error| ThreadStoreError::Internal {
-                        message: format!(
-                            "stored rollout line {} of thread {thread_id} is unreadable: {error}",
-                            line.position
-                        ),
-                    })
-            })
-            .collect::<ThreadStoreResult<Vec<_>>>()?;
-        Ok((items, next_position, last_ordinal))
+        decode_loaded_lines(thread_id, lines)
     }
 
     async fn session_meta(&self, thread_id: ThreadId) -> ThreadStoreResult<Option<SessionMeta>> {
@@ -446,6 +431,28 @@ impl PostgresThreadStore {
     }
 }
 
+fn decode_loaded_lines(
+    thread_id: ThreadId,
+    lines: Vec<codex_postgres_rollout_store::StoredRolloutLine>,
+) -> ThreadStoreResult<(Vec<RolloutItem>, u64, Option<u64>)> {
+    let next_position = lines.last().map_or(0, |line| line.position + 1);
+    let last_ordinal = lines.iter().rev().find_map(|line| line.ordinal);
+    let items = lines
+        .iter()
+        .map(|line| {
+            parse_rollout_line(&line.line)
+                .map(|parsed| parsed.item)
+                .map_err(|error| ThreadStoreError::Internal {
+                    message: format!(
+                        "stored rollout line {} of thread {thread_id} is unreadable: {error}",
+                        line.position
+                    ),
+                })
+        })
+        .collect::<ThreadStoreResult<Vec<_>>>()?;
+    Ok((items, next_position, last_ordinal))
+}
+
 fn encode_cursor(anchor: &Anchor) -> String {
     match anchor.id {
         Some(id) => format!("{}|{id}", anchor.ts.timestamp_millis()),
@@ -548,24 +555,36 @@ impl ThreadStore for PostgresThreadStore {
             let pending = self.start_pending_writer(thread_id, Arc::clone(&original))?;
             pending.wait().await?;
             let refusal_slot = pending.reserve_refusal()?;
-            let loaded = async {
-                let metadata = self
-                    .catalog_thread(thread_id)
-                    .await?
-                    .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
-                if metadata.archived_at.is_some() && !params.include_archived {
-                    return Err(ThreadStoreError::InvalidRequest {
-                        message: format!("thread {thread_id} is archived"),
-                    });
+            let catalog = self.catalog.clone();
+            let rollouts = self.rollouts.clone();
+            pending.load.start(async move {
+                let loaded = async {
+                    let metadata = catalog
+                        .get_thread(thread_id)
+                        .await
+                        .map_err(internal)?
+                        .ok_or(ThreadStoreError::ThreadNotFound { thread_id })?;
+                    if metadata.archived_at.is_some() && !params.include_archived {
+                        return Err(ThreadStoreError::InvalidRequest {
+                            message: format!("thread {thread_id} is archived"),
+                        });
+                    }
+                    let lines = rollouts.read_all(thread_id).await.map_err(rollout_error)?;
+                    decode_loaded_lines(thread_id, lines).map(Arc::new)
                 }
-                self.load_items(thread_id).await
-            }
-            .await;
+                .await;
+                if let Err(error) = &loaded {
+                    refusal_slot.record(copy_error(error));
+                }
+                loaded
+            })?;
+            let loaded = pending.load.observe(false).await.and_then(|loaded| {
+                loaded.ok_or_else(|| internal("original resume load not dispatched"))
+            });
             let (stored, next_position, last_ordinal) = match loaded {
-                Ok(loaded) => loaded,
+                Ok(loaded) => (*loaded).clone(),
                 Err(error) => {
                     let returned = copy_error(&error);
-                    refusal_slot.record(error);
                     self.cleanup_pending_writer(thread_id, &pending).await?;
                     return Err(returned);
                 }
@@ -581,7 +600,7 @@ impl ThreadStore for PostgresThreadStore {
                 _ => Arc::new(stored),
             };
             {
-                let mut current = original.lock().await;
+                let mut current = Arc::clone(&original).lock_owned().await;
                 let mut resumed = LiveThread::for_resume(
                     crate::live::canonical_history_mode(&history),
                     params.metadata.cwd.clone().unwrap_or_default(),
@@ -652,7 +671,7 @@ impl ThreadStore for PostgresThreadStore {
                 return Ok(());
             }
             let original = self.live_thread(thread_id).await?;
-            let mut live = original.lock().await;
+            let mut live = Arc::clone(&original).lock_owned().await;
             if !live.is_sealed() {
                 live.require_writer(thread_id)?;
                 if !live.is_deferred_and_empty() {
@@ -684,7 +703,7 @@ impl ThreadStore for PostgresThreadStore {
                 return Ok(());
             }
             let original = self.live_thread(thread_id).await?;
-            let mut live = original.lock().await;
+            let mut live = Arc::clone(&original).lock_owned().await;
             live.seal();
             live.finish_renewal().await?;
             if let Some(owner) = live.ownership.as_ref() {
@@ -1077,7 +1096,7 @@ impl PostgresThreadStore {
                 .collect()
         };
         for (_, original) in &originals {
-            let mut live = original.lock().await;
+            let mut live = Arc::clone(&original).lock_owned().await;
             live.seal();
             live.finish_renewal().await?;
         }
@@ -1156,6 +1175,7 @@ async fn renew_lease(
 }
 
 #[path = "pending_writer.rs"]
+mod pending_load;
 mod pending_writer;
 
 #[cfg(test)]
