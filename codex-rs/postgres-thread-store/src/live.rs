@@ -7,6 +7,7 @@
 
 use crate::mutation_owner::MutationOutcome;
 use crate::mutation_owner::MutationOwner;
+use crate::mutation_owner::MutationRefusal;
 use crate::mutation_owner::MutationTerminal;
 use chrono::SecondsFormat;
 use chrono::Utc;
@@ -15,6 +16,7 @@ use codex_git_utils::get_git_repo_root;
 use codex_postgres_rollout_store::RolloutStoreError;
 use codex_postgres_rollout_store::append_in;
 use codex_postgres_runtime::PostgresPool;
+use codex_postgres_runtime::RetainedWriteAdmissionError;
 use codex_postgres_runtime::ThreadOwnership;
 use codex_postgres_thread_catalog::get_thread_in;
 use codex_postgres_thread_catalog::upsert_thread_in;
@@ -385,96 +387,144 @@ impl LiveThread {
         let default_provider = default_model_provider_id.to_string();
         let pool = Arc::clone(pool);
         self.mutation.start(async move {
-            let mut admitted = match pool.begin_selected_write().await {
-                Ok(admitted) => admitted,
-                Err(error) => return MutationOutcome::AdmissionUncertain(error),
+            let mut original = match pool.acquire_retained_write().await {
+                Ok(original) => original,
+                Err(cause) => {
+                    return MutationOutcome::AcquisitionUncertain {
+                        original_pool: pool,
+                        cause,
+                    };
+                }
             };
-            let command: ThreadStoreResult<()> = async {
-                // The lease is checked while holding its row, so a takeover cannot slip in between
-                // this check and the commit that follows it.
-                if let Some((owner_id, token)) = fence.as_ref() {
-                    let held: Option<i32> = sqlx::query_scalar(
-                        "SELECT 1 FROM thread_writer_ownership \
+            enum Completion {
+                Committed,
+                RolledBack(MutationRefusal),
+                Admission(RetainedWriteAdmissionError),
+                Uncertain {
+                    command: Option<ThreadStoreError>,
+                    database: sqlx::Error,
+                },
+            }
+            // Result owns no borrow: the original connection remains outside the transaction.
+            let completed = async {
+                let mut admitted = match original.begin().await {
+                    Ok(admitted) => admitted,
+                    Err(cause) => return Completion::Admission(cause),
+                };
+                let command: ThreadStoreResult<()> = async {
+                    // The lease is checked while holding its row, so a takeover cannot slip in between
+                    // this check and the commit that follows it.
+                    if let Some((owner_id, token)) = fence.as_ref() {
+                        let held: Option<i32> = sqlx::query_scalar(
+                            "SELECT 1 FROM thread_writer_ownership \
                      WHERE thread_id = $1::uuid AND owner_id = $2::uuid AND token = $3 \
                        FOR SHARE",
-                    )
-                    .bind(thread_id.to_string())
-                    .bind(owner_id)
-                    .bind(token)
-                    .fetch_optional(admitted.connection())
-                    .await
-                    .map_err(database)?;
-                    if held.is_none() {
-                        return Err(ownership_lost(thread_id));
+                        )
+                        .bind(thread_id.to_string())
+                        .bind(owner_id)
+                        .bind(token)
+                        .fetch_optional(admitted.connection())
+                        .await
+                        .map_err(database)?;
+                        if held.is_none() {
+                            return Err(ownership_lost(thread_id));
+                        }
                     }
-                }
-                // The catalog row follows the items it summarizes, in the same transaction.
-                let existing = get_thread_in(admitted.connection(), thread_id, /*lock*/ true)
-                    .await
-                    .map_err(|error| ThreadStoreError::Internal {
-                        message: format!("failed to read thread metadata: {error}"),
-                    })?;
-                // Both row waits can outlast an unchanged lease. Check the server clock only
-                // after those waits; the held ownership row excludes takeover until commit.
-                if let Some((owner_id, token)) = fence.as_ref() {
-                    let unexpired: Option<bool> = sqlx::query_scalar(
-                        "SELECT lease_until > clock_timestamp() FROM thread_writer_ownership \
-                         WHERE thread_id = $1::uuid AND owner_id = $2::uuid AND token = $3",
-                    )
-                    .bind(thread_id.to_string())
-                    .bind(owner_id)
-                    .bind(token)
-                    .fetch_optional(admitted.connection())
-                    .await
-                    .map_err(database)?;
-                    if unexpired != Some(true) {
-                        return Err(ownership_lost(thread_id));
-                    }
-                }
-                let mut metadata = match existing {
-                    Some(metadata) => metadata,
-                    None => {
-                        let builder = builder_from_items(&items, std::path::Path::new(""))
-                            .ok_or_else(|| ThreadStoreError::Internal {
-                                message: "the first rollout items carry no session metadata"
-                                    .to_string(),
+                    // The catalog row follows the items it summarizes, in the same transaction.
+                    let existing =
+                        get_thread_in(admitted.connection(), thread_id, /*lock*/ true)
+                            .await
+                            .map_err(|error| ThreadStoreError::Internal {
+                                message: format!("failed to read thread metadata: {error}"),
                             })?;
-                        let mut metadata = builder.build(&default_provider);
-                        metadata.rollout_path = PathBuf::new();
-                        metadata.history_mode = history_mode;
-                        metadata
+                    // Both row waits can outlast an unchanged lease. Check the server clock only
+                    // after those waits; the held ownership row excludes takeover until commit.
+                    if let Some((owner_id, token)) = fence.as_ref() {
+                        let unexpired: Option<bool> = sqlx::query_scalar(
+                            "SELECT lease_until > clock_timestamp() FROM thread_writer_ownership \
+                         WHERE thread_id = $1::uuid AND owner_id = $2::uuid AND token = $3",
+                        )
+                        .bind(thread_id.to_string())
+                        .bind(owner_id)
+                        .bind(token)
+                        .fetch_optional(admitted.connection())
+                        .await
+                        .map_err(database)?;
+                        if unexpired != Some(true) {
+                            return Err(ownership_lost(thread_id));
+                        }
                     }
-                };
-                for item in &items {
-                    apply_rollout_item(&mut metadata, item, &default_provider);
+                    let mut metadata = match existing {
+                        Some(metadata) => metadata,
+                        None => {
+                            let builder = builder_from_items(&items, std::path::Path::new(""))
+                                .ok_or_else(|| ThreadStoreError::Internal {
+                                    message: "the first rollout items carry no session metadata"
+                                        .to_string(),
+                                })?;
+                            let mut metadata = builder.build(&default_provider);
+                            metadata.rollout_path = PathBuf::new();
+                            metadata.history_mode = history_mode;
+                            metadata
+                        }
+                    };
+                    for item in &items {
+                        apply_rollout_item(&mut metadata, item, &default_provider);
+                    }
+                    metadata.updated_at = Utc::now();
+                    upsert_thread_in(admitted.connection(), &metadata, memory_mode)
+                        .await
+                        .map_err(|error| ThreadStoreError::Internal {
+                            message: format!("failed to write thread metadata: {error}"),
+                        })?;
+                    append_in(&mut admitted, thread_id, expected, &lines)
+                        .await
+                        .map_err(rollout_error)?;
+                    Ok(())
                 }
-                metadata.updated_at = Utc::now();
-                upsert_thread_in(admitted.connection(), &metadata, memory_mode)
-                    .await
-                    .map_err(|error| ThreadStoreError::Internal {
-                        message: format!("failed to write thread metadata: {error}"),
-                    })?;
-                append_in(&mut admitted, thread_id, expected, &lines)
-                    .await
-                    .map_err(rollout_error)?;
-                Ok(())
+                .await;
+                match command {
+                    Ok(()) => match admitted.commit().await {
+                        Ok(()) => Completion::Committed,
+                        Err(database) => Completion::Uncertain {
+                            command: None,
+                            database,
+                        },
+                    },
+                    Err(command) => match admitted.rollback().await {
+                        Ok(()) => Completion::RolledBack(MutationRefusal::Command(command)),
+                        Err(database) => Completion::Uncertain {
+                            command: Some(command),
+                            database,
+                        },
+                    },
+                }
             }
             .await;
-            match command {
-                Ok(()) => match admitted.commit().await {
-                    Ok(()) => MutationOutcome::Committed,
-                    Err(database) => MutationOutcome::Uncertain {
-                        command: None,
-                        database,
-                    },
+            match completed {
+                Completion::Committed => MutationOutcome::Committed,
+                Completion::RolledBack(error) => MutationOutcome::RolledBack(error),
+                Completion::Uncertain { command, database } => MutationOutcome::Uncertain {
+                    command,
+                    database,
+                    original,
                 },
-                Err(command) => match admitted.rollback().await {
-                    Ok(()) => MutationOutcome::RolledBack(command),
-                    Err(database) => MutationOutcome::Uncertain {
-                        command: Some(command),
-                        database,
-                    },
-                },
+                Completion::Admission(cause) => {
+                    if matches!(
+                        &cause,
+                        RetainedWriteAdmissionError::Gate { rollback: None, .. }
+                    ) {
+                        // Actual original rollback succeeded; preserve the original typed gate cause too.
+                        MutationOutcome::RolledBack(MutationRefusal::Admission {
+                            cause,
+                            refusal: ThreadStoreError::Internal {
+                                message: "original selected mutation admission refused".to_string(),
+                            },
+                        })
+                    } else {
+                        MutationOutcome::AdmissionUncertain { original, cause }
+                    }
+                }
             }
         })?;
         self.resolve_mutation_for_write().await

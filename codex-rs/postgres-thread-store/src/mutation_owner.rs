@@ -1,20 +1,51 @@
 //! Ownership of one original SQL mutation task. Inactive until the live writer wires it.
+use codex_postgres_runtime::PostgresPool;
+use codex_postgres_runtime::RetainedWriteAdmissionError;
+use codex_postgres_runtime::RetainedWriteSession;
 use codex_thread_store::ThreadStoreError;
 use codex_thread_store::ThreadStoreResult;
 use std::future::Future;
+use std::sync::Arc;
 use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 
 pub(crate) enum MutationOutcome {
     Committed,
-    AdmissionUncertain(codex_postgres_runtime::ActivationGateError),
+    AcquisitionUncertain {
+        original_pool: Arc<PostgresPool>,
+        cause: codex_postgres_runtime::PoolError,
+    },
+    AdmissionUncertain {
+        original: RetainedWriteSession,
+        cause: RetainedWriteAdmissionError,
+    },
     /// The original command refused, and the original transaction acknowledged rollback.
-    RolledBack(ThreadStoreError),
+    RolledBack(MutationRefusal),
     /// No physical completion acknowledgment exists. Keep every original cause.
     Uncertain {
         command: Option<ThreadStoreError>,
         database: sqlx::Error,
+        original: RetainedWriteSession,
     },
+}
+
+pub(crate) enum MutationRefusal {
+    Command(ThreadStoreError),
+    Admission {
+        cause: RetainedWriteAdmissionError,
+        refusal: ThreadStoreError,
+    },
+}
+impl MutationRefusal {
+    fn error(&self) -> &ThreadStoreError {
+        match self {
+            Self::Command(error) => error,
+            Self::Admission { cause, refusal } => {
+                let _ = cause;
+                refusal
+            }
+        }
+    }
 }
 
 /// The original handle never leaves its owner while an observer awaits it.
@@ -23,7 +54,7 @@ pub(crate) enum MutationOutcome {
 pub(crate) struct MutationOwner {
     task: Option<JoinHandle<MutationOutcome>>,
     terminal: Option<Result<MutationOutcome, JoinError>>,
-    refusals: Vec<ThreadStoreError>,
+    refusals: Vec<MutationRefusal>,
     #[cfg(test)]
     original_task_id: Option<tokio::task::Id>,
 }
@@ -65,7 +96,7 @@ impl MutationOwner {
     #[cfg(test)]
     pub(crate) fn original_rollback_cause(&self) -> Option<&ThreadStoreError> {
         match self.terminal.as_ref() {
-            Some(Ok(MutationOutcome::RolledBack(error))) => Some(error),
+            Some(Ok(MutationOutcome::RolledBack(error))) => Some(error.error()),
             _ => None,
         }
     }
@@ -76,7 +107,8 @@ impl MutationOwner {
                 self.terminal,
                 Some(Ok(MutationOutcome::RolledBack(_)))
                     | Some(Ok(MutationOutcome::Uncertain { .. }))
-                    | Some(Ok(MutationOutcome::AdmissionUncertain(_)))
+                    | Some(Ok(MutationOutcome::AdmissionUncertain { .. }))
+                    | Some(Ok(MutationOutcome::AcquisitionUncertain { .. }))
                     | Some(Err(_))
             )
     }
@@ -98,16 +130,31 @@ impl MutationOwner {
         }
         match self.terminal.as_ref() {
             Some(Ok(MutationOutcome::Committed)) => Ok(MutationTerminal::Committed),
-            Some(Ok(MutationOutcome::RolledBack(error))) => Ok(MutationTerminal::RolledBack(error)),
-            Some(Ok(MutationOutcome::AdmissionUncertain(error))) => {
-                let _ = error;
+            Some(Ok(MutationOutcome::RolledBack(error))) => {
+                Ok(MutationTerminal::RolledBack(error.error()))
+            }
+            Some(Ok(MutationOutcome::AcquisitionUncertain {
+                original_pool,
+                cause,
+            })) => {
+                let _ = (original_pool, cause);
+                Err(refusal(
+                    "original mutation connection acquisition is uncertain",
+                ))
+            }
+            Some(Ok(MutationOutcome::AdmissionUncertain { original, cause })) => {
+                let _ = (original, cause);
                 Err(refusal(
                     "original mutation admission completion is uncertain",
                 ))
             }
-            Some(Ok(MutationOutcome::Uncertain { command, database })) => {
+            Some(Ok(MutationOutcome::Uncertain {
+                command,
+                database,
+                original,
+            })) => {
                 // Retain both originals; never interpolate database/command payload in logs.
-                let _ = (command, database);
+                let _ = (command, database, original);
                 Err(refusal("original mutation SQL completion is uncertain"))
             }
             Some(Err(error)) => {
@@ -201,7 +248,9 @@ mod tests {
     -> ThreadStoreResult<()> {
         let mut original = MutationOwner::default();
         for _ in 0..4 {
-            original.start(async { MutationOutcome::RolledBack(refusal("original command")) })?;
+            original.start(async {
+                MutationOutcome::RolledBack(MutationRefusal::Command(refusal("original command")))
+            })?;
             if !matches!(original.observe().await?, MutationTerminal::RolledBack(_)) {
                 return Err(refusal("rollback receipt was lost"));
             }
