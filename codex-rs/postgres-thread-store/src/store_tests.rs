@@ -1177,15 +1177,17 @@ async fn renewer_cancellation_control(state: &Path, provider: &str, cwd: &Path) 
     assert!(!late);
     result.expect("same original task joined and conditional lease release complete");
     assert!(probe.returned());
-    let live = original.lock().await;
-    let owner = live.ownership.as_ref().expect("retained original claim");
-    assert!(owner.renewal_joined);
-    assert!(
-        owner
-            .renewal_error
-            .as_ref()
-            .is_some_and(|error| error.is_cancelled() && error.id() == task_id)
-    );
+    {
+        let live = original.lock().await;
+        let owner = live.ownership.as_ref().expect("retained original claim");
+        assert!(owner.renewal_joined);
+        assert!(
+            owner
+                .renewal_error
+                .as_ref()
+                .is_some_and(|error| error.is_cancelled() && error.id() == task_id)
+        );
+    }
     assert!(matches!(
         store.live_thread(id).await,
         Err(ThreadStoreError::ThreadNotFound { .. })
