@@ -192,13 +192,12 @@ impl Operations {
     }
     async fn finish(&self, original: Arc<Original>) -> Result<Output, StorageError> {
         let _permit = original.join.acquire().await.map_err(|_| unavailable())?;
-        let task = {
-            original
-                .state
-                .lock()
-                .map_err(|_| unavailable())?
-                .task
-                .take()
+        let (task, mut poisoned) = {
+            let (mut state, poisoned) = match original.state.lock() {
+                Ok(state) => (state, false),
+                Err(cause) => (cause.into_inner(), true),
+            };
+            (state.task.take(), poisoned)
         };
         if let Some(task) = task {
             let mut loan = Loan {
@@ -219,12 +218,34 @@ impl Operations {
                 Err(cause) => state.failure = Some(cause),
             }
         }
-        let result = {
-            let state = original.state.lock().map_err(|_| unavailable())?;
-            if state.failure.is_some() {
-                return Err(unavailable());
-            }
-            state.result.clone().ok_or_else(unavailable)?
+        let (result, joined_failure) = {
+            let (state, state_poisoned) = match original.state.lock() {
+                Ok(state) => (state, false),
+                Err(cause) => (cause.into_inner(), true),
+            };
+            poisoned |= state_poisoned;
+            (state.result.clone(), state.failure.is_some())
+        };
+        if joined_failure {
+            // Cache the actual original JoinError BEFORE waking resource borrowers.
+            original.resources.record_joined_task_terminal();
+        }
+        if result.is_none() && !joined_failure {
+            return Err(unavailable()); // Missing original handle is not terminal proof.
+        }
+        // Reconcile the same external resources even when command admission is refused.
+        // A canceled cleanup waiter restores its SAME stored cleanup handle.
+        let cleanup = original
+            .resources
+            .finish_cleanup(&original.resources.original_startups())
+            .await;
+        if cleanup.is_err() {
+            return Err(unavailable());
+        }
+        let result = if poisoned || joined_failure {
+            Err(unavailable())
+        } else {
+            result.ok_or_else(unavailable)?
         };
         // Actual command and cleanup terminal proof precede success reclaim or
         // failed-result archive. Same-key fresh retry never erases the prior cause.

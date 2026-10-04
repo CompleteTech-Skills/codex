@@ -42,6 +42,9 @@ impl Resources {
             cleanup_join: tokio::sync::Semaphore::new(1),
         })
     }
+    pub(crate) fn original_startups(&self) -> Arc<crate::MigrationStartupRegistry> {
+        Arc::clone(&self._original_startups)
+    }
     // Called only after the original dispatch body's actual future returns.
     pub(crate) fn record_body_returned(
         &self,
@@ -51,6 +54,15 @@ impl Resources {
             .body_result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+        *self
+            .body_returned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.body_done.notify_waiters();
+    }
+    // Only the physically joined SAME operation task can prove a panicked/aborted
+    // body can no longer install resources. This is not a successful body result.
+    pub(crate) fn record_joined_task_terminal(&self) {
         *self
             .body_returned
             .lock()
