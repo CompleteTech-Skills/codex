@@ -46,6 +46,7 @@ struct Failure {
     acquisition: Option<crate::PoolError>,
     task_failure: Option<Arc<tokio::task::JoinError>>,
     diagnostic_acquisition: Option<crate::PoolError>,
+    diagnostic_cleanup_acquisition: Option<crate::PoolError>,
     relay_report: Option<Arc<serde_json::Value>>,
     relay_error: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
@@ -67,6 +68,7 @@ impl Failure {
             &self.acquisition,
             &self.task_failure,
             &self.diagnostic_acquisition,
+            &self.diagnostic_cleanup_acquisition,
             &self.relay_report,
             &self.relay_error,
         );
@@ -155,6 +157,17 @@ async fn selected_bootstrap_with_diagnostic(
     let namespace = named
         .then(|| NamedNamespace::new("codex_storage_isolation"))
         .transpose()?;
+    // Fault 7 uses the OTHER genuine selected namespace, never inherited
+    // search_path or a caller-made native server identity.
+    let diagnostic_namespace = if fault == 7 {
+        if named {
+            None
+        } else {
+            Some(NamedNamespace::new("codex_storage_isolation")?)
+        }
+    } else {
+        namespace.clone()
+    };
     let mut settings = ConnectionSettings {
         host: "localhost".into(),
         port: u16::try_from(receipt["port"].as_u64().ok_or("missing fixture port")?)?,
@@ -232,7 +245,7 @@ async fn selected_bootstrap_with_diagnostic(
         Some(
             crate::PostgresPool::connect_retained_in_namespace(
                 settings,
-                namespace.as_ref(),
+                diagnostic_namespace.as_ref(),
                 &mut |actual| {
                     diagnostic_pool = Some(actual); // SAME latent SDK before any acquisition.
                     Ok(())
@@ -273,6 +286,113 @@ async fn selected_bootstrap_with_diagnostic(
             false
         } // Original driver remains in captured SDK ledger.
     };
+    if fault == 7 {
+        let original_factory_ok =
+            matches!(&connected, Ok(returned) if Arc::ptr_eq(returned, &pool));
+        let selected_mismatch = diagnostic_pool.as_ref().is_some_and(|diagnostic| {
+            pool.selected_search_path.is_some()
+                && diagnostic.selected_search_path.is_some()
+                && pool.selected_search_path != diagnostic.selected_search_path
+        });
+        let refused_loan = owner.loan().await.is_err();
+        let never_dispatched = owner.state.lock().ok().is_some_and(|state| {
+            state.sealed
+                && !state.started
+                && state.session.is_none()
+                && state.xid.is_none()
+                && state.native_origin.is_none()
+        });
+        // Even a wrong test verdict must physically reconcile both actual
+        // factory-created pools before returning an owning diagnostic.
+        let proof = match owner.reconcile_original().await {
+            Ok(proof) if proof.covers_pool(&pool) => proof,
+            other => {
+                let retained = (
+                    owner,
+                    pool,
+                    diagnostic_pool,
+                    connected,
+                    diagnostic_error,
+                    other,
+                );
+                let terminal = std::future::pending::<Result<()>>().await;
+                let _ = retained;
+                return terminal;
+            }
+        };
+        let mut close = Box::pin(pool.close_original_sdk());
+        let late = tokio::time::timeout(Duration::from_secs(10), &mut close)
+            .await
+            .is_err();
+        if late {
+            close.await;
+        }
+        let mut diagnostic_late = false;
+        let mut diagnostic_closed = false;
+        let mut diagnostic_cleanup_acquisition = None;
+        if let Some(diagnostic) = diagnostic_pool.as_ref() {
+            let mut close = Box::pin(diagnostic.close_original_sdk());
+            diagnostic_late = tokio::time::timeout(Duration::from_secs(10), &mut close)
+                .await
+                .is_err();
+            if diagnostic_late {
+                close.await;
+            }
+            diagnostic_closed = match diagnostic.acquire().await {
+                Err(crate::PoolError::Closed) => true,
+                Ok(connection) => {
+                    drop(connection);
+                    false
+                }
+                Err(cause) => {
+                    diagnostic_cleanup_acquisition = Some(cause);
+                    false
+                }
+            };
+        }
+        let mut acquisition = None;
+        let closed = match pool.acquire().await {
+            Err(crate::PoolError::Closed) => true,
+            Ok(connection) => {
+                drop(connection);
+                false
+            }
+            Err(cause) => {
+                acquisition = Some(cause);
+                false
+            }
+        };
+        if closed && diagnostic_closed {
+            owner
+                .control_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        }
+        if !original_factory_ok
+            || !diagnostic_ok
+            || !selected_mismatch
+            || !refused_loan
+            || !never_dispatched
+            || proof.refused()
+            || late
+            || diagnostic_late
+            || !closed
+            || !diagnostic_closed
+        {
+            return Err(Box::new(Failure {
+                original: owner,
+                result: Err(BootstrapError::Migration),
+                acquisition,
+                task_failure: None,
+                diagnostic_acquisition: diagnostic_error,
+                diagnostic_cleanup_acquisition,
+                relay_report: None,
+                relay_error: None,
+            }));
+        }
+        return Ok(());
+    }
     let result = match connected {
         Ok(returned) if Arc::ptr_eq(&returned, &pool) => {
             async {
@@ -607,6 +727,7 @@ async fn selected_bootstrap_with_diagnostic(
             acquisition: None,
             task_failure: task_failure.clone(),
             diagnostic_acquisition: diagnostic_error,
+            diagnostic_cleanup_acquisition: None,
             relay_report: relay_report.clone(),
             relay_error: relay_error.clone(),
         }));
@@ -673,6 +794,7 @@ async fn selected_bootstrap_with_diagnostic(
             acquisition,
             task_failure: task_failure.clone(),
             diagnostic_acquisition: diagnostic_error,
+            diagnostic_cleanup_acquisition: None,
             relay_report: relay_report.clone(),
             relay_error: relay_error.clone(),
         }));
@@ -689,6 +811,7 @@ async fn selected_bootstrap_with_diagnostic(
             acquisition,
             task_failure: task_failure.clone(),
             diagnostic_acquisition: diagnostic_error,
+            diagnostic_cleanup_acquisition: None,
             relay_report: relay_report.clone(),
             relay_error: relay_error.clone(),
         }));
@@ -907,6 +1030,33 @@ async fn actual_named_lost_commit_reply_native_recovery() -> Result<()> {
         )?),
         true,
         6,
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOT-admitted default and named migrator namespaces; no privilege fallback"]
+async fn default_bootstrap_rejects_named_diagnostic_namespace() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_FOREIGN_NAMESPACE_STATE",
+        )?),
+        false,
+        7,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires ROOT-admitted named and default migrator namespaces; no privilege fallback"]
+async fn named_bootstrap_rejects_default_diagnostic_namespace() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_FOREIGN_NAMESPACE_STATE",
+        )?),
+        true,
+        7,
         true,
     )
     .await
