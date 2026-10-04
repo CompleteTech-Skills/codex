@@ -6,6 +6,21 @@ use crate::PoolLimits;
 use std::path::Path;
 use std::time::Duration;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+struct TaskLoan {
+    original: Arc<BootstrapSessionOwner>,
+    task: Option<tokio::task::JoinHandle<std::result::Result<(), BootstrapError>>>,
+}
+impl Drop for TaskLoan {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            *self
+                .original
+                .control_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+        }
+    }
+}
 
 struct Failure {
     original: Arc<BootstrapSessionOwner>,
@@ -134,6 +149,11 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
                     let selected = namespace.clone();
                     let start = Arc::new(tokio::sync::Notify::new());
                     let entry = Arc::clone(&start);
+                    *owner
+                        .control_hold
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(Arc::clone(&owner));
                     let task = tokio::spawn(async move {
                         entry.notified().await;
                         match selected.as_ref() {
@@ -144,6 +164,21 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
                         }
                     });
                     let original_id = task.id();
+                    *owner
+                        .control_task
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+                    let mut loan = TaskLoan {
+                        original: Arc::clone(&owner),
+                        task: owner
+                            .control_task
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take(),
+                    };
+                    let Some(task) = loan.task.as_mut() else {
+                        return Err(BootstrapError::Migration);
+                    };
                     start.notify_one(); // Original handle captured before first SQL poll.
                     witnessed =
                         tokio::time::timeout(Duration::from_secs(10), probe.entered.notified())
@@ -162,7 +197,14 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
                     }
                     task.abort();
                     probe.release.notify_one();
-                    match task.await {
+                    let joined = task.await;
+                    loan.task = None; // Only actual SAME JoinHandle await can clear ownership.
+                    owner
+                        .control_hold
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    match joined {
                         // SAME original physical join before reconciliation/verdict.
                         Err(original) => {
                             witnessed &= original.is_cancelled() && original.id() == original_id;

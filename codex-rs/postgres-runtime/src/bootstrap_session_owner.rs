@@ -22,6 +22,10 @@ pub struct BootstrapSessionOwner {
     commit_probe: Mutex<Option<Arc<StampProbe>>>,
     #[cfg(test)]
     outcome_probe: Mutex<Option<Arc<StampProbe>>>,
+    #[cfg(test)]
+    control_task: Mutex<Option<tokio::task::JoinHandle<Result<(), BootstrapError>>>>,
+    #[cfg(test)]
+    control_hold: Mutex<Option<Arc<BootstrapSessionOwner>>>,
 }
 struct State {
     sealed: bool,
@@ -49,6 +53,10 @@ impl BootstrapSessionOwner {
             commit_probe: Mutex::new(None),
             #[cfg(test)]
             outcome_probe: Mutex::new(None),
+            #[cfg(test)]
+            control_task: Mutex::new(None),
+            #[cfg(test)]
+            control_hold: Mutex::new(None),
             state: Mutex::new(State {
                 sealed: false,
                 cleanup_complete: false,
