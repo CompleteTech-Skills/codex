@@ -176,6 +176,28 @@ impl Resources {
             state.entries[index].installed.as_ref().map(Arc::clone)
         }))
     }
+    #[cfg(test)]
+    pub(crate) fn actual_administrative_archive_for(
+        &self,
+        observer: &Arc<codex_remote_storage::RemoteAdministrativeObserver>,
+    ) -> bool {
+        let Ok(commands) = self.administrative_commands.state.lock() else {
+            return false;
+        };
+        let Ok(archives) = self.administrative_archives.lock() else {
+            return false;
+        };
+        let actual = commands
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.installed.as_ref().map(|command| (index, command)))
+            .collect::<Vec<_>>();
+        actual.len() == 1
+            && actual[0].1.belongs_to_observer(observer)
+            && !actual[0].1.retains_original_causes()
+            && archives[actual[0].0].is_some()
+    }
     pub(crate) fn retains_original_causes(&self) -> bool {
         if self
             .administrative_cleanup_causes

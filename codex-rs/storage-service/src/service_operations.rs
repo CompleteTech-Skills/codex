@@ -555,3 +555,7 @@ mod tests;
 #[cfg(test)]
 #[path = "service_public_route_tests.rs"]
 mod public_route_tests;
+
+#[cfg(test)]
+#[path = "service_administration_tests.rs"]
+mod administration_tests;
