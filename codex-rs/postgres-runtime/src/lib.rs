@@ -59,6 +59,7 @@ mod bootstrap;
 pub use bootstrap::BootstrapError;
 pub use bootstrap::bootstrap_codex_storage;
 pub use bootstrap::bootstrap_codex_storage_retained;
+pub use bootstrap::embedded_migration_checksums;
 mod compatibility;
 pub use compatibility::ClientCapabilities;
 pub use compatibility::CompatibilityError;

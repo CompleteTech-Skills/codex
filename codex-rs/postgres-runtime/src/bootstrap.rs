@@ -22,6 +22,15 @@ pub(crate) const LOCK_RESOURCE: i32 = 1; // Fixed codex_storage metadata namespa
 const MIGRATIONS_TABLE: &str = "codex_storage._codex_pg_migrations";
 pub(crate) static BASE_MIGRATOR: Migrator = sqlx_macros::migrate!("./migrations");
 
+/// Immutable expectations from this build's embedded migrations, not observed
+/// server history or an admission/upgrade permission. No caller supplies hashes.
+pub fn embedded_migration_checksums() -> impl Iterator<Item = (i64, &'static [u8])> {
+    BASE_MIGRATOR
+        .migrations
+        .iter()
+        .map(|migration| (migration.version, migration.checksum.as_ref()))
+}
+
 pub(crate) fn history_matches(rows: &[PgRow], migrations: &[Migration], format: i32) -> bool {
     if !crate::schema_registry::supported_format(format)
         || rows.len() != format as usize

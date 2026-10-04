@@ -291,6 +291,77 @@ pub(super) enum RelationRefusal {
     PartialExtension,
 }
 
+pub(super) enum HistoryRefusal {
+    Driver(sqlx::Error),
+    MissingSnapshot,
+    UnregisteredFormat,
+    ChangedHistory,
+}
+
+// Fixed current19 table scope; ONLY avoids silently admitting descendants.
+// SHARE is native write-blocking until rollback, not a role/ACL/schema-creation
+// lock or backend/credential/prepared-transaction retirement permission.
+pub(super) fn structural_lock_sql(namespace: &str) -> String {
+    let qualified = format!("\"{}\"", namespace.replace('"', "\"\""));
+    let tables = CURRENT_TABLES
+        .iter()
+        .map(|table| format!("ONLY {qualified}.\"{table}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("LOCK TABLE {tables} IN SHARE MODE")
+}
+
+pub(super) fn inspect_history(
+    metadata: &[sqlx::postgres::PgRow],
+    history: &[sqlx::postgres::PgRow],
+) -> Result<(), HistoryRefusal> {
+    use sqlx::Row;
+    if metadata.len() != 1 {
+        return Err(HistoryRefusal::MissingSnapshot);
+    }
+    let row = &metadata[0];
+    let singleton: bool = row.try_get("singleton").map_err(HistoryRefusal::Driver)?;
+    let format: i32 = row
+        .try_get("format_version")
+        .map_err(HistoryRefusal::Driver)?;
+    let reader: i32 = row
+        .try_get("min_reader_version")
+        .map_err(HistoryRefusal::Driver)?;
+    let writer: i32 = row
+        .try_get("min_writer_version")
+        .map_err(HistoryRefusal::Driver)?;
+    // No executable canonical20/21 contracts exist in this stage.
+    if !singleton || format != 19 || reader != 19 || writer != 19 {
+        return Err(HistoryRefusal::UnregisteredFormat);
+    }
+    let expected = codex_postgres_runtime::embedded_migration_checksums()
+        .take(19)
+        .collect::<Vec<_>>();
+    if expected.len() != 19 || history.len() != 19 {
+        return Err(HistoryRefusal::ChangedHistory);
+    }
+    for (row, (version, _)) in history.iter().zip(expected) {
+        let actual: i64 = row.try_get("version").map_err(HistoryRefusal::Driver)?;
+        let success: bool = row.try_get("success").map_err(HistoryRefusal::Driver)?;
+        let matches: bool = row
+            .try_get("checksum_matches")
+            .map_err(HistoryRefusal::Driver)?;
+        if actual != version || !success || !matches {
+            return Err(HistoryRefusal::ChangedHistory);
+        }
+    }
+    Ok(())
+}
+
+impl std::fmt::Debug for HistoryRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Self::Driver(raw) = self {
+            let _ = raw;
+        }
+        formatter.write_str("CatalogHistoryRefused([native rows retained])")
+    }
+}
+
 pub(super) struct RelationObservation {
     pub(super) namespace_oid: i64,
     pub(super) relation_count: usize,

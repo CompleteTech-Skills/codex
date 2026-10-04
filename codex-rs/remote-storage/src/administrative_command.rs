@@ -40,6 +40,8 @@ pub(super) enum CommandCause {
     Wait(tokio::sync::AcquireError),
     Catalog(catalog::PayloadRefusal),
     Relations(catalog::RelationRefusal),
+    RetainedDriver(Arc<sqlx::Error>),
+    History(Arc<catalog::HistoryRefusal>),
 }
 
 struct State {
@@ -55,6 +57,13 @@ struct State {
     raw_catalog: [Option<Vec<PgRow>>; 6],
     catalog_payload_bytes: usize,
     catalog_relations: Option<catalog::RelationObservation>,
+    structural: bool,
+    structural_bounds: Option<Result<PgRow, Arc<sqlx::Error>>>,
+    structural_lock: Option<Result<sqlx::postgres::PgQueryResult, Arc<sqlx::Error>>>,
+    structural_metadata: Option<Result<Vec<PgRow>, Arc<sqlx::Error>>>,
+    structural_history: Option<Result<Vec<PgRow>, Arc<sqlx::Error>>>,
+    structural_refusal: Option<Arc<catalog::HistoryRefusal>>,
+    structural_history_accepted: bool,
     #[cfg(test)]
     catalog_probe: Option<catalog::NativePayloadProbe>,
     #[cfg(test)]
@@ -116,6 +125,12 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
                 CommandCause::Relations(raw) => {
                     let _ = raw;
                 }
+                CommandCause::RetainedDriver(raw) => {
+                    let _ = raw;
+                }
+                CommandCause::History(raw) => {
+                    let _ = raw;
+                }
                 CommandCause::MissingSession | CommandCause::UnknownStatus => {}
             }
         }
@@ -124,6 +139,13 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
             &state.raw_rows,
             &state.raw_catalog,
             state.catalog_payload_bytes,
+            state.structural,
+            &state.structural_bounds,
+            &state.structural_lock,
+            &state.structural_metadata,
+            &state.structural_history,
+            &state.structural_refusal,
+            state.structural_history_accepted,
             &state.raw_stamp,
             &state.native_baseline,
             &state.xid,
@@ -248,6 +270,13 @@ impl OriginalAdministrativeCommand {
                 raw_catalog: std::array::from_fn(|_| None),
                 catalog_payload_bytes: 0,
                 catalog_relations: None,
+                structural: false,
+                structural_bounds: None,
+                structural_lock: None,
+                structural_metadata: None,
+                structural_history: None,
+                structural_refusal: None,
+                structural_history_accepted: false,
                 #[cfg(test)]
                 catalog_probe: None,
                 #[cfg(test)]
@@ -326,7 +355,150 @@ impl OriginalAdministrativeCommand {
         // exist for this single immutable dispatch. No retry overwrites history.
     }
 
+    fn history_refusal(&self, raw: catalog::HistoryRefusal) {
+        let raw = Arc::new(raw);
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            // Dedicated original cause survives generic diagnostic capacity.
+            if state.structural_refusal.is_none() {
+                state.structural_refusal = Some(Arc::clone(&raw));
+            }
+        }
+        self.cause(CommandCause::History(raw));
+    }
+
+    fn can_capture_structural(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+        state.structural && !state.refused && !self.state.is_poisoned()
+    }
+
+    async fn capture_structural_history(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        namespace: &str,
+    ) {
+        if !self.can_capture_structural() {
+            return;
+        }
+        let bounds = sqlx::query("SELECT pg_catalog.set_config('search_path','pg_catalog',true), pg_catalog.set_config('lock_timeout','5000ms',true), pg_catalog.set_config('statement_timeout','30000ms',true)")
+            .fetch_one(&mut *connection).await.map_err(Arc::new);
+        let error = bounds.as_ref().err().cloned();
+        {
+            let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+            state.structural_bounds = Some(bounds);
+            state.refused |= self.state.is_poisoned();
+        }
+        if let Some(raw) = error {
+            self.cause(CommandCause::RetainedDriver(raw));
+        }
+        if !self.can_capture_structural() {
+            return;
+        }
+        let locked = sqlx::query(&catalog::structural_lock_sql(namespace))
+            .execute(&mut *connection)
+            .await
+            .map_err(Arc::new);
+        let error = locked.as_ref().err().cloned();
+        {
+            let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+            state.structural_lock = Some(locked); // Native ACK before ANY classification/await.
+            state.refused |= self.state.is_poisoned();
+        }
+        if let Some(raw) = error {
+            self.cause(CommandCause::RetainedDriver(raw));
+        }
+        if !self.can_capture_structural() {
+            return;
+        }
+        let qualified = format!("\"{}\"", namespace.replace('"', "\"\""));
+        let metadata = sqlx::query(&format!("SELECT singleton, format_version, min_reader_version, min_writer_version FROM ONLY {qualified}.codex_schema_meta ORDER BY singleton LIMIT 2"))
+            .fetch_all(&mut *connection).await.map_err(Arc::new);
+        let error = metadata.as_ref().err().cloned();
+        {
+            let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+            state.structural_metadata = Some(metadata);
+            state.refused |= self.state.is_poisoned();
+        }
+        if let Some(raw) = error {
+            self.cause(CommandCause::RetainedDriver(raw));
+        }
+        if !self.can_capture_structural() {
+            return;
+        }
+        let expected = codex_postgres_runtime::embedded_migration_checksums()
+            .take(19)
+            .collect::<Vec<_>>();
+        let versions = expected
+            .iter()
+            .map(|(version, _)| *version)
+            .collect::<Vec<_>>();
+        let checksums = expected
+            .iter()
+            .map(|(_, checksum)| *checksum)
+            .collect::<Vec<_>>();
+        // Native comparison bounds client values even for oversized corrupt checksum.
+        let history = sqlx::query(&format!("SELECT history.version, history.success, COALESCE(history.checksum OPERATOR(pg_catalog.=) expected.checksum,FALSE) AS checksum_matches FROM ONLY {qualified}._codex_pg_migrations history LEFT JOIN ROWS FROM (pg_catalog.unnest($1::pg_catalog.int8[]),pg_catalog.unnest($2::pg_catalog.bytea[])) AS expected(version,checksum) ON history.version OPERATOR(pg_catalog.=) expected.version ORDER BY history.version LIMIT 20"))
+            .bind(versions).bind(checksums).fetch_all(&mut *connection).await.map_err(Arc::new);
+        let error = history.as_ref().err().cloned();
+        let inspected = {
+            let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+            state.structural_history = Some(history);
+            state.refused |= self.state.is_poisoned();
+            match (
+                state.structural_metadata.as_ref(),
+                state.structural_history.as_ref(),
+            ) {
+                (Some(Ok(metadata)), Some(Ok(history))) => {
+                    let bytes =
+                        catalog::retained_payload_bytes(metadata, state.catalog_payload_bytes)
+                            .and_then(|bytes| catalog::retained_payload_bytes(history, bytes));
+                    match bytes {
+                        Ok(bytes) => {
+                            let inspected = catalog::inspect_history(metadata, history);
+                            state.catalog_payload_bytes = bytes;
+                            Some(Ok(inspected))
+                        }
+                        Err(raw) => Some(Err(raw)),
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(raw) = error {
+            self.cause(CommandCause::RetainedDriver(raw));
+        }
+        match inspected {
+            Some(Ok(Ok(()))) => {
+                let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                state.structural_history_accepted = true;
+                state.refused |= self.state.is_poisoned();
+            }
+            Some(Ok(Err(raw))) => self.history_refusal(raw),
+            Some(Err(raw)) => self.cause(CommandCause::Catalog(raw)),
+            None if self.can_capture_structural() => {
+                self.history_refusal(catalog::HistoryRefusal::MissingSnapshot)
+            }
+            None => {}
+        }
+    }
+
     pub fn start_preflight(self: &Arc<Self>) -> Result<(), AdministrativeCommandRefusal> {
+        self.start_preflight_mode(false)
+    }
+
+    /// Explicit current19 structural observation. Takes native SHARE table locks
+    /// until the original rollback; requires actual lock privileges. This neither
+    /// enrolls principals nor certifies ACL/global-role/credential retirement.
+    pub fn start_structural_preflight(
+        self: &Arc<Self>,
+    ) -> Result<(), AdministrativeCommandRefusal> {
+        self.start_preflight_mode(true)
+    }
+
+    fn start_preflight_mode(
+        self: &Arc<Self>,
+        structural: bool,
+    ) -> Result<(), AdministrativeCommandRefusal> {
         let refused = || AdministrativeCommandRefusal {
             original: Arc::clone(self),
         };
@@ -334,6 +506,7 @@ impl OriginalAdministrativeCommand {
         if state.dispatched || state.refused || state.sealed {
             return Err(refused());
         }
+        state.structural = structural;
         let runtime = match tokio::runtime::Handle::try_current() {
             Ok(runtime) => runtime,
             Err(raw) => {
@@ -443,6 +616,16 @@ impl OriginalAdministrativeCommand {
                 .namespace()
                 .to_owned()
         };
+        let structural = {
+            self.state
+                .lock()
+                .unwrap_or_else(|raw| raw.into_inner())
+                .structural
+        };
+        if structural {
+            self.capture_structural_history(connection, &namespace)
+                .await;
+        }
         for (index, statement) in catalog::STATEMENTS.iter().enumerate() {
             #[cfg(test)]
             if index == 0 {
@@ -510,7 +693,19 @@ impl OriginalAdministrativeCommand {
                                 None => Err(catalog::RelationRefusal::MissingSnapshot),
                             };
                             match observation {
-                                Ok(observed) => state.catalog_relations = Some(observed),
+                                Ok(observed) => {
+                                    let unregistered = state.structural
+                                        && (observed.generation_relations_present
+                                            || observed.memory_v2_relations_present);
+                                    state.catalog_relations = Some(observed);
+                                    if unregistered {
+                                        drop(state);
+                                        self.history_refusal(
+                                            catalog::HistoryRefusal::UnregisteredFormat,
+                                        );
+                                        break;
+                                    }
+                                }
                                 Err(raw) => {
                                     drop(state);
                                     self.cause(CommandCause::Relations(raw));

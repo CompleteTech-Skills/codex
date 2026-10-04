@@ -192,6 +192,7 @@ impl OriginalServiceAdministration {
                 move |service| async move {
                     let refused = || crate::StorageError(crate::BlockerCode::Internal);
                     let resources = service.operation_resources.as_ref().ok_or_else(refused)?;
+                    let structural = operation.is_some();
                     if let Some(operation) = operation {
                         if !operation.matches_original(&service.inputs, &observer, &origin) {
                             return Err(refused());
@@ -233,7 +234,12 @@ impl OriginalServiceAdministration {
                         command_slot.record_retained_failure(Arc::new(raw));
                         return Err(refused());
                     }
-                    if let Err(raw) = command.start_preflight() {
+                    let dispatch = if structural {
+                        command.start_structural_preflight()
+                    } else {
+                        command.start_preflight()
+                    };
+                    if let Err(raw) = dispatch {
                         command_slot.record_retained_failure(Arc::new(raw));
                         return Err(refused());
                     }
