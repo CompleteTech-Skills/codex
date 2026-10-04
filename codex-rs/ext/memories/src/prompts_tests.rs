@@ -64,3 +64,53 @@ async fn v2_reads_only_its_own_summary_without_falling_back_to_v1()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn checked_summary_preserves_selected_read_failure_and_genuine_absence() {
+    let home = tempdir().unwrap();
+    let home = AbsolutePathBuf::from_absolute_path(home.path()).unwrap();
+    for version in [MemoryVersion::V1, MemoryVersion::V2] {
+        assert!(
+            build_memory_tool_developer_instructions_checked(&home, version)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let directory = home.join(version.directory_name());
+        tokio_fs::create_dir_all(&directory).await.unwrap();
+        tokio_fs::write(directory.join("memory_summary.md"), [0xff])
+            .await
+            .unwrap();
+        match build_memory_tool_developer_instructions_checked(&home, version)
+            .await
+            .unwrap_err()
+        {
+            SummaryError::Read {
+                version: selected,
+                cause,
+            } => {
+                assert_eq!(selected, version);
+                assert_eq!(cause.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("unexpected summary error: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn checked_render_retains_actual_template_failure() {
+    let template = Template::parse("{{required_other_field}}").unwrap();
+    match render_summary_template(&template, MemoryVersion::V2, "selected", "summary").unwrap_err()
+    {
+        SummaryError::Render { version, cause } => {
+            assert_eq!(version, MemoryVersion::V2);
+            assert_eq!(
+                cause,
+                template
+                    .render([("base_path", "selected"), ("memory_summary", "summary")])
+                    .unwrap_err()
+            );
+        }
+        other => panic!("unexpected render error: {other:?}"),
+    }
+}

@@ -121,6 +121,20 @@ pub trait ContextContributor: Send + Sync {
         })
     }
 
+    /// Fallible host context boundary. The host must propagate this failure
+    /// before recording history or opening a new context window.
+    fn contribute_thread_context_checked<'a>(
+        &'a self,
+        session_store: &'a ExtensionData,
+        thread_store: &'a ExtensionData,
+    ) -> ExtensionFuture<'a, std::io::Result<Vec<PromptFragment>>> {
+        Box::pin(async move {
+            Ok(self
+                .contribute_thread_context(session_store, thread_store)
+                .await)
+        })
+    }
+
     fn contribute_turn_context<'a>(
         &'a self,
         input: TurnContextContributionInput<'a>,
