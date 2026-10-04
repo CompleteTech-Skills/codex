@@ -81,7 +81,17 @@ def create_receipt(path, value):
 
 
 class OriginalRelay:
-    def __init__(self, frontend, backend):
+    def __init__(self, frontend, backend, fault_mode="commit_reply"):
+        if type(fault_mode) is not str or fault_mode not in (
+            "commit_reply",
+            "commit_request",
+        ):
+            raise ValueError("fixture commit fault mode refused")
+        self.fault_mode = fault_mode
+        self.commit_request_observed = False
+        self.commit_request_forwarded = False
+        self.commit_request_kind = None
+        self.commit_request_sha256 = None
         self.frontend = frontend
         self.backend = backend
         self.guard = threading.Lock()
@@ -107,10 +117,28 @@ class OriginalRelay:
                 total += len(wire)
                 if total > MAX_STREAM:
                     raise ValueError("fixture stream bound")
-                if commit_command(kind, payload):
+                commit = commit_command(kind, payload)
+                if commit:
                     with self.guard:
                         self.armed = True
+                        self.commit_request_observed = True
+                        self.commit_request_kind = kind.decode("ascii")
+                        self.commit_request_sha256 = hashlib.sha256(wire).hexdigest()
+                    if self.fault_mode == "commit_request":
+                        # The original request is NEVER sent upstream. Closing
+                        # is only the injected fault; native xid status remains
+                        # a separate genuine diagnostic-session observation.
+                        for stream in (self.frontend, self.backend):
+                            try:
+                                stream.shutdown(socket.SHUT_RDWR)
+                            except BaseException as original:
+                                with self.guard:
+                                    self.causes.append(original)
+                        return
                 self.backend.sendall(wire)
+                if commit:
+                    with self.guard:
+                        self.commit_request_forwarded = True
         except BaseException as original:
             with self.guard:
                 self.causes.append(original)
@@ -200,7 +228,16 @@ class OriginalRelay:
             raise RelayCleanupRefusal(self, started, joined)
         with self.guard:
             return {
-                "kind": "fixture-commit-reply-suppression",
+                "kind": (
+                    "fixture-commit-reply-suppression"
+                    if self.fault_mode == "commit_reply"
+                    else "fixture-commit-request-suppression"
+                ),
+                "fault_mode": self.fault_mode,
+                "client_commit_request_observed": self.commit_request_observed,
+                "client_commit_request_forwarded": self.commit_request_forwarded,
+                "client_commit_request_kind": self.commit_request_kind,
+                "client_commit_request_sha256": self.commit_request_sha256,
                 "release_authority": False,
                 "server_commit_tag_observed": self.suppressed,
                 "driver_commit_tag_forwarded": self.commit_tag_forwarded,
@@ -221,6 +258,12 @@ def main():
     args = parser.parse_args()
     with open(args.inputs, encoding="utf-8") as source:
         inputs = json.load(source)
+    fault_mode = inputs.get("fault_mode", "commit_reply")
+    if type(fault_mode) is not str or fault_mode not in (
+        "commit_reply",
+        "commit_request",
+    ):
+        raise ValueError("fixture commit fault mode refused")
     port = inputs["provider_port"]
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("fixture provider port")
@@ -240,6 +283,7 @@ def main():
                 "release_authority": False,
                 "pid": os.getpid(),
                 "port": listener.getsockname()[1],
+                "fault_mode": fault_mode,
             },
         )
         accepted, _ = listener.accept()
@@ -265,7 +309,7 @@ def main():
                         if backend.getpeercert(binary_form=True) != expected_leaf:
                             raise ValueError("provider leaf association refused")
                         backend.settimeout(10)
-                        relay = OriginalRelay(frontend, backend)
+                        relay = OriginalRelay(frontend, backend, fault_mode)
                         result = relay.run()
                         result.update(
                             {

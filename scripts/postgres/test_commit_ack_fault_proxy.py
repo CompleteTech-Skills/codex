@@ -25,6 +25,67 @@ class BytesOnly:
 
 
 class ProtocolControls(unittest.TestCase):
+    def test_actual_shared_request_fault_never_forwards_commit(self):
+        class Stream(BytesOnly):
+            def __init__(self, data=b"", fail=False):
+                super().__init__(data)
+                self.sent = bytearray()
+                self.stopped = False
+                self.fail = fail
+
+            def sendall(self, value):
+                self.sent.extend(value)
+
+            def shutdown(self, _how):
+                self.stopped = True
+                if self.fail:
+                    raise OSError("original shutdown failure")
+
+        startup = struct.pack("!II", 8, 196608)
+        for kind, payload in ((b"Q", b"COMMIT\0"), (b"P", b"\0COMMIT\0\0\0")):
+            for fail in (False, True):
+                wire = kind + struct.pack("!I", len(payload) + 4) + payload
+                frontend, backend = Stream(startup + wire, fail), Stream()
+                relay = source.OriginalRelay(frontend, backend, "commit_request")
+                relay.client()  # SAME production parser/pump, no threads/sockets.
+                self.assertEqual(bytes(backend.sent), startup)
+                self.assertTrue(frontend.stopped and backend.stopped)
+                self.assertTrue(relay.commit_request_observed)
+                self.assertFalse(relay.commit_request_forwarded or relay.suppressed)
+                self.assertEqual(relay.commit_request_kind, kind.decode("ascii"))
+                self.assertEqual(
+                    relay.commit_request_sha256, source.hashlib.sha256(wire).hexdigest()
+                )
+                self.assertEqual(
+                    any(isinstance(cause, OSError) for cause in relay.causes), fail
+                )
+
+    def test_malformed_request_is_not_a_commit_fault_witness(self):
+        class Stream(BytesOnly):
+            def __init__(self, data=b""):
+                super().__init__(data)
+                self.sent = bytearray()
+
+            def sendall(self, value):
+                self.sent.extend(value)
+
+        startup = struct.pack("!II", 8, 196608)
+        for payload in (b"COMMIT", b"COMMIT\0\0"):
+            wire = b"Q" + struct.pack("!I", len(payload) + 4) + payload
+            frontend, backend = Stream(startup + wire), Stream()
+            relay = source.OriginalRelay(frontend, backend, "commit_request")
+            relay.client()
+            self.assertEqual(bytes(backend.sent), startup + wire)
+            self.assertFalse(
+                relay.commit_request_observed or relay.commit_request_forwarded
+            )
+            self.assertTrue(any(isinstance(cause, EOFError) for cause in relay.causes))
+
+    def test_unknown_fault_mode_refuses_before_stream_use(self):
+        for mode in (True, "rollback", None):
+            with self.assertRaises(ValueError):
+                source.OriginalRelay(object(), object(), mode)
+
     def test_join_and_close_refusals_do_not_skip_other_originals(self):
         originals = []
 
