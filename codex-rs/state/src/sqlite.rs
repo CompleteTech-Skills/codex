@@ -26,6 +26,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 mod validation;
+mod write_pool_owner;
+pub use write_pool_owner::ClosedWritePools;
 
 use validation::SqliteQuickCheckManager;
 
@@ -154,6 +156,7 @@ pub struct RuntimeDbPath {
 pub struct SqliteConfig {
     sqlite_home: AbsolutePathBuf,
     quick_check_manager: SqliteQuickCheckManager,
+    write_pools: std::sync::Arc<write_pool_owner::WritePoolOwner>,
 }
 
 // Validation history is operational state, not part of configuration equality.
@@ -168,9 +171,23 @@ impl Eq for SqliteConfig {}
 impl SqliteConfig {
     pub fn from_sqlite_home(sqlite_home: AbsolutePathBuf) -> Self {
         Self {
+            write_pools: std::sync::Arc::new(write_pool_owner::WritePoolOwner::new()),
             sqlite_home,
             quick_check_manager: SqliteQuickCheckManager::new(),
         }
+    }
+
+    /// Seal this exact configuration owner against new writable pools and await
+    /// physical closure of every pool it registered, including cancelled opens.
+    /// Independently constructed configurations, filesystem jobs and other
+    /// processes are not covered. This is not a whole-home migration permit.
+    pub async fn seal_and_close_write_pools(&self) -> std::io::Result<ClosedWritePools> {
+        self.write_pools.seal_and_close().await
+    }
+
+    /// Exact original configuration-owner identity, never pathname equivalence.
+    pub fn shares_write_pool_owner(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.write_pools, &other.write_pools)
     }
 
     pub fn new_for_testing(sqlite_home: AbsolutePathBuf) -> Self {
@@ -403,11 +420,25 @@ impl SqliteConfig {
                     })
                 },
             );
-            tokio::select! {
+            // Retain the original pool under the same seal gate BEFORE its
+            // first connection, initialization query or WAL write. SQLx lazy
+            // construction with min_connections(0) opens no connections.
+            let pool = self
+                .write_pools
+                .register_lazy(pool_options, options.clone())
+                .map_err(Error::Io)?;
+            let result = tokio::select! {
                 biased;
                 Some(error) = init_error_rx.recv() => Err(error),
-                result = pool_options.connect_with(options.clone()) => result,
+                result = pool.acquire() => result.map(|connection| {
+                    drop(connection);
+                    pool.clone()
+                }),
+            };
+            if result.is_err() {
+                pool.close().await;
             }
+            result
         };
         let pool = connect().await?;
         let validation_result = self
