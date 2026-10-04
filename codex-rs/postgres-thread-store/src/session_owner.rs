@@ -74,6 +74,14 @@ impl OriginalSessionOwner {
             acknowledged: Mutex::new(None),
         }))
     }
+    #[cfg(test)]
+    pub(crate) fn captured_ack(&self) -> ThreadStoreResult<OriginalTransactionAcknowledgment> {
+        self.acknowledged
+            .lock()
+            .map_err(|_| refusal("ack poisoned"))?
+            .clone()
+            .ok_or_else(|| refusal("actual acknowledgment missing"))
+    }
     pub(crate) fn prepare_next_dispatch(&self) -> ThreadStoreResult<()> {
         if !self
             .slot

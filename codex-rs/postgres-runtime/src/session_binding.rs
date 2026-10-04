@@ -370,6 +370,9 @@ pub struct OriginalTransactionAcknowledgment {
     committed: bool,
 }
 impl OriginalTransactionAcknowledgment {
+    pub fn original_xid(&self) -> &str {
+        self.identity.as_str()
+    }
     pub fn committed(&self) -> bool {
         self.committed
     }

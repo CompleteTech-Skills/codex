@@ -123,6 +123,8 @@ pub(crate) struct LiveThread {
     mutation: MutationOwner,
     #[cfg(test)]
     mutation_fault: Option<OriginalMutationFault>,
+    #[cfg(test)]
+    acknowledged_fault: Option<OriginalAcknowledgedFault>,
 }
 
 impl LiveThread {
@@ -181,6 +183,8 @@ impl LiveThread {
             mutation: MutationOwner::default(),
             #[cfg(test)]
             mutation_fault: None,
+            #[cfg(test)]
+            acknowledged_fault: None,
         }
     }
 
@@ -207,6 +211,8 @@ impl LiveThread {
             mutation: MutationOwner::default(),
             #[cfg(test)]
             mutation_fault: None,
+            #[cfg(test)]
+            acknowledged_fault: None,
         }
     }
 
@@ -253,6 +259,21 @@ impl LiveThread {
         ready: tokio::sync::oneshot::Sender<i32>,
     ) {
         self.mutation_fault = Some(OriginalMutationFault { panic, ready });
+    }
+    #[cfg(test)]
+    pub(crate) fn inject_post_ack_fault(
+        &mut self,
+        panic: bool,
+        rollback: bool,
+        ready: tokio::sync::oneshot::Sender<
+            codex_postgres_runtime::OriginalTransactionAcknowledgment,
+        >,
+    ) {
+        self.acknowledged_fault = Some(OriginalAcknowledgedFault {
+            panic,
+            rollback,
+            ready,
+        });
     }
     #[cfg(test)]
     pub(crate) fn abort_original_mutation_task(&self) {
@@ -414,6 +435,8 @@ impl LiveThread {
         let original = self.mutation.original_session(pool)?;
         #[cfg(test)]
         let fault = self.mutation_fault.take();
+        #[cfg(test)]
+        let acknowledged_fault = self.acknowledged_fault.take();
         self.mutation.start(async move {
             let mut loan = match original.loan().await {
                 Ok(loan) => loan,
@@ -509,6 +532,15 @@ impl LiveThread {
                         .await
                         .map_err(rollout_error)?;
                     #[cfg(test)]
+                    if acknowledged_fault
+                        .as_ref()
+                        .is_some_and(|fault| fault.rollback)
+                    {
+                        return Err(ThreadStoreError::Internal {
+                            message: "actual original rollback control".to_string(),
+                        });
+                    }
+                    #[cfg(test)]
                     if let Some(fault) = fault {
                         let actual_pid: i32 =
                             sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
@@ -545,10 +577,18 @@ impl LiveThread {
             match completed {
                 Completion::Committed => {
                     loan.return_acknowledged();
+                    #[cfg(test)]
+                    if let Some(fault) = acknowledged_fault {
+                        fault.fire(&original).await;
+                    }
                     MutationOutcome::Committed
                 }
                 Completion::RolledBack(error) => {
                     loan.return_acknowledged();
+                    #[cfg(test)]
+                    if let Some(fault) = acknowledged_fault {
+                        fault.fire(&original).await;
+                    }
                     MutationOutcome::RolledBack(error)
                 }
                 Completion::Owner(cause) => MutationOutcome::OwnerUncertain {
@@ -697,4 +737,23 @@ fn copy_mutation_error(error: &ThreadStoreError) -> ThreadStoreError {
 struct OriginalMutationFault {
     panic: bool,
     ready: tokio::sync::oneshot::Sender<i32>,
+}
+
+#[cfg(test)]
+struct OriginalAcknowledgedFault {
+    panic: bool,
+    rollback: bool,
+    ready: tokio::sync::oneshot::Sender<codex_postgres_runtime::OriginalTransactionAcknowledgment>,
+}
+#[cfg(test)]
+impl OriginalAcknowledgedFault {
+    async fn fire(self, original: &crate::session_owner::OriginalSessionOwner) {
+        if let Ok(actual) = original.captured_ack() {
+            let _ = self.ready.send(actual);
+        }
+        if self.panic {
+            panic!("actual original task AFTER acknowledgment and pool return");
+        }
+        std::future::pending::<()>().await;
+    }
 }
