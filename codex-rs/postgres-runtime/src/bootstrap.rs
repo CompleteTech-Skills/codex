@@ -122,17 +122,50 @@ pub(crate) fn classify_sqlx(error: &sqlx::Error) -> BootstrapError {
     }
 }
 
-fn classify_migration(error: MigrateError) -> BootstrapError {
-    match error {
+fn classify_migration(error: sqlx::migrate::MigrateError) -> BootstrapError {
+    captured_migration(error, None)
+}
+pub(crate) fn captured_migration(
+    error: MigrateError,
+    capture: Option<&crate::bootstrap_session_owner::DdlReservation>,
+) -> BootstrapError {
+    let code = match &error {
         MigrateError::Execute(error) | MigrateError::ExecuteMigration(error, _) => {
-            classify_sqlx(&error)
+            classify_sqlx(error)
         }
         _ => BootstrapError::Migration,
+    };
+    if let Some(capture) = capture {
+        capture.failure(error);
+    }
+    code
+}
+pub(crate) fn captured_sqlx(
+    error: sqlx::Error,
+    capture: Option<&crate::bootstrap_session_owner::DdlReservation>,
+    classify: fn(&sqlx::Error) -> BootstrapError,
+) -> BootstrapError {
+    let code = classify(&error);
+    if let Some(capture) = capture {
+        capture.failure(error);
+    }
+    code
+}
+fn captured_namespace(
+    error: sqlx::Error,
+    capture: Option<&crate::bootstrap_session_owner::DdlReservation>,
+) -> BootstrapError {
+    match capture {
+        Some(capture) => captured_sqlx(error, Some(capture), classify_namespace_validation_ref),
+        None => classify_namespace_validation(error),
     }
 }
 
-fn classify_namespace_validation(error: sqlx::Error) -> BootstrapError {
-    match &error {
+pub(crate) fn classify_namespace_validation(error: sqlx::Error) -> BootstrapError {
+    classify_namespace_validation_ref(&error)
+}
+pub(crate) fn classify_namespace_validation_ref(error: &sqlx::Error) -> BootstrapError {
+    match error {
         sqlx::Error::ColumnDecode { .. } => BootstrapError::IncompatibleNamespace,
         sqlx::Error::Database(error)
             if matches!(
@@ -152,6 +185,13 @@ fn classify_namespace_validation(error: sqlx::Error) -> BootstrapError {
 pub(crate) async fn namespace_has_unexpected_objects(
     connection: &mut PgConnection,
     permitted_relations: &[&str],
+) -> Result<bool, BootstrapError> {
+    namespace_has_unexpected_objects_retained(connection, permitted_relations, None).await
+}
+async fn namespace_has_unexpected_objects_retained(
+    connection: &mut PgConnection,
+    permitted_relations: &[&str],
+    capture: Option<&crate::bootstrap_session_owner::DdlReservation>,
 ) -> Result<bool, BootstrapError> {
     sqlx::query_scalar(
         "WITH expected_relations AS (
@@ -181,11 +221,17 @@ pub(crate) async fn namespace_has_unexpected_objects(
     .bind(permitted_relations)
     .fetch_one(connection)
     .await
-    .map_err(|error| classify_sqlx(&error))
+    .map_err(|error| captured_sqlx(error, capture, classify_sqlx))
 }
 
 pub(crate) async fn require_safe_protected_privileges(
+    transaction: &mut PgConnection,
+) -> Result<(), BootstrapError> {
+    require_safe_protected_privileges_retained(transaction, None).await
+}
+async fn require_safe_protected_privileges_retained(
     connection: &mut PgConnection,
+    capture: Option<&crate::bootstrap_session_owner::DdlReservation>,
 ) -> Result<(), BootstrapError> {
     // Check effective access, including column ACLs, PUBLIC, inherited roles,
     // and roles either login could assume explicitly.
@@ -408,7 +454,7 @@ pub(crate) async fn require_safe_protected_privileges(
     )
     .fetch_one(connection)
     .await
-    .map_err(|error| classify_sqlx(&error))?;
+    .map_err(|error| captured_sqlx(error, capture, classify_sqlx))?;
     if unsafe_privileges {
         return Err(BootstrapError::Privilege);
     }
@@ -418,26 +464,44 @@ pub(crate) async fn require_safe_protected_privileges(
 /// Bootstrap only the preprovisioned schema, using a separate migrator login.
 /// The caller must supply `codex_migrator`; this never selects an active backend.
 pub async fn bootstrap_codex_storage(pool: &PostgresPool) -> Result<(), BootstrapError> {
+    bootstrap_codex_storage_with_owner(pool, None).await
+}
+pub async fn bootstrap_codex_storage_retained(
+    owner: &std::sync::Arc<crate::BootstrapSessionOwner>,
+) -> Result<(), BootstrapError> {
+    bootstrap_codex_storage_with_owner(owner.original_pool(), Some(owner)).await
+}
+async fn bootstrap_codex_storage_with_owner(
+    pool: &PostgresPool,
+    session_owner: Option<&std::sync::Arc<crate::BootstrapSessionOwner>>,
+) -> Result<(), BootstrapError> {
     timeout(BOOTSTRAP_TIMEOUT, async {
-        let mut connection = pool.acquire().await.map_err(BootstrapError::Connection)?;
-        let mut transaction = connection.begin().await.map_err(|error| classify_sqlx(&error))?;
+        let mut retained = match session_owner { Some(owner) => Some(owner.loan().await?), None => None };
+        let mut connection = match session_owner { None => Some(pool.acquire().await.map_err(BootstrapError::Connection)?), Some(_) => None };
+        let mut transaction = match (&mut retained, &mut connection) {
+            (Some(loan), _) => loan.begin().await?,
+            (_, Some(connection)) => connection.begin().await.map_err(|error| classify_sqlx(&error))?,
+            _ => return Err(BootstrapError::Migration),
+        };
+        if let Some(owner) = session_owner { owner.stamp(&mut transaction).await?; }
+        let capture = session_owner.map(|owner| owner.reserve_ddl()).transpose()?;
         sqlx::query("SET LOCAL ROLE codex_owner")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| classify_sqlx(&error))?;
+            .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
         sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
             .bind(LOCK_CLASS)
             .bind(LOCK_RESOURCE)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|error| classify_sqlx(&error))?;
+            .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
 
         let owner: Option<String> = sqlx::query_scalar(
             "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'codex_storage'",
         )
         .fetch_optional(&mut *transaction)
         .await
-        .map_err(|error| classify_sqlx(&error))?;
+        .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
         if owner.as_deref() != Some("codex_owner") {
             return Err(BootstrapError::IncompatibleNamespace);
         }
@@ -445,9 +509,9 @@ pub async fn bootstrap_codex_storage(pool: &PostgresPool) -> Result<(), Bootstra
         // pg_depend covers namespace-scoped objects across catalogs, including
         // operators, collations, and text search objects. The fixture's known
         // default ACLs are policy; effective table privileges are checked below.
-        let unexpected_objects = namespace_has_unexpected_objects(
+        let unexpected_objects = namespace_has_unexpected_objects_retained(
             &mut transaction,
-            &crate::schema_registry::known_relations(),
+            &crate::schema_registry::known_relations(), capture.as_ref(),
         ).await?;
         if unexpected_objects {
             return Err(BootstrapError::IncompatibleNamespace);
@@ -458,7 +522,7 @@ pub async fn bootstrap_codex_storage(pool: &PostgresPool) -> Result<(), Bootstra
         )
         .fetch_one(&mut *transaction)
         .await
-        .map_err(|error| classify_sqlx(&error))?;
+        .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
         if history_exists {
             let known_schema_complete: bool = sqlx::query_scalar(
                 "SELECT NOT EXISTS (
@@ -573,7 +637,7 @@ pub async fn bootstrap_codex_storage(pool: &PostgresPool) -> Result<(), Bootstra
             )
             .fetch_one(&mut *transaction)
             .await
-            .map_err(classify_namespace_validation)?;
+            .map_err(|error| captured_namespace(error, capture.as_ref()))?;
             if !known_schema_complete {
                 return Err(BootstrapError::IncompatibleNamespace);
             }
@@ -582,7 +646,7 @@ pub async fn bootstrap_codex_storage(pool: &PostgresPool) -> Result<(), Bootstra
             )
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(classify_namespace_validation)?;
+            .map_err(|error| captured_namespace(error, capture.as_ref()))?;
             let Some((format, min_reader, min_writer)) = version else {
                 return Err(BootstrapError::IncompatibleNamespace);
             };
@@ -592,15 +656,15 @@ pub async fn bootstrap_codex_storage(pool: &PostgresPool) -> Result<(), Bootstra
             }
             if !recorded_history_matches(&mut transaction, BASE_MIGRATOR.migrations.as_ref(), format)
                 .await
-                .map_err(classify_namespace_validation)?
+                .map_err(|error| captured_namespace(error, capture.as_ref()))?
             {
                 return Err(BootstrapError::IncompatibleNamespace);
             }
             // Refuse privilege drift on an existing namespace before any ACL
             // changes, so bootstrap cannot silently repair caller-owned policy.
-            require_safe_protected_privileges(&mut transaction).await?;
+            require_safe_protected_privileges_retained(&mut transaction, capture.as_ref()).await?;
         } else {
-            let occupied = namespace_has_unexpected_objects(&mut transaction, &[]).await?;
+            let occupied = namespace_has_unexpected_objects_retained(&mut transaction, &[], capture.as_ref()).await?;
             if occupied {
                 return Err(BootstrapError::IncompatibleNamespace);
             }
@@ -616,7 +680,10 @@ pub async fn bootstrap_codex_storage(pool: &PostgresPool) -> Result<(), Bootstra
         migrator
             .run_direct(/*target*/ None, &mut *transaction, /*skip*/ false)
             .await
-            .map_err(classify_migration)?;
+            .map_err(|error| match capture.as_ref() {
+                Some(capture) => captured_migration(error, Some(capture)),
+                None => classify_migration(error),
+            })?;
         for table in crate::schema_registry::PROTECTED_TABLES {
             for statement in [
                 format!(
@@ -632,44 +699,48 @@ pub async fn bootstrap_codex_storage(pool: &PostgresPool) -> Result<(), Bootstra
                 sqlx::query(AssertSqlSafe(statement))
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|error| classify_sqlx(&error))?;
+                    .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
             }
         }
         // The fixture's default grants are broad; metadata and history must be immutable to runtime.
         sqlx::query("REVOKE ALL ON codex_storage.codex_schema_meta FROM codex_runtime")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| classify_sqlx(&error))?;
+            .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
         sqlx::query("GRANT SELECT ON codex_storage.codex_schema_meta TO codex_runtime")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| classify_sqlx(&error))?;
+            .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
         sqlx::query("GRANT SELECT ON codex_storage.codex_schema_meta TO codex_backup")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| classify_sqlx(&error))?;
+            .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
         sqlx::query("REVOKE ALL ON codex_storage._codex_pg_migrations FROM codex_runtime, codex_backup")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| classify_sqlx(&error))?;
+            .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
         sqlx::query("GRANT SELECT ON codex_storage._codex_pg_migrations TO codex_backup")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| classify_sqlx(&error))?;
+            .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
         sqlx::query("GRANT USAGE ON SCHEMA codex_storage TO codex_runtime, codex_backup")
             .execute(&mut *transaction)
             .await
-            .map_err(|error| classify_sqlx(&error))?;
-        require_safe_protected_privileges(&mut transaction).await?;
-        let unexpected_objects = namespace_has_unexpected_objects(
+            .map_err(|error| captured_sqlx(error, capture.as_ref(), classify_sqlx))?;
+        require_safe_protected_privileges_retained(&mut transaction, capture.as_ref()).await?;
+        let unexpected_objects = namespace_has_unexpected_objects_retained(
             &mut transaction,
-            &crate::schema_registry::known_relations(),
+            &crate::schema_registry::known_relations(), capture.as_ref(),
         )
         .await?;
         if unexpected_objects {
             return Err(BootstrapError::IncompatibleNamespace);
         }
-        transaction.commit().await.map_err(|error| classify_sqlx(&error))?;
+        if let Some(capture) = capture { capture.success(); }
+        match session_owner {
+            Some(owner) => owner.commit(transaction).await?,
+            None => transaction.commit().await.map_err(|error| classify_sqlx(&error))?,
+        }
         Ok(())
     })
     .await

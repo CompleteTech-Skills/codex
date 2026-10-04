@@ -15,6 +15,9 @@ pub(crate) struct Resources {
     targets: Arc<Slots<SqliteTarget>>,
     staged_configs: Arc<Slots<SqliteConfig>>,
     read_sources: Arc<Slots<codex_storage_migration::RetainedSqliteSource>>,
+    bootstrap_sessions: Arc<Slots<codex_postgres_runtime::BootstrapSessionOwner>>,
+    bootstrap_cleanup_causes:
+        Mutex<[Option<Arc<codex_postgres_runtime::BootstrapSessionRefusal>>; CAPACITY]>,
     cleanup_causes: Mutex<[Option<Arc<std::io::Error>>; CAPACITY]>,
     admission_failure: Mutex<Option<Refusal>>,
     body_result: Mutex<Option<Result<crate::service_operations::Output, crate::StorageError>>>,
@@ -38,6 +41,8 @@ impl Resources {
             targets: Arc::default(),
             staged_configs: Arc::default(),
             read_sources: Arc::default(),
+            bootstrap_sessions: Arc::default(),
+            bootstrap_cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
             cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
             body_result: Mutex::new(None),
             admission_failure: Mutex::new(None),
@@ -201,6 +206,15 @@ impl Resources {
         Ok(std::array::from_fn(|index| {
             state.entries[index].installed.as_ref().map(Arc::clone)
         }))
+    }
+    pub(crate) fn retain_bootstrap_session(
+        &self,
+        pool: Arc<codex_postgres_runtime::PostgresPool>,
+    ) -> Result<Arc<codex_postgres_runtime::BootstrapSessionOwner>, Refusal> {
+        let slot = self.bootstrap_sessions.reserve()?;
+        let owner = codex_postgres_runtime::BootstrapSessionOwner::new(pool);
+        slot.capture_original_arc(Arc::clone(&owner))?;
+        Ok(owner)
     }
     pub(crate) fn retain_read_source(
         &self,
@@ -408,6 +422,8 @@ impl Resources {
                     self.staged_configs.seal_cleanup_snapshot();
                 let (read_sources, read_unresolved, read_poison) =
                     self.read_sources.seal_cleanup_snapshot();
+                let (bootstrap_sessions, bootstrap_unresolved, bootstrap_poison) =
+                    self.bootstrap_sessions.seal_cleanup_snapshot();
                 let original = Arc::clone(self);
                 let startups = Arc::clone(startups);
                 state.task = Some(tokio::spawn(async move {
@@ -428,7 +444,35 @@ impl Resources {
                         || target_unresolved
                         || config_unresolved
                         || read_unresolved
-                        || read_poison);
+                        || read_poison
+                        || bootstrap_unresolved
+                        || bootstrap_poison);
+                    let mut blocked_bootstrap_pools =
+                        std::array::from_fn::<_, CAPACITY, _>(|_| None);
+                    for (index, owner) in bootstrap_sessions.into_iter().enumerate() {
+                        if let Some(owner) = owner {
+                            match owner.reconcile_original().await {
+                                Ok(receipt) if receipt.covers_pool(owner.original_pool()) => {
+                                    complete &= !receipt.refused();
+                                }
+                                Ok(_) => {
+                                    blocked_bootstrap_pools[index] =
+                                        Some(Arc::clone(owner.original_pool()));
+                                    complete = false;
+                                }
+                                Err(cause) => {
+                                    blocked_bootstrap_pools[index] =
+                                        Some(Arc::clone(owner.original_pool()));
+                                    original
+                                        .bootstrap_cleanup_causes
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        [index] = Some(Arc::new(cause));
+                                    complete = false;
+                                }
+                            }
+                        }
+                    }
                     for source in read_sources.into_iter().flatten() {
                         // Diagnostic failure stays in the SAME externally retained source;
                         // it is distinct from the actual SDK-close completion below.
@@ -457,6 +501,13 @@ impl Resources {
                         }
                     }
                     for pool in pools.into_iter().flatten() {
+                        if blocked_bootstrap_pools
+                            .iter()
+                            .flatten()
+                            .any(|blocked| Arc::ptr_eq(blocked, &pool))
+                        {
+                            continue;
+                        }
                         if let Some(runtime) = runtimes
                             .iter()
                             .flatten()

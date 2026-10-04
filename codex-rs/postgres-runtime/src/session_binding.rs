@@ -307,6 +307,12 @@ impl PostgresPool {
     }
 }
 impl RetainedWriteSession {
+    // SDK-private bootstrap consumer uses the SAME physical container, without
+    // calling selected-write begin or claiming Runtime activation admission.
+    pub(crate) fn bootstrap_connection(&mut self) -> &mut PgConnection {
+        &mut self.connection
+    }
+
     pub fn original_pool(&self) -> &Arc<PostgresPool> {
         &self.original_pool
     }

@@ -14,8 +14,6 @@ use crate::types::RemoteSummary;
 use crate::types::StorageStatus;
 use codex_keyring_store::KeyringStore;
 use codex_postgres_runtime::PostgresPool;
-use codex_postgres_runtime::bootstrap_codex_storage;
-use codex_postgres_runtime::bootstrap_named_namespace;
 use codex_remote_storage::LoginRole;
 use codex_remote_storage::RemoteStorageError;
 use codex_remote_storage::connection_settings;
@@ -389,9 +387,18 @@ UNION ALL SELECT extnamespace FROM pg_catalog.pg_extension
                 }
             }
         }
+        let session_owner = resources
+            .retain_bootstrap_session(Arc::clone(&pool))
+            .map_err(|_| StorageError(BlockerCode::SchemaInvalid))?;
         let result = match &namespace {
-            Some(namespace) => bootstrap_named_namespace(&pool, namespace).await,
-            None => bootstrap_codex_storage(&pool).await,
+            Some(namespace) => {
+                codex_postgres_runtime::bootstrap_named_namespace_retained(
+                    &session_owner,
+                    namespace,
+                )
+                .await
+            }
+            None => codex_postgres_runtime::bootstrap_codex_storage_retained(&session_owner).await,
         };
         if let Err(original) = result {
             slot.record_returned_failure(Arc::new(original));
