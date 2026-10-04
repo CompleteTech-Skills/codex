@@ -189,3 +189,163 @@ async fn real_empty_named_public_bootstrap_canceled_original_constructor_cleanup
     )
     .await
 }
+
+// Real public plan body and real SQLite refusal, not a substitute factory task.
+async fn selected_public_plan_canceled_sqlite_refusal(
+    state: &std::path::Path,
+    namespace: &str,
+    prefix: &str,
+) -> ControlResult<()> {
+    let home = tempfile::tempdir()?.keep();
+    let service = sdk_service(&home, state, namespace, prefix)?;
+    // Deliberately valid SQLite with missing production threads table. Retain the
+    // actual setup pool before its first acquisition and close it on every result.
+    let seed = sqlx::sqlite::SqlitePoolOptions::new()
+        .min_connections(0)
+        .max_connections(1)
+        .connect_lazy_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(service.inputs.sqlite.state_db_path())
+                .create_if_missing(true),
+        );
+    let seeded = sqlx::query("CREATE TABLE unrelated_control (value INTEGER)")
+        .execute(&seed)
+        .await;
+    seed.close().await;
+    seeded?;
+    let probe = Arc::new(Probe::default());
+    *service
+        .original_operations
+        .probe
+        .lock()
+        .map_err(|_| "probe poisoned")? = Some(Arc::clone(&probe));
+    let mut caller = Box::pin(service.plan(crate::PlanAction::Migrate));
+    let entered = tokio::select! { biased;
+        _ = &mut caller => false,
+        result = tokio::time::timeout(Duration::from_secs(5), probe.entered.notified()) => result.is_ok(),
+    };
+    let original = {
+        let originals = service
+            .original_operations
+            .originals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        originals
+            .iter()
+            .find(|original| original.kind == Kind::Plan(crate::PlanAction::Migrate))
+            .map(Arc::clone)
+    };
+    let Some(original) = original else {
+        probe.release.notify_one();
+        let retained = (&mut caller, &service);
+        let result = std::future::pending::<ControlResult<()>>().await;
+        let _ = retained;
+        return result;
+    };
+    drop(caller);
+    let (id, stored) = {
+        let state = original
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state.operation_task_id,
+            state.task.as_ref().map(JoinHandle::id),
+        )
+    };
+    // Subsequent real nested Runtime probe must not inherit this entry pause.
+    *service
+        .original_operations
+        .probe
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    probe.release.notify_one();
+    let mut finish = Box::pin(service.original_operations.finish(Arc::clone(&original)));
+    let (late, result) = match tokio::time::timeout(Duration::from_secs(30), &mut finish).await {
+        Ok(result) => (false, result),
+        Err(_) => (true, finish.await),
+    };
+    let actual_task_terminal = original
+        .state
+        .lock()
+        .map(|state| state.task.is_none() && (state.result.is_some() || state.failure.is_some()))
+        .unwrap_or(false);
+    if !actual_task_terminal {
+        // A refused observer is not original query-task terminal evidence. Keep
+        // the exact source/operation/service owner instead of closing live reads.
+        let retained = (&original, &service);
+        let result = std::future::pending::<ControlResult<()>>().await;
+        let _ = retained;
+        return result;
+    }
+    let sources = original.resources.actual_read_sources();
+    let mut source_count = 0;
+    let mut genuine_cause = false;
+    let mut closed = true;
+    if let Ok(sources) = sources.as_ref() {
+        for source in sources.iter().flatten() {
+            source_count += 1;
+            genuine_cause |= source
+                .original_query_failure()
+                .ok()
+                .flatten()
+                .is_some_and(|cause| cause.downcast_ref::<sqlx::Error>().is_some());
+            // Observe actual admission closure BEFORE any diagnostic cleanup.
+            match source.original_read_pools() {
+                Ok(pools) => {
+                    let mut count = 0;
+                    for pool in pools.into_iter().flatten() {
+                        count += 1;
+                        closed &= match pool.acquire().await {
+                            Err(sqlx::Error::PoolClosed) => true,
+                            Ok(connection) => {
+                                drop(connection);
+                                false
+                            }
+                            Err(_) => false,
+                        };
+                    }
+                    closed &= count == 1;
+                }
+                Err(_) => closed = false,
+            }
+            // All known originals reconciled even when the closure observation fails.
+            closed &= source.close_original_read_pools().await.is_ok();
+        }
+    }
+    if !entered
+        || late
+        || id.is_none()
+        || id != stored
+        || sources.is_err()
+        || source_count != 1
+        || !genuine_cause
+        || !closed
+        || !original.resources.cleanup_completed()
+        || !matches!(
+            result,
+            Err(crate::StorageError(crate::BlockerCode::SourceUnreadable))
+        )
+    {
+        return Err("actual public plan canceled caller/read query cause cleanup failed".into());
+    }
+    Ok(())
+}
+#[tokio::test]
+#[ignore = "requires ROOT current default SQL fixture and admitted SQLite/retained host"]
+async fn real_default_public_plan_canceled_original_sqlite_query_refusal() -> ControlResult<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_OWNERSHIP_STATE")?;
+    selected_public_plan_canceled_sqlite_refusal(std::path::Path::new(&state), "codex_storage", "")
+        .await
+}
+#[tokio::test]
+#[ignore = "requires ROOT current named SQL fixture and admitted SQLite/retained host"]
+async fn real_named_public_plan_canceled_original_sqlite_query_refusal() -> ControlResult<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_ISOLATION_STATE")?;
+    selected_public_plan_canceled_sqlite_refusal(
+        std::path::Path::new(&state),
+        "codex_storage_isolation",
+        "isolation_",
+    )
+    .await
+}

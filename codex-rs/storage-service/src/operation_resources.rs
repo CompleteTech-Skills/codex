@@ -192,6 +192,16 @@ impl Resources {
         slot.install(original).map_err(|_| Refusal)?;
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn actual_read_sources(
+        &self,
+    ) -> Result<[Option<Arc<codex_storage_migration::RetainedSqliteSource>>; CAPACITY], Refusal>
+    {
+        let state = self.read_sources.state.lock().map_err(|_| Refusal)?;
+        Ok(std::array::from_fn(|index| {
+            state.entries[index].installed.as_ref().map(Arc::clone)
+        }))
+    }
     pub(crate) fn retain_read_source(
         &self,
         source: codex_storage_migration::SqliteSource,

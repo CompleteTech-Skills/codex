@@ -104,7 +104,7 @@ impl SqliteSource {
 pub struct RetainedSqliteSource {
     source: SqliteSource,
     reads: std::sync::Mutex<RetainedReads>,
-    query_cause: std::sync::Mutex<Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>>,
+    query_cause: std::sync::Mutex<Option<std::sync::Arc<anyhow::Error>>>,
 }
 struct RetainedReads {
     sealed: bool,
@@ -188,16 +188,24 @@ impl RetainedSqliteSource {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if saved.is_none() {
-            *saved = Some(std::sync::Arc::from(cause.into_boxed_dyn_error()));
+            *saved = Some(std::sync::Arc::new(cause));
         }
     }
-    pub fn original_query_failure(
-        &self,
-    ) -> Result<Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>> {
+    pub fn original_query_failure(&self) -> Result<Option<std::sync::Arc<anyhow::Error>>> {
         self.query_cause
             .lock()
             .map(|saved| saved.clone())
             .map_err(|_| anyhow::anyhow!("query cause owner poisoned"))
+    }
+    /// Observe the same SDK originals; snapshots grant no terminal or Home authority.
+    pub fn original_read_pools(&self) -> Result<[Option<SqlitePool>; 6]> {
+        let reads = self
+            .reads
+            .lock()
+            .map_err(|_| anyhow::anyhow!("read owner poisoned"))?;
+        Ok(std::array::from_fn(|index| {
+            reads.entries[index].pool.clone()
+        }))
     }
     /// Borrow the retained original driver failures; this is diagnostic evidence only.
     pub fn original_read_causes(&self) -> Result<[Option<std::sync::Arc<sqlx::Error>>; 6]> {
