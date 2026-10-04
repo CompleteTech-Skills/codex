@@ -1,4 +1,4 @@
-//! Inactive explicit administrative input. Parsing never grants server authority.
+//! Explicit administrative input. Parsing never grants server authority.
 
 use crate::CredentialSource;
 use crate::RemotePostgresProfile;

@@ -15,8 +15,11 @@ use std::io::Write;
 use std::path::Path;
 use uuid::Uuid;
 
+mod administrative_profile;
 mod credential_resolution;
 mod cutover;
+pub use administrative_profile::InvalidAdministrativeInput;
+pub use administrative_profile::RemoteAdministrationInput;
 pub use credential_resolution::CredentialResolutionError;
 pub use credential_resolution::HostCredentialResolver;
 pub use credential_resolution::KEYRING_SERVICE;

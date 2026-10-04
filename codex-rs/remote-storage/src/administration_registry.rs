@@ -1,4 +1,4 @@
-//! Inactive bounded observation-startup registry. No administrative permit.
+//! Bounded observation-startup registry. No administrative permit.
 //! Only startup observation borrowers exist here; role mutation actors are absent.
 use crate::administration_startup::AdministrativeNativeObservation;
 use crate::administration_startup::AdministrativeStartupRefusal;

@@ -1,4 +1,4 @@
-//! Inactive original administrative startup/session observation owner.
+//! Original administrative startup/session observation owner.
 //! No credential retirement, role mutation, drain or exclusive permit is exposed.
 
 use crate::administration_close::OriginalAdministrativeClose;
@@ -161,6 +161,7 @@ impl OriginalAdministrativeStartup {
     }
     /// Resolve explicit credential settings synchronously, own the original
     /// frame and latent SDK before any factory/role query can be polled.
+    #[cfg(test)]
     pub fn start(
         input: Arc<RemoteAdministrationInput>,
         resolver: &HostCredentialResolver<'_>,

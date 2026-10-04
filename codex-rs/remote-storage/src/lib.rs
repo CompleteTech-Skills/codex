@@ -6,9 +6,19 @@
 //! creates tables, never falls back to local files, and reports failures as typed outcomes that
 //! say whether trying again can help.
 
+mod administration;
+mod administration_close;
+mod administration_registry;
+mod administration_settings;
+mod administration_startup;
 mod error;
 mod storage;
 
+pub use administration::AdministrativeObservationRefusal;
+pub use administration::RemoteAdministrativeObserver;
+pub use administration_registry::AdministrativeFailureArchive;
+pub use administration_registry::AdministrativeRegistryRefusal;
+pub use administration_startup::AdministrativeNativeObservation;
 pub use error::RemoteStorageError;
 pub use storage::LoginRole;
 pub use storage::RemoteStorage;

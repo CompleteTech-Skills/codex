@@ -1,4 +1,4 @@
-//! Inactive administrative TLS factory prerequisite, not a privilege permit.
+//! Administrative TLS factory for original observation tasks, not a privilege permit.
 //!
 //! Declaration requires the administrative input export and an original task/
 //! session consumer registered before polling this factory. Returned SDK pools

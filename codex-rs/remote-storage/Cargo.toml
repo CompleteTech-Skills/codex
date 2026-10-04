@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 codex-agent-graph-store = { workspace = true }
 codex-agent-message-board-extension = { workspace = true }
+codex-keyring-store = { workspace = true }
 codex-postgres-goal-store = { workspace = true }
 codex-postgres-import-store = { workspace = true }
 codex-postgres-log-store = { workspace = true }
@@ -25,13 +26,13 @@ codex-postgres-thread-store = { workspace = true }
 codex-protocol = { workspace = true }
 codex-storage-authority = { workspace = true }
 sqlx = { workspace = true, features = ["postgres"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
-codex-keyring-store = { workspace = true }
 codex-state = { workspace = true }
 codex-thread-store = { workspace = true }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

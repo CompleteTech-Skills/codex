@@ -1,4 +1,4 @@
-//! Inactive same-original native/SDK close owner. No remote xid or exclusive proof.
+//! Same-original native/SDK close owner. No remote xid or exclusive proof.
 use codex_postgres_runtime::PostgresPool;
 use sqlx::Connection;
 use sqlx::Postgres;
