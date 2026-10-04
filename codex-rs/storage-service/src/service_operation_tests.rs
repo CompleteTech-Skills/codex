@@ -343,3 +343,135 @@ async fn real_named_same_service_thirty_two_sdk_canceled_success_cycles() -> Con
     )
     .await
 }
+
+// Actual registered task fault AFTER both original SDK factories, never replacement tasks.
+async fn selected_sdk_task_faults(
+    state: &std::path::Path,
+    namespace: &str,
+    prefix: &str,
+) -> ControlResult<()> {
+    let home = tempfile::tempdir()?.keep();
+    let service = sdk_service(&home, state, namespace, prefix)?;
+    for (aborted, poison) in [(false, false), (true, false), (false, true)] {
+        let id = active(&service)?;
+        let probe = Arc::new(Probe {
+            exercise_sdk: true,
+            fail_after_sdk: true,
+            ..Probe::default()
+        });
+        *service
+            .original_operations
+            .probe
+            .lock()
+            .map_err(|_| "probe poisoned")? = Some(Arc::clone(&probe));
+        let original = service.original_operations.capture(
+            service.operation_context(),
+            Kind::Activate,
+            Some(id),
+            None,
+        )?;
+        probe.release.notify_one();
+        let ready = tokio::time::timeout(Duration::from_secs(20), probe.sdk_ready.notified()).await;
+        let task_id = {
+            let state = original
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let task_id = state.task.as_ref().map(JoinHandle::id);
+            if aborted || ready.is_err() {
+                if let Some(task) = state.task.as_ref() {
+                    task.abort();
+                }
+            }
+            task_id
+        };
+        if poison {
+            let retained = Arc::clone(&original);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _state = retained
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                std::panic::resume_unwind(Box::new("original state poison control"));
+            }));
+        }
+        probe.sdk_release.notify_one(); // Always release original body before diagnostics.
+        let mut finish = Box::pin(service.original_operations.finish(Arc::clone(&original)));
+        let timed = tokio::time::timeout(Duration::from_secs(20), &mut finish).await;
+        let (late, result) = match timed {
+            Ok(result) => (false, result),
+            Err(_) => (true, finish.await), // SAME retained future/handles, no orphan continuation.
+        };
+        let (same_failure, no_task) = {
+            let state = original
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.failure.as_ref().is_some_and(|cause| {
+                    Some(cause.id()) == task_id
+                        && if aborted {
+                            cause.is_cancelled()
+                        } else {
+                            cause.is_panic()
+                        }
+                }),
+                state.task.is_none(),
+            )
+        };
+        let snapshot = original.resources.actual_runtime_sdk_snapshot();
+        let mut closed = true;
+        let mut count = 0;
+        if let Ok(pools) = snapshot.as_ref() {
+            for pool in pools.iter().flatten() {
+                count += 1;
+                closed &= match pool.acquire().await {
+                    Err(codex_postgres_runtime::PoolError::Closed) => true,
+                    Ok(connection) => {
+                        drop(connection);
+                        false
+                    }
+                    Err(_) => false,
+                };
+            }
+        }
+        let archived = service
+            .original_operations
+            .history
+            .lock()
+            .map(|history| history.iter().any(|saved| Arc::ptr_eq(saved, &original)))
+            .unwrap_or(false);
+        if ready.is_err()
+            || late
+            || task_id.is_none()
+            || !same_failure
+            || !no_task
+            || snapshot.is_err()
+            || count != 1
+            || !closed
+            || !archived
+            || !original.resources.cleanup_completed()
+            || result.is_ok()
+        {
+            return Err("same original SDK/task panic abort poison cleanup failed".into());
+        }
+    }
+    Ok(())
+}
+#[tokio::test]
+#[ignore = "requires ROOT admitted default SQL fixture and original execution host"]
+async fn real_default_original_sdk_task_panic_abort_poison_cleanup() -> ControlResult<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_OWNERSHIP_STATE")?;
+    selected_sdk_task_faults(std::path::Path::new(&state), "codex_storage", "").await
+}
+#[tokio::test]
+#[ignore = "requires ROOT admitted named SQL fixture and original execution host"]
+async fn real_named_original_sdk_task_panic_abort_poison_cleanup() -> ControlResult<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_ISOLATION_STATE")?;
+    selected_sdk_task_faults(
+        std::path::Path::new(&state),
+        "codex_storage_isolation",
+        "isolation_",
+    )
+    .await
+}

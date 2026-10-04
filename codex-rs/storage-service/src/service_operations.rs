@@ -102,6 +102,11 @@ impl Operations {
                     let pool = service.migration_pool_for(&runtime).await?;
                     let connection = pool.acquire().await.map_err(|_| unavailable())?;
                     drop(connection); // Real borrower ends before actual SDK-close boundary.
+                    if let Some(probe) = probe.as_ref().filter(|probe| probe.fail_after_sdk) {
+                        probe.sdk_ready.notify_one();
+                        probe.sdk_release.notified().await;
+                        std::panic::resume_unwind(Box::new("original operation SDK fault"));
+                    }
                 }
                 match kind {
                     Kind::Forward => service
@@ -301,6 +306,9 @@ impl StorageService {
 #[derive(Default)]
 struct Probe {
     exercise_sdk: bool,
+    fail_after_sdk: bool,
+    sdk_ready: tokio::sync::Notify,
+    sdk_release: tokio::sync::Notify,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
     returned: tokio::sync::Notify,
