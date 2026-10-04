@@ -65,6 +65,12 @@ struct State {
     structural_refusal: Option<Arc<catalog::HistoryRefusal>>,
     structural_history_accepted: bool,
     #[cfg(test)]
+    history_probe: Option<catalog::NativeHistoryProbe>,
+    #[cfg(test)]
+    history_probe_rows: [[Option<Result<Vec<PgRow>, Arc<sqlx::Error>>>; 2]; 2],
+    #[cfg(test)]
+    history_probe_ddl: [Option<Result<sqlx::postgres::PgQueryResult, Arc<sqlx::Error>>>; 2],
+    #[cfg(test)]
     catalog_probe: Option<catalog::NativePayloadProbe>,
     #[cfg(test)]
     relation_probe: Option<catalog::NativeRelationProbe>,
@@ -278,6 +284,12 @@ impl OriginalAdministrativeCommand {
                 structural_refusal: None,
                 structural_history_accepted: false,
                 #[cfg(test)]
+                history_probe: None,
+                #[cfg(test)]
+                history_probe_rows: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+                #[cfg(test)]
+                history_probe_ddl: std::array::from_fn(|_| None),
+                #[cfg(test)]
                 catalog_probe: None,
                 #[cfg(test)]
                 relation_probe: None,
@@ -410,9 +422,45 @@ impl OriginalAdministrativeCommand {
         if !self.can_capture_structural() {
             return;
         }
-        let qualified = format!("\"{}\"", namespace.replace('"', "\"\""));
-        let metadata = sqlx::query(&format!("SELECT singleton, format_version, min_reader_version, min_writer_version FROM ONLY {qualified}.codex_schema_meta ORDER BY singleton LIMIT 2"))
-            .fetch_all(&mut *connection).await.map_err(Arc::new);
+        #[cfg(test)]
+        {
+            let probe = self
+                .state
+                .lock()
+                .unwrap_or_else(|raw| raw.into_inner())
+                .history_probe;
+            if let Some(probe) = probe {
+                if !self
+                    .capture_history_probe_rows(connection, namespace, 0)
+                    .await
+                {
+                    return;
+                }
+                for (index, statement) in probe.ddl(namespace).iter().enumerate() {
+                    let result = sqlx::query(statement)
+                        .execute(&mut *connection)
+                        .await
+                        .map_err(Arc::new);
+                    let error = result.as_ref().err().cloned();
+                    {
+                        let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                        state.history_probe_ddl[index] = Some(result);
+                        state.refused |= self.state.is_poisoned();
+                    }
+                    if let Some(raw) = error {
+                        self.cause(CommandCause::RetainedDriver(raw));
+                    }
+                    if !self.can_capture_structural() {
+                        return;
+                    }
+                }
+            }
+        }
+        let metadata = sqlx::query(&catalog::metadata_sql(namespace))
+            .persistent(false)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(Arc::new);
         let error = metadata.as_ref().err().cloned();
         {
             let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
@@ -437,8 +485,13 @@ impl OriginalAdministrativeCommand {
             .map(|(_, checksum)| *checksum)
             .collect::<Vec<_>>();
         // Native comparison bounds client values even for oversized corrupt checksum.
-        let history = sqlx::query(&format!("SELECT history.version, history.success, COALESCE(history.checksum OPERATOR(pg_catalog.=) expected.checksum,FALSE) AS checksum_matches FROM ONLY {qualified}._codex_pg_migrations history LEFT JOIN ROWS FROM (pg_catalog.unnest($1::pg_catalog.int8[]),pg_catalog.unnest($2::pg_catalog.bytea[])) AS expected(version,checksum) ON history.version OPERATOR(pg_catalog.=) expected.version ORDER BY history.version LIMIT 20"))
-            .bind(versions).bind(checksums).fetch_all(&mut *connection).await.map_err(Arc::new);
+        let history = sqlx::query(&catalog::history_sql(namespace))
+            .persistent(false)
+            .bind(versions)
+            .bind(checksums)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(Arc::new);
         let error = history.as_ref().err().cloned();
         let inspected = {
             let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
@@ -775,6 +828,23 @@ impl OriginalAdministrativeCommand {
         }
         #[cfg(test)]
         {
+            let restore_history = {
+                let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                state.history_probe.is_some()
+                    && !self.state.is_poisoned()
+                    && state
+                        .observed_status
+                        .as_ref()
+                        .and_then(|status| status.as_deref())
+                        == Some("aborted")
+            };
+            if restore_history {
+                self.capture_history_probe_rows(&mut **connection, &namespace, 1)
+                    .await;
+            }
+        }
+        #[cfg(test)]
+        {
             let restore_probe = {
                 let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
                 state.relation_probe.is_some()
@@ -810,6 +880,85 @@ impl OriginalAdministrativeCommand {
                     }
                     Err(raw) => self.cause(CommandCause::Driver(raw)),
                 }
+            }
+        }
+    }
+
+    // Both baseline and restored snapshots are actual SQLx rows on the SAME
+    // command connection. No result is classified before exterior retention.
+    #[cfg(test)]
+    async fn capture_history_probe_rows(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        namespace: &str,
+        stage: usize,
+    ) -> bool {
+        let metadata = sqlx::query(&catalog::metadata_sql(namespace))
+            .persistent(false)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(Arc::new);
+        let error = metadata.as_ref().err().cloned();
+        {
+            let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+            state.history_probe_rows[stage][0] = Some(metadata);
+            state.refused |= self.state.is_poisoned();
+        }
+        if let Some(raw) = error {
+            self.cause(CommandCause::RetainedDriver(raw));
+            return false;
+        }
+        let expected = codex_postgres_runtime::embedded_migration_checksums()
+            .take(19)
+            .collect::<Vec<_>>();
+        let versions = expected
+            .iter()
+            .map(|(version, _)| *version)
+            .collect::<Vec<_>>();
+        let checksums = expected
+            .iter()
+            .map(|(_, checksum)| *checksum)
+            .collect::<Vec<_>>();
+        let history = sqlx::query(&catalog::history_sql(namespace))
+            .persistent(false)
+            .bind(versions)
+            .bind(checksums)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(Arc::new);
+        let error = history.as_ref().err().cloned();
+        let checked = {
+            let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+            state.history_probe_rows[stage][1] = Some(history);
+            state.refused |= self.state.is_poisoned();
+            match (
+                &state.history_probe_rows[stage][0],
+                &state.history_probe_rows[stage][1],
+            ) {
+                (Some(Ok(metadata)), Some(Ok(history))) => Some(
+                    catalog::retained_payload_bytes(metadata, 0)
+                        .and_then(|bytes| catalog::retained_payload_bytes(history, bytes))
+                        .map(|_| catalog::inspect_history(metadata, history)),
+                ),
+                _ => None,
+            }
+        };
+        if let Some(raw) = error {
+            self.cause(CommandCause::RetainedDriver(raw));
+        }
+        match checked {
+            Some(Ok(Ok(()))) if !self.state.is_poisoned() => true,
+            Some(Ok(Err(raw))) => {
+                self.history_refusal(raw);
+                false
+            }
+            Some(Err(raw)) => {
+                self.cause(CommandCause::Catalog(raw));
+                false
+            }
+            _ => {
+                self.cause(CommandCause::UnknownStatus);
+                false
             }
         }
     }

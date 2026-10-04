@@ -12,6 +12,7 @@ enum Mode {
     BudgetExact,
     BudgetOverflow,
     Relation(catalog::NativeRelationProbe),
+    History(catalog::NativeHistoryProbe),
 }
 struct Failure {
     runtime: Option<Arc<OriginalRuntimeOrigin>>,
@@ -155,8 +156,19 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
             _ => None,
         };
     }
+    if let Mode::History(probe) = mode {
+        original
+            .state
+            .lock()
+            .unwrap_or_else(|raw| raw.into_inner())
+            .history_probe = Some(probe);
+    }
     failure.command = Some(Arc::clone(&original));
-    let dispatched = original.start_preflight();
+    let dispatched = if matches!(mode, Mode::History(_)) {
+        original.start_structural_preflight()
+    } else {
+        original.start_preflight()
+    };
     failure.dispatch = dispatched.err();
     let queried = original.finish_original().await;
     let query_good = queried.is_ok();
@@ -261,6 +273,53 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
                         .and_then(|status| status.as_deref())
                         == Some("aborted")
             }
+            Mode::History(probe) => {
+                let restored = state.history_probe_rows.iter().all(|snapshots| {
+                    match (&snapshots[0], &snapshots[1]) {
+                        (Some(Ok(metadata)), Some(Ok(history))) => {
+                            catalog::inspect_history(metadata, history).is_ok()
+                        }
+                        _ => false,
+                    }
+                });
+                let expected = state
+                    .structural_refusal
+                    .as_ref()
+                    .is_some_and(|raw| probe.expected(raw))
+                    && state.causes.iter().flatten().count() == 1;
+                let ddl_count = if matches!(
+                    probe,
+                    catalog::NativeHistoryProbe::NullReader
+                        | catalog::NativeHistoryProbe::TextReader
+                ) {
+                    2
+                } else {
+                    1
+                };
+                code.as_deref() == Some("25P01")
+                    && !query_good
+                    && expected
+                    && restored
+                    && state.structural_bounds.as_ref().is_some_and(Result::is_ok)
+                    && state.structural_lock.as_ref().is_some_and(Result::is_ok)
+                    && state
+                        .structural_metadata
+                        .as_ref()
+                        .is_some_and(Result::is_ok)
+                    && state.structural_history.as_ref().is_some_and(Result::is_ok)
+                    && !state.structural_history_accepted
+                    && state.history_probe_ddl.iter().flatten().count() == ddl_count
+                    && state.history_probe_ddl.iter().flatten().all(Result::is_ok)
+                    && state.raw_catalog.iter().all(Option::is_none)
+                    && state.rollback_attempted
+                    && !state.commit_attempted
+                    && state.xid.is_some()
+                    && state
+                        .observed_status
+                        .as_ref()
+                        .and_then(|status| status.as_deref())
+                        == Some("aborted")
+            }
             Mode::Relation(probe) => {
                 let expected = state.causes.iter().flatten().count() == 1
                     && state
@@ -351,9 +410,11 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
             && !original.state.is_poisoned()
     };
     let setup_good = match mode {
-        Mode::Idle | Mode::BudgetExact | Mode::BudgetOverflow | Mode::Relation(_) => {
-            failure.setup.iter().all(Option::is_none)
-        }
+        Mode::Idle
+        | Mode::BudgetExact
+        | Mode::BudgetOverflow
+        | Mode::Relation(_)
+        | Mode::History(_) => failure.setup.iter().all(Option::is_none),
         Mode::Begin => failure.setup[0].as_ref().is_some_and(Result::is_ok),
         Mode::Aborted => {
             failure.setup[0].as_ref().is_some_and(Result::is_ok)
@@ -447,4 +508,34 @@ async fn named_native_relation_refusals() -> Result<(), Failure> {
         control(true, Mode::Relation(probe)).await?;
     }
     Ok(())
+}
+
+// Requires actual current19 rows and isolated native DDL capability. Hooks retain
+// actual native rows/DDL results and use the production history classifier.
+async fn native_history_controls(named: bool) -> Result<(), Failure> {
+    use catalog::NativeHistoryProbe::*;
+    for probe in [
+        LowerReader,
+        LowerWriter,
+        HighReader,
+        NullReader,
+        TextReader,
+        Checksum,
+        Failed,
+        Missing,
+        Surplus,
+    ] {
+        control(named, Mode::History(probe)).await?;
+    }
+    Ok(())
+}
+#[tokio::test]
+#[ignore = "requires exclusively isolated default current19/admin native DDL privileges; real SQL"]
+async fn default_native_history_refusals() -> Result<(), Failure> {
+    native_history_controls(false).await
+}
+#[tokio::test]
+#[ignore = "requires exclusively isolated named current19/admin native DDL privileges; real SQL"]
+async fn named_native_history_refusals() -> Result<(), Failure> {
+    native_history_controls(true).await
 }

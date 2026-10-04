@@ -311,6 +311,86 @@ pub(super) fn structural_lock_sql(namespace: &str) -> String {
     format!("LOCK TABLE {tables} IN SHARE MODE")
 }
 
+pub(super) fn metadata_sql(namespace: &str) -> String {
+    let qualified = format!("\"{}\"", namespace.replace('"', "\"\""));
+    format!(
+        "SELECT singleton, format_version, min_reader_version, min_writer_version FROM ONLY {qualified}.codex_schema_meta ORDER BY singleton LIMIT 2"
+    )
+}
+
+pub(super) fn history_sql(namespace: &str) -> String {
+    let qualified = format!("\"{}\"", namespace.replace('"', "\"\""));
+    format!(
+        "SELECT history.version, history.success, COALESCE(history.checksum OPERATOR(pg_catalog.=) expected.checksum,FALSE) AS checksum_matches FROM ONLY {qualified}._codex_pg_migrations history LEFT JOIN ROWS FROM (pg_catalog.unnest($1::pg_catalog.int8[]),pg_catalog.unnest($2::pg_catalog.bytea[])) AS expected(version,checksum) ON history.version OPERATOR(pg_catalog.=) expected.version ORDER BY history.version LIMIT 20"
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) enum NativeHistoryProbe {
+    LowerReader,
+    LowerWriter,
+    HighReader,
+    NullReader,
+    TextReader,
+    Checksum,
+    Failed,
+    Missing,
+    Surplus,
+}
+#[cfg(test)]
+impl NativeHistoryProbe {
+    pub(super) fn ddl(self, namespace: &str) -> Vec<String> {
+        let qualified = format!("\"{}\"", namespace.replace('"', "\"\""));
+        let meta = format!("{qualified}.codex_schema_meta");
+        let history = format!("{qualified}._codex_pg_migrations");
+        match self {
+            Self::LowerReader => vec![format!("UPDATE {meta} SET min_reader_version=1")],
+            Self::LowerWriter => vec![format!("UPDATE {meta} SET min_writer_version=1")],
+            Self::HighReader => vec![format!("UPDATE {meta} SET min_reader_version=20")],
+            Self::NullReader => vec![
+                format!("ALTER TABLE {meta} ALTER COLUMN min_reader_version DROP NOT NULL"),
+                format!("UPDATE {meta} SET min_reader_version=NULL"),
+            ],
+            Self::TextReader => vec![
+                format!(
+                    "ALTER TABLE {meta} DROP CONSTRAINT codex_schema_meta_min_reader_version_check"
+                ),
+                format!(
+                    "ALTER TABLE {meta} ALTER COLUMN min_reader_version TYPE pg_catalog.text USING min_reader_version::pg_catalog.text"
+                ),
+            ],
+            Self::Checksum => vec![format!(
+                "UPDATE {history} SET checksum=pg_catalog.decode('00','hex') WHERE version=19"
+            )],
+            Self::Failed => vec![format!(
+                "UPDATE {history} SET success=FALSE WHERE version=19"
+            )],
+            Self::Missing => vec![format!("DELETE FROM {history} WHERE version=19")],
+            Self::Surplus => vec![format!(
+                "INSERT INTO {history}(version,description,installed_on,success,checksum,execution_time) SELECT 20,description,installed_on,success,checksum,execution_time FROM {history} WHERE version=19"
+            )],
+        }
+    }
+    pub(super) fn expected(self, raw: &HistoryRefusal) -> bool {
+        match (self, raw) {
+            (
+                Self::LowerReader | Self::LowerWriter | Self::HighReader,
+                HistoryRefusal::UnregisteredFormat,
+            ) => true,
+            (
+                Self::NullReader | Self::TextReader,
+                HistoryRefusal::Driver(sqlx::Error::ColumnDecode { index, .. }),
+            ) => index == "min_reader_version",
+            (
+                Self::Checksum | Self::Failed | Self::Missing | Self::Surplus,
+                HistoryRefusal::ChangedHistory,
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
 pub(super) fn inspect_history(
     metadata: &[sqlx::postgres::PgRow],
     history: &[sqlx::postgres::PgRow],
