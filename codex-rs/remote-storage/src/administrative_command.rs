@@ -747,6 +747,16 @@ impl OriginalAdministrativeCommand {
                             };
                             match observation {
                                 Ok(observed) => {
+                                    if state.structural {
+                                        let surface = state.raw_catalog[0]
+                                            .as_ref()
+                                            .map(|rows| catalog::inspect_current19_surface(rows));
+                                        if let Some(Err(raw)) = surface {
+                                            drop(state);
+                                            self.cause(CommandCause::Relations(raw));
+                                            break;
+                                        }
+                                    }
                                     let unregistered = state.structural
                                         && (observed.generation_relations_present
                                             || observed.memory_v2_relations_present);
@@ -1024,7 +1034,20 @@ impl OriginalAdministrativeCommand {
                 match validation {
                     Some(Ok(Ok(observed)))
                         if !observed.generation_relations_present
-                            && !observed.memory_v2_relations_present => {}
+                            && !observed.memory_v2_relations_present =>
+                    {
+                        let surface = {
+                            let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                            state
+                                .relation_baseline
+                                .as_ref()
+                                .map(|rows| catalog::inspect_current19_surface(rows))
+                        };
+                        if let Some(Err(raw)) = surface {
+                            self.cause(CommandCause::Relations(raw));
+                            return;
+                        }
+                    }
                     Some(Err(raw)) => {
                         self.cause(CommandCause::Catalog(raw));
                         return;

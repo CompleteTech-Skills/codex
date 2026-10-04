@@ -12,6 +12,7 @@ enum Mode {
     BudgetExact,
     BudgetOverflow,
     Relation(catalog::NativeRelationProbe),
+    Surface(catalog::NativeRelationProbe),
     History(catalog::NativeHistoryProbe),
 }
 struct Failure {
@@ -152,7 +153,7 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
             _ => None,
         };
         state.relation_probe = match mode {
-            Mode::Relation(probe) => Some(probe),
+            Mode::Relation(probe) | Mode::Surface(probe) => Some(probe),
             _ => None,
         };
     }
@@ -164,7 +165,7 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
             .history_probe = Some(probe);
     }
     failure.command = Some(Arc::clone(&original));
-    let dispatched = if matches!(mode, Mode::History(_)) {
+    let dispatched = if matches!(mode, Mode::History(_) | Mode::Surface(_)) {
         original.start_structural_preflight()
     } else {
         original.start_preflight()
@@ -320,13 +321,21 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
                         .and_then(|status| status.as_deref())
                         == Some("aborted")
             }
-            Mode::Relation(probe) => {
+            Mode::Relation(probe) | Mode::Surface(probe) => {
                 let expected = state.causes.iter().flatten().count() == 1
                     && state
                         .causes
                         .iter()
                         .flatten()
                         .any(|cause| match (probe, cause.as_ref()) {
+                            (
+                                catalog::NativeRelationProbe::Rls
+                                | catalog::NativeRelationProbe::Policy
+                                | catalog::NativeRelationProbe::UserTrigger,
+                                CommandCause::Relations(catalog::RelationRefusal::NonCanonical {
+                                    relation,
+                                }),
+                            ) => relation == "threads",
                             (
                                 catalog::NativeRelationProbe::Unknown,
                                 CommandCause::Relations(catalog::RelationRefusal::NonCanonical {
@@ -374,7 +383,11 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
                     remember_decode(row.try_get::<i32, _>("format_version"), &mut failure, 2)
                         .is_some_and(|format| format == 19)
                 });
-                let ddl_count = if matches!(probe, catalog::NativeRelationProbe::WrongKind) {
+                let ddl_count = if matches!(
+                    probe,
+                    catalog::NativeRelationProbe::WrongKind
+                        | catalog::NativeRelationProbe::UserTrigger
+                ) {
                     2
                 } else {
                     1
@@ -385,6 +398,12 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
                     && actual_fixture
                     && state.relation_ddl.iter().flatten().count() == ddl_count
                     && state.relation_ddl.iter().flatten().all(Result::is_ok)
+                    && (!matches!(mode, Mode::Surface(_))
+                        || (state.structural_history_accepted
+                            && state.structural_lock.as_ref().is_some_and(Result::is_ok)
+                            && state.relation_restored.as_ref().is_some_and(|rows| {
+                                catalog::inspect_current19_surface(rows).is_ok()
+                            })))
                     && before.as_ref().is_some_and(|oids| oids.len() == 89)
                     && before == restored
                     && restored.is_some()
@@ -414,6 +433,7 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
         | Mode::BudgetExact
         | Mode::BudgetOverflow
         | Mode::Relation(_)
+        | Mode::Surface(_)
         | Mode::History(_) => failure.setup.iter().all(Option::is_none),
         Mode::Begin => failure.setup[0].as_ref().is_some_and(Result::is_ok),
         Mode::Aborted => {
@@ -538,4 +558,25 @@ async fn default_native_history_refusals() -> Result<(), Failure> {
 #[ignore = "requires exclusively isolated named current19/admin native DDL privileges; real SQL"]
 async fn named_native_history_refusals() -> Result<(), Failure> {
     native_history_controls(true).await
+}
+
+async fn native_surface_controls(named: bool) -> Result<(), Failure> {
+    for probe in [
+        catalog::NativeRelationProbe::Rls,
+        catalog::NativeRelationProbe::Policy,
+        catalog::NativeRelationProbe::UserTrigger,
+    ] {
+        control(named, Mode::Surface(probe)).await?;
+    }
+    Ok(())
+}
+#[tokio::test]
+#[ignore = "requires exclusive current19 default/admin DDL and plpgsql capability; real SQL"]
+async fn default_native_surface_refusals() -> Result<(), Failure> {
+    native_surface_controls(false).await
+}
+#[tokio::test]
+#[ignore = "requires exclusive current19 named/admin DDL and plpgsql capability; real SQL"]
+async fn named_native_surface_refusals() -> Result<(), Failure> {
+    native_surface_controls(true).await
 }

@@ -85,6 +85,24 @@ SELECT relation.oid::bigint AS relation_oid, namespace.oid::bigint AS namespace_
        relation.relname::text, relation.relkind::text, relation.relowner::bigint,
        relation.relacl::text, relation.relispartition, relation.relrowsecurity,
        relation.relforcerowsecurity,
+       EXISTS (SELECT 1 FROM pg_catalog.pg_policy policy WHERE policy.polrelid=relation.oid) AS has_policies,
+       EXISTS (SELECT 1 FROM pg_catalog.pg_trigger trigger_row
+               WHERE trigger_row.tgrelid=relation.oid AND NOT trigger_row.tgisinternal) AS has_user_triggers,
+       EXISTS (SELECT 1 FROM pg_catalog.pg_index index_row
+               WHERE index_row.indexrelid=relation.oid
+                 AND (NOT index_row.indisvalid OR NOT index_row.indisready OR NOT index_row.indislive)) AS unusable_index,
+       (SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+           'native',pg_catalog.to_jsonb(definition),
+           'expression',pg_catalog.pg_get_expr(definition.adbin,definition.adrelid)) ORDER BY definition.adnum)
+        FROM pg_catalog.pg_attrdef definition WHERE definition.adrelid=relation.oid) AS defaults,
+       (SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
+           'native',pg_catalog.to_jsonb(index_row),
+           'definition',pg_catalog.pg_get_indexdef(index_row.indexrelid),
+           'predicate',pg_catalog.pg_get_expr(index_row.indpred,index_row.indrelid),
+           'expressions',pg_catalog.pg_get_expr(index_row.indexprs,index_row.indrelid)) ORDER BY index_row.indexrelid)
+        FROM pg_catalog.pg_index index_row WHERE index_row.indexrelid=relation.oid OR index_row.indrelid=relation.oid) AS indexes,
+       (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(policy) ORDER BY policy.oid)
+        FROM pg_catalog.pg_policy policy WHERE policy.polrelid=relation.oid) AS policies,
        EXISTS (SELECT 1 FROM pg_catalog.pg_inherits inherited
                WHERE inherited.inhrelid=relation.oid OR inherited.inhparent=relation.oid) AS has_inheritance,
        EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite rewritten
@@ -533,6 +551,31 @@ pub(super) fn inspect_relations(
     })
 }
 
+// Immutable current19 migrations define no user triggers, policies or RLS.
+// Internal FK triggers remain native rows requiring exact constraint comparison.
+// This is a surface refusal, not exact columns/defaults/index/ACL permission.
+pub(super) fn inspect_current19_surface(
+    rows: &[sqlx::postgres::PgRow],
+) -> Result<(), RelationRefusal> {
+    use sqlx::Row;
+    for row in rows {
+        let relation: String = row.try_get("relname").map_err(RelationRefusal::Driver)?;
+        for field in [
+            "relrowsecurity",
+            "relforcerowsecurity",
+            "has_policies",
+            "has_user_triggers",
+            "unusable_index",
+        ] {
+            let present: bool = row.try_get(field).map_err(RelationRefusal::Driver)?;
+            if present {
+                return Err(RelationRefusal::NonCanonical { relation });
+            }
+        }
+    }
+    Ok(())
+}
+
 impl std::fmt::Debug for RelationRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -611,6 +654,9 @@ impl NativePayloadProbe {
 #[cfg(test)]
 #[derive(Clone, Copy)]
 pub(super) enum NativeRelationProbe {
+    Rls,
+    Policy,
+    UserTrigger,
     Unknown,
     WrongKind,
     MissingIndex,
@@ -623,6 +669,20 @@ impl NativeRelationProbe {
     pub(super) fn ddl(self, namespace: &str) -> Vec<String> {
         let qualified = format!("\"{}\"", namespace.replace('"', "\"\""));
         match self {
+            Self::Rls => vec![format!(
+                "ALTER TABLE {qualified}.threads ENABLE ROW LEVEL SECURITY"
+            )],
+            Self::Policy => vec![format!(
+                "CREATE POLICY codex_surface_control ON {qualified}.threads USING (TRUE)"
+            )],
+            Self::UserTrigger => vec![
+                format!(
+                    "CREATE FUNCTION {qualified}.codex_surface_control() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END;'"
+                ),
+                format!(
+                    "CREATE TRIGGER codex_surface_control BEFORE INSERT ON {qualified}.threads FOR EACH ROW EXECUTE FUNCTION {qualified}.codex_surface_control()"
+                ),
+            ],
             Self::Unknown => vec![format!(
                 "CREATE TABLE {qualified}.codex_relation_control_unknown (probe INTEGER)"
             )],
