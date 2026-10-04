@@ -38,6 +38,8 @@ struct State {
     observation: Option<(Arc<String>, bool)>,
     causes: [Cause; 8],
     sealed: bool,
+    #[cfg(test)]
+    control_payload: Option<bool>,
     close: Option<Arc<crate::bootstrap_original_close::OriginalClose>>,
 }
 pub(crate) struct Observation {
@@ -63,6 +65,8 @@ impl DiagnosticSession {
                 observation: None,
                 causes: std::array::from_fn(|_| Cause::default()),
                 sealed: false,
+                #[cfg(test)]
+                control_payload: None,
                 close: None,
             }),
         })
@@ -218,6 +222,129 @@ impl DiagnosticSession {
             xid: Arc::clone(original_xid),
             committed,
         })
+    }
+    #[cfg(test)]
+    async fn control_query<T>(
+        self: &Arc<Self>,
+        future: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<T, Refusal> {
+        let refusal = || Refusal {
+            original: Arc::clone(self),
+        };
+        let reservation = self.reserve().map_err(|_| refusal())?;
+        match future.await {
+            Ok(value) => {
+                reservation.success();
+                Ok(value)
+            }
+            Err(cause) => {
+                reservation.failure(cause);
+                Err(refusal())
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(crate) async fn control_verify_committed_bootstrap(
+        self: &Arc<Self>,
+        namespace: Option<&crate::NamedNamespace>,
+    ) -> Result<bool, Refusal> {
+        use sqlx::Row;
+        let refusal = || Refusal {
+            original: Arc::clone(self),
+        };
+        let permit = Arc::clone(&self.gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| refusal())?;
+        let original = {
+            let mut state = self.state.lock().map_err(|_| refusal())?;
+            if state.sealed
+                || !state
+                    .observation
+                    .as_ref()
+                    .is_some_and(|(_, committed)| *committed)
+                || self.original_pool.selected_search_path.as_deref()
+                    != Some(crate::owned_namespace_search_path(namespace).as_str())
+            {
+                return Err(refusal());
+            }
+            state.original.take()
+        };
+        let mut loan = Loan {
+            owner: Arc::clone(self),
+            original,
+            _permit: permit,
+        };
+        let connection = loan
+            .original
+            .as_mut()
+            .ok_or_else(refusal)?
+            .bootstrap_connection();
+        let format = crate::client_schema_format();
+        let metadata: Vec<(bool, i32, i32, i32)> = self.control_query(sqlx::query_as(
+            "SELECT singleton, format_version, min_reader_version, min_writer_version FROM ONLY codex_schema_meta LIMIT 2"
+        ).fetch_all(&mut *connection)).await?;
+        let activation: Vec<(bool, String, Option<String>, i64, i64, Option<String>)> = self.control_query(sqlx::query_as(
+            "SELECT singleton, state, run_id::text, generation, updated_at_ms, dataset_id::text FROM ONLY storage_activation LIMIT 2"
+        ).fetch_all(&mut *connection)).await?;
+        let counts: (i64, i64) = self.control_query(sqlx::query_as(
+            "SELECT (SELECT count(*) FROM ONLY storage_migration_runs), (SELECT count(*) FROM ONLY storage_migration_domains)"
+        ).fetch_one(&mut *connection)).await?;
+        let named = match namespace {
+            Some(namespace) => Some(
+                crate::named_bootstrap::namespaced_migrations(namespace).map_err(|_| refusal())?,
+            ),
+            None => None,
+        };
+        let migrations = match named.as_ref() {
+            Some(named) => named.as_slice(),
+            None => crate::bootstrap::BASE_MIGRATOR.migrations.as_ref(),
+        };
+        let versions: Vec<i64> = migrations
+            .iter()
+            .map(|migration| migration.version)
+            .collect();
+        let checksums: Vec<&[u8]> = migrations
+            .iter()
+            .map(|migration| migration.checksum.as_ref())
+            .collect();
+        let rows = self.control_query(sqlx::query(
+            "SELECT h.version, h.success, COALESCE(h.checksum=expected.checksum,FALSE) AS checksum_matches FROM ONLY _codex_pg_migrations h LEFT JOIN unnest($1::bigint[], $2::bytea[]) expected(version,checksum) ON h.version=expected.version ORDER BY h.version LIMIT $3"
+        ).bind(versions).bind(checksums).bind(i64::from(format)+1).fetch_all(&mut *connection)).await?;
+        let mut history =
+            rows.len() == migrations.len() && i32::try_from(migrations.len()).ok() == Some(format);
+        for (row, migration) in rows.iter().zip(migrations) {
+            let actual = self
+                .control_query(async {
+                    Ok((
+                        row.try_get::<i64, _>("version")?,
+                        row.try_get::<bool, _>("success")?,
+                        row.try_get::<bool, _>("checksum_matches")?,
+                    ))
+                })
+                .await?;
+            history &= actual == (migration.version, true, true);
+        }
+        let valid = metadata == vec![(true, format, format, format)]
+            && activation == vec![(true, "open".into(), None, 0, 0, None)]
+            && counts == (0, 0)
+            && history;
+        let poison = {
+            let (mut state, poison) = match self.state.lock() {
+                Ok(state) => (state, false),
+                Err(cause) => (cause.into_inner(), true),
+            };
+            state.control_payload = Some(valid); // Actual returned query facts classified only afterward.
+            poison
+        };
+        if poison { Err(refusal()) } else { Ok(valid) }
+    }
+    #[cfg(test)]
+    pub(crate) fn control_payload_verified(&self) -> bool {
+        self.state
+            .lock()
+            .ok()
+            .is_some_and(|state| state.control_payload == Some(true))
     }
     fn reserve(self: &Arc<Self>) -> Result<Reservation, ()> {
         let mut state = self.state.lock().map_err(|_| ())?;

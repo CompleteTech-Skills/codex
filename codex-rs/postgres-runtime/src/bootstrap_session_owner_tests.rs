@@ -3,6 +3,9 @@ use super::*;
 use crate::ConnectionSettings;
 use crate::NamedNamespace;
 use crate::PoolLimits;
+use rustls::pki_types::pem::PemObject;
+use sha2::Digest;
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -43,6 +46,8 @@ struct Failure {
     acquisition: Option<crate::PoolError>,
     task_failure: Option<Arc<tokio::task::JoinError>>,
     diagnostic_acquisition: Option<crate::PoolError>,
+    relay_report: Option<Arc<serde_json::Value>>,
+    relay_error: Option<Arc<dyn std::error::Error + Send + Sync>>,
 }
 impl std::fmt::Debug for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -62,6 +67,8 @@ impl Failure {
             &self.acquisition,
             &self.task_failure,
             &self.diagnostic_acquisition,
+            &self.relay_report,
+            &self.relay_error,
         );
         let _ = retained;
         f.write_str("bootstrap control refusal [original diagnostics retained]")
@@ -98,6 +105,37 @@ UNION ALL SELECT extnamespace FROM pg_catalog.pg_extension
     }
 }
 
+fn original_provider_der_hash(state: &Path, receipt: &serde_json::Value) -> Result<String> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(state.join("secrets/server.crt"))?
+        .take(16 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024
+        || receipt["file_hashes"]["server.crt"].as_str()
+            != Some(format!("{:x}", sha2::Sha256::digest(&bytes)).as_str())
+    {
+        return Err("original provider PEM hash/size admission refused".into());
+    }
+    let mut leaves = rustls::pki_types::CertificateDer::pem_slice_iter(&bytes);
+    let leaf = leaves
+        .next()
+        .transpose()?
+        .ok_or("original provider leaf absent")?;
+    if leaves.next().is_some() {
+        return Err("ambiguous original provider leaf".into());
+    }
+    Ok(format!("{:x}", sha2::Sha256::digest(leaf.as_ref())))
+}
+fn original_relay_report(path: &str) -> Result<serde_json::Value> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 64 * 1024 {
+        return Err("relay observation too large".into());
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
 async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> {
     selected_bootstrap_with_diagnostic(state, named, fault, false).await
 }
@@ -159,6 +197,11 @@ async fn selected_bootstrap_with_diagnostic(
             })
         })
         .transpose()?;
+    let expected_provider_der = if recoverable && fault == 6 {
+        Some(original_provider_der_hash(state, &receipt)?)
+    } else {
+        None
+    };
     let relay_inputs = if fault == 6 {
         let ready_path = std::env::var("CODEX_TEST_BOOTSTRAP_COMMIT_RELAY_READY")?;
         let ready: serde_json::Value = serde_json::from_slice(&std::fs::read(ready_path)?)?;
@@ -210,6 +253,12 @@ async fn selected_bootstrap_with_diagnostic(
         .control_hold
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&owner));
+    if recoverable && fault == 6 {
+        *owner
+            .control_verify_payload
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(namespace.clone());
+    }
     let mut task_failure = None;
     let mut witnessed = fault == 0;
     let mut native_unknown_witnessed = !recoverable || fault != 3;
@@ -399,7 +448,7 @@ async fn selected_bootstrap_with_diagnostic(
     }
     recovered_blocker.connection.take();
     // Never infer task/session termination from a bare bootstrap error.
-    let reconciled = if recoverable {
+    let reconciled = if recoverable && fault != 6 {
         let mut result = owner.control_close_original_and_observe().await;
         for _ in 0..6 {
             let in_progress = owner.diagnostic.as_ref().is_some_and(|diagnostic| {
@@ -493,11 +542,60 @@ async fn selected_bootstrap_with_diagnostic(
                 .is_some_and(|((observed, status), original)| {
                     Arc::ptr_eq(&observed, &original)
                         && status.as_deref()
-                            == Some(if fault == 0 || fault == 4 {
+                            == Some(if fault == 0 || fault == 4 || recoverable && fault == 6 {
                                 "committed"
                             } else {
                                 "aborted"
                             })
+                })
+        });
+    let mut relay_error = None;
+    let relay_report = if recoverable && fault == 6 {
+        match relay_inputs
+            .as_ref()
+            .map(|(_, path)| original_relay_report(path))
+        {
+            Some(Ok(report)) => Some(Arc::new(report)),
+            Some(Err(cause)) => {
+                relay_error = Some(Arc::<dyn std::error::Error + Send + Sync>::from(cause));
+                None
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let lost_reply_witness = !recoverable
+        || fault != 6
+        || relay_report.as_ref().is_some_and(|report| {
+            report["kind"] == "fixture-commit-reply-suppression"
+                && report["release_authority"] == false
+                && report["server_commit_tag_observed"] == true
+                && report["driver_commit_tag_forwarded"] == false
+                && report["original_threads_joined"] == true
+                && report["all_original_threads_started"] == true
+                && report["cleanup_refused"] == false
+                && report["provider_port"].as_u64() == receipt["port"].as_u64()
+                && report["provider_leaf_sha256"].as_str() == expected_provider_der.as_deref()
+                && report["command_tag_frame_sha256"].as_str()
+                    == Some(format!("{:x}", sha2::Sha256::digest(b"C\0\0\0\x0bCOMMIT\0")).as_str())
+                && relay_inputs.as_ref().is_some_and(|(ready, _)| {
+                    ready["kind"] == "fixture-commit-relay-ready"
+                        && ready["release_authority"] == false
+                        && ready["pid"].as_u64().is_some_and(|pid| pid > 0)
+                        && report["pid"].as_u64() == ready["pid"].as_u64()
+                        && report["relay_port"].as_u64() == ready["port"].as_u64()
+                })
+                && owner
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|diagnostic| diagnostic.control_payload_verified())
+                && result == Err(BootstrapError::Unavailable)
+                && owner.original_driver_causes().is_some_and(|causes| {
+                    causes
+                        .iter()
+                        .flatten()
+                        .any(|cause| cause.downcast_ref::<sqlx::Error>().is_some())
                 })
         });
     let covers = proof.covers_pool(&pool);
@@ -509,6 +607,8 @@ async fn selected_bootstrap_with_diagnostic(
             acquisition: None,
             task_failure: task_failure.clone(),
             diagnostic_acquisition: diagnostic_error,
+            relay_report: relay_report.clone(),
+            relay_error: relay_error.clone(),
         }));
     }
     // Session proof precedes real SDK closure; both finish before diagnostics.
@@ -557,7 +657,7 @@ async fn selected_bootstrap_with_diagnostic(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
     }
-    if fault == 6
+    if fault == 6 && !recoverable
         || (fault == 0 && result.is_err())
         || !witnessed
         || late
@@ -565,6 +665,7 @@ async fn selected_bootstrap_with_diagnostic(
         || diagnostic_late
         || !diagnostic_closed
         || !diagnostic_ok
+        || !lost_reply_witness
     {
         return Err(Box::new(Failure {
             original: owner,
@@ -572,13 +673,15 @@ async fn selected_bootstrap_with_diagnostic(
             acquisition,
             task_failure: task_failure.clone(),
             diagnostic_acquisition: diagnostic_error,
+            relay_report: relay_report.clone(),
+            relay_error: relay_error.clone(),
         }));
     }
     if !covers
         || !native_unknown_witnessed
         || !native_recovery_fact
         || refused != (fault == 2)
-        || !matches!(outcome, Some((_, committed)) if committed == (fault == 0 || fault == 4))
+        || !matches!(outcome, Some((_, committed)) if committed == (fault == 0 || fault == 4 || recoverable && fault == 6))
     {
         return Err(Box::new(Failure {
             original: owner,
@@ -586,6 +689,8 @@ async fn selected_bootstrap_with_diagnostic(
             acquisition,
             task_failure: task_failure.clone(),
             diagnostic_acquisition: diagnostic_error,
+            relay_report: relay_report.clone(),
+            relay_error: relay_error.clone(),
         }));
     }
     Ok(())
@@ -775,6 +880,33 @@ async fn actual_named_diagnostic_owner_actual_ddl_abort() -> Result<()> {
         )?),
         true,
         3,
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires separately owned actual TLS relay, fresh default fixture and migrator capability; no grants"]
+async fn actual_default_lost_commit_reply_native_recovery() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_LOST_REPLY_RECOVERY_STATE",
+        )?),
+        false,
+        6,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires separately owned actual TLS relay, fresh named fixture and migrator capability; no grants"]
+async fn actual_named_lost_commit_reply_native_recovery() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_LOST_REPLY_RECOVERY_STATE",
+        )?),
+        true,
+        6,
         true,
     )
     .await

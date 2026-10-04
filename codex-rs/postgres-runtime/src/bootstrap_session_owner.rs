@@ -32,6 +32,8 @@ pub struct BootstrapSessionOwner {
     #[cfg(test)]
     control_blocker: Mutex<Option<sqlx::pool::PoolConnection<Postgres>>>,
     #[cfg(test)]
+    control_verify_payload: Mutex<Option<Option<crate::NamedNamespace>>>,
+    #[cfg(test)]
     control_terminal: Mutex<Option<ControlTerminal>>,
 }
 struct State {
@@ -99,6 +101,8 @@ impl BootstrapSessionOwner {
             control_hold: Mutex::new(None),
             #[cfg(test)]
             control_blocker: Mutex::new(None),
+            #[cfg(test)]
+            control_verify_payload: Mutex::new(None),
             #[cfg(test)]
             control_terminal: Mutex::new(None),
             state: Mutex::new(State {
@@ -606,6 +610,25 @@ impl BootstrapSessionOwner {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.outcome = Some(observed.committed); // Native same-instance original-xid fact, not driver ACK.
+        }
+        #[cfg(test)]
+        {
+            let selected = self
+                .control_verify_payload
+                .lock()
+                .ok()
+                .and_then(|selected| selected.clone());
+            if let Some(namespace) = selected {
+                // A payload diagnostic is not physical ownership uncertainty.
+                // Preserve its same-owner raw causes/verdict, then still close
+                // the actual diagnostic session before the control verdict.
+                if let Err(cause) = diagnostic
+                    .control_verify_committed_bootstrap(namespace.as_ref())
+                    .await
+                {
+                    let _ = &cause.original;
+                }
+            }
         }
         diagnostic.close_original().await.map_err(|cause| {
             let _ = &cause.original;
