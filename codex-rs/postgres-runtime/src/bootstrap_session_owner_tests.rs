@@ -425,12 +425,12 @@ async fn selected_bootstrap_with_diagnostic(
             })
         })
         .transpose()?;
-    let expected_provider_der = if recoverable && fault == 6 {
+    let expected_provider_der = if recoverable && (fault == 6 || fault == 12) {
         Some(original_provider_der_hash(state, &receipt)?)
     } else {
         None
     };
-    let relay_inputs = if fault == 6 {
+    let relay_inputs = if fault == 6 || fault == 12 {
         let ready_path = std::env::var("CODEX_TEST_BOOTSTRAP_COMMIT_RELAY_READY")?;
         let ready: serde_json::Value = serde_json::from_slice(&std::fs::read(ready_path)?)?;
         settings.port = u16::try_from(ready["port"].as_u64().ok_or("relay port absent")?)?;
@@ -502,7 +502,7 @@ async fn selected_bootstrap_with_diagnostic(
         .control_hold
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&owner));
-    if recoverable && fault == 6 {
+    if recoverable && (fault == 6 || fault == 12) {
         *owner
             .control_verify_payload
             .lock()
@@ -751,7 +751,7 @@ async fn selected_bootstrap_with_diagnostic(
                             });
                         }
                     }
-                    if fault != 6 && fault != 8 && fault != 9 { task.abort(); }
+                    if fault != 6 && fault != 8 && fault != 9 && fault != 12 { task.abort(); }
                     probe.release.notify_one();
                     let joined = task.await.map_err(Arc::new);
                     *owner.control_terminal.lock()
@@ -774,7 +774,7 @@ async fn selected_bootstrap_with_diagnostic(
                             Err(BootstrapError::Migration)
                         }
                         Ok(result) => {
-                            if fault == 6 {
+                            if fault == 6 || fault == 12 {
                                 witnessed &= result == Err(BootstrapError::Unavailable);
                             } else if fault == 8 || fault == 9 {
                                 witnessed &= result.is_ok();
@@ -837,7 +837,7 @@ async fn selected_bootstrap_with_diagnostic(
         true
     };
     // Never infer task/session termination from a bare bootstrap error.
-    let reconciled = if recoverable && fault != 6 && fault != 8 && fault != 9 {
+    let reconciled = if recoverable && fault != 6 && fault != 8 && fault != 9 && fault != 12 {
         let mut result = owner.control_close_original_and_observe().await;
         for _ in 0..6 {
             let in_progress = owner.diagnostic.as_ref().is_some_and(|diagnostic| {
@@ -854,7 +854,31 @@ async fn selected_bootstrap_with_diagnostic(
         }
         result
     } else {
-        owner.reconcile_original().await
+        let mut result = owner.reconcile_original().await;
+        if fault == 12 {
+            for _ in 0..6 {
+                let original_xid = owner.state.lock().ok().and_then(|state| state.xid.clone());
+                let same_original_in_progress =
+                    owner.diagnostic.as_ref().is_some_and(|diagnostic| {
+                        diagnostic
+                            .original_native_status()
+                            .zip(original_xid)
+                            .is_some_and(|((observed, status), original)| {
+                                Arc::ptr_eq(&observed, &original)
+                                    && status.as_deref() == Some("in progress")
+                            })
+                    });
+                if result.is_ok() || !same_original_in_progress {
+                    break;
+                }
+                // Closing upstream can precede server abort. Retry only actual
+                // same-xid in-progress evidence, with SAME cached hardclose and
+                // diagnostic physical session; never a timeout or new factory.
+                tokio::task::yield_now().await;
+                result = owner.reconcile_original().await;
+            }
+        }
+        result
     };
     let proof = match reconciled {
         Ok(proof) => proof,
@@ -947,7 +971,7 @@ async fn selected_bootstrap_with_diagnostic(
                 })
         });
     let mut relay_error = None;
-    let relay_report = if recoverable && fault == 6 {
+    let relay_report = if recoverable && (fault == 6 || fault == 12) {
         match relay_inputs
             .as_ref()
             .map(|(_, path)| original_relay_report(path))
@@ -963,21 +987,45 @@ async fn selected_bootstrap_with_diagnostic(
         None
     };
     let lost_reply_witness = !recoverable
-        || fault != 6
+        || (fault != 6 && fault != 12)
         || relay_report.as_ref().is_some_and(|report| {
-            report["kind"] == "fixture-commit-reply-suppression"
+            let mode_witness = if fault == 12 {
+                report["kind"] == "fixture-commit-request-suppression"
+                    && report["fault_mode"] == "commit_request"
+                    && report["client_commit_request_observed"] == true
+                    && report["client_commit_request_forwarded"] == false
+                    && matches!(
+                        report["client_commit_request_kind"].as_str(),
+                        Some("Q" | "P")
+                    )
+                    && report["client_commit_request_sha256"]
+                        .as_str()
+                        .is_some_and(|hash| {
+                            hash.len() == 64
+                                && hash.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
+                    && report["server_commit_tag_observed"] == false
+            } else {
+                report["kind"] == "fixture-commit-reply-suppression"
+                    && report["server_commit_tag_observed"] == true
+                    && report["command_tag_frame_sha256"].as_str()
+                        == Some(
+                            format!("{:x}", sha2::Sha256::digest(b"C\0\0\0\x0bCOMMIT\0")).as_str(),
+                        )
+            };
+            mode_witness
                 && report["release_authority"] == false
-                && report["server_commit_tag_observed"] == true
                 && report["driver_commit_tag_forwarded"] == false
                 && report["original_threads_joined"] == true
                 && report["all_original_threads_started"] == true
                 && report["cleanup_refused"] == false
                 && report["provider_port"].as_u64() == receipt["port"].as_u64()
                 && report["provider_leaf_sha256"].as_str() == expected_provider_der.as_deref()
-                && report["command_tag_frame_sha256"].as_str()
-                    == Some(format!("{:x}", sha2::Sha256::digest(b"C\0\0\0\x0bCOMMIT\0")).as_str())
                 && relay_inputs.as_ref().is_some_and(|(ready, _)| {
                     ready["kind"] == "fixture-commit-relay-ready"
+                        && (fault != 12 || ready["fault_mode"] == "commit_request")
                         && ready["release_authority"] == false
                         && ready["pid"].as_u64().is_some_and(|pid| pid > 0)
                         && report["pid"].as_u64() == ready["pid"].as_u64()
@@ -1062,7 +1110,7 @@ async fn selected_bootstrap_with_diagnostic(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
     }
-    if fault == 6 && !recoverable
+    if (fault == 6 || fault == 12) && !recoverable
         || (fault == 0 && result.is_err())
         || !witnessed
         || late
@@ -1430,6 +1478,34 @@ async fn named_factory_caller_cancel_retains_same_native_task() -> Result<()> {
         )?),
         true,
         10,
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOT-admitted original empty default fixture and protected pre-forward COMMIT request-loss relay"]
+async fn default_commit_request_loss_recovers_actual_aborted_xid_and_empty_namespace() -> Result<()>
+{
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_COMMIT_REQUEST_LOSS_STATE",
+        )?),
+        false,
+        12,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires ROOT-admitted original empty named fixture and protected pre-forward COMMIT request-loss relay"]
+async fn named_commit_request_loss_recovers_actual_aborted_xid_and_empty_namespace() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_COMMIT_REQUEST_LOSS_STATE",
+        )?),
+        true,
+        12,
         true,
     )
     .await

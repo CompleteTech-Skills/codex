@@ -370,6 +370,75 @@ impl DiagnosticSession {
         if poison { Err(refusal()) } else { Ok(valid) }
     }
     #[cfg(test)]
+    pub(crate) async fn control_verify_aborted_bootstrap(
+        self: &Arc<Self>,
+        namespace: Option<&crate::NamedNamespace>,
+    ) -> Result<bool, Refusal> {
+        let refusal = || Refusal {
+            original: Arc::clone(self),
+        };
+        let permit = Arc::clone(&self.gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| refusal())?;
+        let original = {
+            let mut state = self.state.lock().map_err(|_| refusal())?;
+            if state.sealed
+                || !state
+                    .observation
+                    .as_ref()
+                    .is_some_and(|(_, committed)| !*committed)
+                || self.original_pool.selected_search_path.as_deref()
+                    != Some(crate::owned_namespace_search_path(namespace).as_str())
+            {
+                return Err(refusal());
+            }
+            state.original.take()
+        };
+        let mut loan = Loan {
+            owner: Arc::clone(self),
+            original,
+            _permit: permit,
+        };
+        let connection = loan
+            .original
+            .as_mut()
+            .ok_or_else(refusal)?
+            .bootstrap_connection();
+        // SAME identity-bound diagnostic native session, after actual aborted
+        // original xid observation. No source/destination table lookup can
+        // substitute for complete absence in the selected namespace.
+        let empty = self.control_query(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=$1) AND NOT EXISTS (
+SELECT 1 FROM (
+SELECT relnamespace AS namespace FROM pg_catalog.pg_class
+UNION ALL SELECT pronamespace FROM pg_catalog.pg_proc
+UNION ALL SELECT typnamespace FROM pg_catalog.pg_type
+UNION ALL SELECT collnamespace FROM pg_catalog.pg_collation
+UNION ALL SELECT connamespace FROM pg_catalog.pg_constraint
+UNION ALL SELECT connamespace FROM pg_catalog.pg_conversion
+UNION ALL SELECT oprnamespace FROM pg_catalog.pg_operator
+UNION ALL SELECT opcnamespace FROM pg_catalog.pg_opclass
+UNION ALL SELECT opfnamespace FROM pg_catalog.pg_opfamily
+UNION ALL SELECT cfgnamespace FROM pg_catalog.pg_ts_config
+UNION ALL SELECT dictnamespace FROM pg_catalog.pg_ts_dict
+UNION ALL SELECT prsnamespace FROM pg_catalog.pg_ts_parser
+UNION ALL SELECT tmplnamespace FROM pg_catalog.pg_ts_template
+UNION ALL SELECT stxnamespace FROM pg_catalog.pg_statistic_ext
+UNION ALL SELECT extnamespace FROM pg_catalog.pg_extension
+) objects JOIN pg_catalog.pg_namespace n ON n.oid=objects.namespace WHERE n.nspname=$1)"
+        ).bind(namespace.map_or("codex_storage", crate::NamedNamespace::schema)).fetch_one(connection)).await?;
+        let poison = {
+            let (mut state, poison) = match self.state.lock() {
+                Ok(state) => (state, false),
+                Err(cause) => (cause.into_inner(), true),
+            };
+            state.control_payload = Some(empty); // Returned native catalog fact before refusal.
+            poison
+        };
+        if poison { Err(refusal()) } else { Ok(empty) }
+    }
+    #[cfg(test)]
     pub(crate) fn control_payload_verified(&self) -> bool {
         self.state
             .lock()

@@ -622,10 +622,21 @@ impl BootstrapSessionOwner {
                 // A payload diagnostic is not physical ownership uncertainty.
                 // Preserve its same-owner raw causes/verdict, then still close
                 // the actual diagnostic session before the control verdict.
-                if let Err(cause) = diagnostic
-                    .control_verify_committed_bootstrap(namespace.as_ref())
-                    .await
-                {
+                let aborted = self
+                    .state
+                    .lock()
+                    .ok()
+                    .is_some_and(|state| state.outcome == Some(false));
+                let payload = if aborted {
+                    diagnostic
+                        .control_verify_aborted_bootstrap(namespace.as_ref())
+                        .await
+                } else {
+                    diagnostic
+                        .control_verify_committed_bootstrap(namespace.as_ref())
+                        .await
+                };
+                if let Err(cause) = payload {
                     let _ = &cause.original;
                 }
             }
