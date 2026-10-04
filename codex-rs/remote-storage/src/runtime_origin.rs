@@ -1,4 +1,4 @@
-//! Undeclared original Runtime origin prerequisite. No exclusive permit.
+//! Original Runtime origin observations. No exclusive permit.
 //! Exterior must retain this frame before the existing retained factory polls.
 use crate::administration_close::OriginalAdministrativeClose;
 use codex_postgres_runtime::PoolError;
@@ -14,7 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-pub(crate) struct RuntimeNativeOrigin {
+pub struct RuntimeNativeOrigin {
     pub(crate) system_identifier: String,
     pub(crate) database_oid: i64,
     pub(crate) login_oid: i64,
@@ -26,8 +26,15 @@ struct State {
     row: Option<PgRow>,
     native: Option<Arc<RuntimeNativeOrigin>>,
     acquisition: Option<PoolError>,
+    constructor_failure: Option<crate::RemoteStorageError>,
+    expected_login: Option<String>,
     query: Option<sqlx::Error>,
     refused: bool,
+    constructor_dispatched: bool,
+    constructor_task:
+        Option<JoinHandle<Result<Arc<crate::RemoteStorage>, crate::RemoteStorageError>>>,
+    constructor_returned: Option<Result<Arc<crate::RemoteStorage>, crate::RemoteStorageError>>,
+    constructor_join_failure: Option<Arc<tokio::task::JoinError>>,
     dispatched: bool,
     sealed: bool,
     task: Option<JoinHandle<Result<Arc<RuntimeNativeOrigin>, ()>>>,
@@ -38,22 +45,24 @@ struct State {
     hold: Option<Arc<OriginalRuntimeOrigin>>,
 }
 /// Exact profile and SDK owner, not an endpoint comparison or caller tuple.
-pub(crate) struct OriginalRuntimeOrigin {
+pub struct OriginalRuntimeOrigin {
     profile: Arc<RemotePostgresProfile>,
     state: Mutex<State>,
     session: Arc<AsyncMutex<Option<PoolConnection<Postgres>>>>,
     join: Arc<Semaphore>,
+    constructor_join: Arc<Semaphore>,
     close: Arc<OriginalAdministrativeClose>,
 }
-pub(crate) struct RuntimeOriginRefusal {
+pub struct RuntimeOriginRefusal {
     pub(crate) original: Arc<OriginalRuntimeOrigin>,
 }
 impl OriginalRuntimeOrigin {
-    pub(crate) fn prepare(profile: Arc<RemotePostgresProfile>) -> Arc<Self> {
+    pub fn prepare(profile: Arc<RemotePostgresProfile>) -> Arc<Self> {
         Arc::new(Self {
             profile,
             session: Arc::new(AsyncMutex::new(None)),
             join: Arc::new(Semaphore::new(1)),
+            constructor_join: Arc::new(Semaphore::new(1)),
             close: OriginalAdministrativeClose::new(),
             state: Mutex::new(State {
                 pool: None,
@@ -61,8 +70,14 @@ impl OriginalRuntimeOrigin {
                 row: None,
                 native: None,
                 acquisition: None,
+                constructor_failure: None,
+                expected_login: None,
                 query: None,
                 refused: false,
+                constructor_dispatched: false,
+                constructor_task: None,
+                constructor_returned: None,
+                constructor_join_failure: None,
                 dispatched: false,
                 sealed: false,
                 task: None,
@@ -74,8 +89,172 @@ impl OriginalRuntimeOrigin {
             }),
         })
     }
-    pub(crate) fn original_profile(&self) -> &Arc<RemotePostgresProfile> {
+    pub fn original_profile(&self) -> &Arc<RemotePostgresProfile> {
         &self.profile
+    }
+    pub(crate) async fn run_constructor<F>(
+        self: &Arc<Self>,
+        body: F,
+    ) -> Result<Arc<crate::RemoteStorage>, crate::RemoteStorageError>
+    where
+        F: std::future::Future<
+                Output = Result<Arc<crate::RemoteStorage>, crate::RemoteStorageError>,
+            > + Send
+            + 'static,
+    {
+        let unavailable = || crate::RemoteStorageError::Connection(PoolError::Unavailable);
+        let permit = Arc::clone(&self.constructor_join)
+            .acquire_owned()
+            .await
+            .map_err(|_| unavailable())?;
+        let task = {
+            let mut state = self.state.lock().map_err(|_| unavailable())?;
+            if state.sealed || state.constructor_join_failure.is_some() {
+                return Err(unavailable());
+            }
+            if let Some(returned) = state.constructor_returned.as_ref() {
+                return match returned {
+                    Err(error) => Err(*error),
+                    Ok(storage) if !state.refused => Ok(Arc::clone(storage)),
+                    Ok(_) => Err(unavailable()),
+                };
+            }
+            if !state.constructor_dispatched {
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        state.runtime_failure = Some(error);
+                        state.refused = true;
+                        return Err(unavailable());
+                    }
+                };
+                state.constructor_dispatched = true;
+                state.hold = Some(Arc::clone(self));
+                let original = Arc::clone(self);
+                state.constructor_task = Some(runtime.spawn(async move {
+                    // Gate first credential/factory/body poll behind original JH registration.
+                    {
+                        let _registered = original
+                            .state
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                    }
+                    body.await
+                }));
+            }
+            state.constructor_task.take().ok_or_else(unavailable)?
+        };
+        let mut loan = RuntimeConstructorLoan {
+            original: Arc::clone(self),
+            task: Some(task),
+            _permit: permit,
+        };
+        self.join_constructor_loan(&mut loan)
+            .await
+            .map_err(|_| unavailable())?;
+        let state = self.state.lock().map_err(|_| unavailable())?;
+        match state.constructor_returned.as_ref() {
+            Some(Err(error)) => Err(*error),
+            Some(Ok(storage)) if !state.refused && state.constructor_join_failure.is_none() => {
+                Ok(Arc::clone(storage))
+            }
+            _ => Err(unavailable()),
+        }
+    }
+    async fn join_constructor_loan(&self, loan: &mut RuntimeConstructorLoan) -> Result<(), ()> {
+        let returned = loan.task.as_mut().ok_or(())?.await;
+        let (mut state, poison) = match self.state.lock() {
+            Ok(state) => (state, false),
+            Err(error) => (error.into_inner(), true),
+        };
+        match returned {
+            Ok(result) => state.constructor_returned = Some(result),
+            Err(error) => {
+                state.constructor_join_failure = Some(Arc::new(error));
+                state.refused = true;
+            }
+        }
+        loan.task = None; // SAME raw result/JoinError is exterior first.
+        state.refused |= poison;
+        Ok(())
+    }
+    async fn seal_and_join_constructor(self: &Arc<Self>) -> Result<(), RuntimeOriginRefusal> {
+        let refusal = || RuntimeOriginRefusal {
+            original: Arc::clone(self),
+        };
+        let permit = Arc::clone(&self.constructor_join)
+            .acquire_owned()
+            .await
+            .map_err(|_| refusal())?;
+        let task = {
+            let (mut state, poison) = match self.state.lock() {
+                Ok(state) => (state, false),
+                Err(error) => (error.into_inner(), true),
+            };
+            state.refused |= poison;
+            state.sealed = true;
+            state.constructor_task.take()
+        };
+        if let Some(task) = task {
+            let mut loan = RuntimeConstructorLoan {
+                original: Arc::clone(self),
+                task: Some(task),
+                _permit: permit,
+            };
+            self.join_constructor_loan(&mut loan)
+                .await
+                .map_err(|_| refusal())?;
+        }
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.constructor_task.is_some()
+            || (state.constructor_dispatched
+                && state.constructor_returned.is_none()
+                && state.constructor_join_failure.is_none())
+        {
+            return Err(refusal());
+        }
+        Ok(()) // Physical constructor terminal only, not admission/native outcome.
+    }
+    pub(crate) fn bind_expected_login(&self, login: String) -> Result<(), PoolError> {
+        let mut state = self.state.lock().map_err(|_| PoolError::Unavailable)?;
+        if state.expected_login.is_some() || state.dispatched || state.sealed {
+            return Err(PoolError::Unavailable);
+        }
+        state.expected_login = Some(login);
+        Ok(())
+    }
+    pub(crate) fn record_constructor_failure(&self, error: crate::RemoteStorageError) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.constructor_failure.is_none() {
+            state.constructor_failure = Some(error);
+        }
+        state.refused = true;
+    }
+    /// Actual captured native fact only; never caller-supplied or exclusive access.
+    pub fn original_native_origin(&self) -> Option<Arc<RuntimeNativeOrigin>> {
+        let state = self.state.lock().ok()?;
+        if state.refused {
+            None
+        } else {
+            state.native.as_ref().map(Arc::clone)
+        }
+    }
+    pub fn captured_original_pool(&self) -> Option<Arc<PostgresPool>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pool
+            .as_ref()
+            .map(Arc::clone)
+    }
+    /// Same frame's actual native+SDK task results; no remote transaction outcome.
+    pub fn known_original_closed(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let constructor_terminal = !state.constructor_dispatched
+            || (state.constructor_task.is_none()
+                && (state.constructor_returned.is_some()
+                    || state.constructor_join_failure.is_some()));
+        constructor_terminal && self.close.physical_terminal()
     }
     /// Called by the real retained factory before its first acquisition/SQL.
     /// Incoming actual pool is retained even when poisoned state refuses capture.
@@ -95,7 +274,7 @@ impl OriginalRuntimeOrigin {
         } else {
             state.pool = Some(pool);
         }
-        state.refused |= poisoned;
+        state.refused |= poisoned || state.sealed;
         if state.refused {
             Err(PoolError::Unavailable)
         } else {
@@ -103,7 +282,8 @@ impl OriginalRuntimeOrigin {
         }
     }
     /// Must run inside the SAME already-owned startup task, before schema or
-    /// activation queries. This method creates no task/controller or grant.
+    /// activation queries. The same stored query task is joined; no controller
+    /// or grant is created.
     /// Privilege/query refusal retains actual driver cause and cannot be retried
     /// to replace the original observation. Caller cancellation is still a
     /// consumer-owned boundary; no origin is published without a complete row.
@@ -220,16 +400,16 @@ impl OriginalRuntimeOrigin {
         if !closed || state.refused {
             return Err(refuse());
         }
-        state.hold = None;
         Ok(())
     }
     /// Cleanup-only joins the exact captured native and SDK close tasks after
     /// original query terminal. Failed/panicked query still remains an owning
     /// refusal; physical closure cannot turn it into an origin observation.
-    pub(crate) async fn close_original(self: &Arc<Self>) -> Result<(), RuntimeOriginRefusal> {
+    pub async fn close_original(self: &Arc<Self>) -> Result<(), RuntimeOriginRefusal> {
         let refusal = || RuntimeOriginRefusal {
             original: Arc::clone(self),
         };
+        self.seal_and_join_constructor().await?;
         {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.sealed = true;
@@ -265,7 +445,7 @@ impl OriginalRuntimeOrigin {
             original: Arc::clone(self),
         };
         let pool = {
-            let mut state = self.state.lock().map_err(|_| refuse())?;
+            let state = self.state.lock().map_err(|_| refuse())?;
             if state.refused {
                 return Err(refuse());
             }
@@ -345,7 +525,7 @@ impl OriginalRuntimeOrigin {
             || native.system_identifier.bytes().all(|byte| byte == b'0')
             || native.database_oid <= 0
             || native.login_oid <= 0
-            || native.login.is_empty()
+            || state.expected_login.as_deref() != Some(native.login.as_str())
         {
             state.refused = true;
             return Err(refuse());
@@ -375,6 +555,64 @@ impl Drop for RuntimeQueryLoan {
                 state.collision = Some(task);
                 state.refused = true;
             }
+        }
+    }
+}
+
+impl RuntimeNativeOrigin {
+    pub fn system_identifier(&self) -> &str {
+        &self.system_identifier
+    }
+    pub fn database_oid(&self) -> i64 {
+        self.database_oid
+    }
+    pub fn login_oid(&self) -> i64 {
+        self.login_oid
+    }
+    pub fn login(&self) -> &str {
+        &self.login
+    }
+}
+impl std::fmt::Debug for RuntimeOriginRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self
+            .original
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _original_causes = (
+            &state.acquisition,
+            &state.query,
+            &state.constructor_failure,
+            &state.runtime_failure,
+            &state.join_failure,
+            &state.constructor_join_failure,
+            &state.rejected_pool,
+        );
+        formatter.write_str("RuntimeOriginRefused([original retained])")
+    }
+}
+impl RuntimeOriginRefusal {
+    pub fn original_owner(&self) -> &Arc<OriginalRuntimeOrigin> {
+        &self.original
+    }
+}
+
+struct RuntimeConstructorLoan {
+    original: Arc<OriginalRuntimeOrigin>,
+    task: Option<JoinHandle<Result<Arc<crate::RemoteStorage>, crate::RemoteStorageError>>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl Drop for RuntimeConstructorLoan {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            let mut state = self
+                .original
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // Same single constructor permit excludes another loan/capture.
+            state.constructor_task = Some(task);
         }
     }
 }
