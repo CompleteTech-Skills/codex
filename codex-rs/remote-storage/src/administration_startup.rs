@@ -1,6 +1,7 @@
 //! Inactive original administrative startup/session observation owner.
 //! No credential retirement, role mutation, drain or exclusive permit is exposed.
 
+use crate::administration_close::OriginalAdministrativeClose;
 use crate::administration_settings::AdministrativeFactoryError;
 use crate::administration_settings::administrative_settings;
 use codex_postgres_runtime::NamedNamespace;
@@ -57,6 +58,7 @@ pub struct OriginalAdministrativeStartup {
     // Owned guard restores to this exterior original slot on panic/cancellation.
     session: Arc<AsyncMutex<Option<PoolConnection<Postgres>>>>,
     join: Arc<Semaphore>,
+    close: Arc<OriginalAdministrativeClose>,
 }
 
 pub struct AdministrativeStartupRefusal {
@@ -151,6 +153,7 @@ impl OriginalAdministrativeStartup {
             }),
             session: Arc::new(AsyncMutex::new(None)),
             join: Arc::new(Semaphore::new(1)),
+            close: OriginalAdministrativeClose::new(),
         });
         let prepared = administrative_settings(&original.input, resolver);
         let (settings, namespace) = match prepared {
@@ -401,5 +404,42 @@ impl OriginalAdministrativeStartup {
         }
         // No hold release: same actual physical session + SDK require an original
         // close producer before this module may be declared in a real consumer.
+    }
+
+    /// Cleanup admission is separate from role admission. Reap SAME actual
+    /// startup even after native refusal/poison, then transfer its actual session
+    /// into the preallocated exterior close frame before native close polling.
+    pub async fn close_original(self: &Arc<Self>) -> Result<(), AdministrativeStartupRefusal> {
+        let _admission = self.finish_original().await;
+        let (pool, terminal) = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            (
+                state.pool.clone(),
+                state.task.is_none() && (state.returned.is_some() || state.join_failure.is_some()),
+            )
+        };
+        if !terminal {
+            return Err(AdministrativeStartupRefusal {
+                original: Arc::clone(self),
+            });
+        }
+        {
+            let mut original_session = Arc::clone(&self.session).lock_owned().await;
+            self.close.seal_source(pool, &mut original_session);
+        }
+        let known_closed = self.close.finish().await;
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !known_closed
+            || state.poison_seen
+            || self.state.is_poisoned()
+            || state.join_failure.is_some()
+            || !matches!(state.returned, Some(Ok(_)))
+        {
+            return Err(AdministrativeStartupRefusal {
+                original: Arc::clone(self),
+            });
+        }
+        state.hold = None; // Both actual close tasks physically joined first.
+        Ok(())
     }
 }
