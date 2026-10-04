@@ -57,6 +57,16 @@ struct State {
     catalog_relations: Option<catalog::RelationObservation>,
     #[cfg(test)]
     catalog_probe: Option<catalog::NativePayloadProbe>,
+    #[cfg(test)]
+    relation_probe: Option<catalog::NativeRelationProbe>,
+    #[cfg(test)]
+    relation_baseline: Option<Vec<PgRow>>,
+    #[cfg(test)]
+    relation_format: Option<PgRow>,
+    #[cfg(test)]
+    relation_restored: Option<Vec<PgRow>>,
+    #[cfg(test)]
+    relation_ddl: [Option<Result<sqlx::postgres::PgQueryResult, Arc<sqlx::Error>>>; 2],
     observed_status: Option<Option<String>>,
     commit_attempted: bool,
     rollback_attempted: bool,
@@ -240,6 +250,16 @@ impl OriginalAdministrativeCommand {
                 catalog_relations: None,
                 #[cfg(test)]
                 catalog_probe: None,
+                #[cfg(test)]
+                relation_probe: None,
+                #[cfg(test)]
+                relation_baseline: None,
+                #[cfg(test)]
+                relation_format: None,
+                #[cfg(test)]
+                relation_restored: None,
+                #[cfg(test)]
+                relation_ddl: std::array::from_fn(|_| None),
                 observed_status: None,
                 commit_attempted: false,
                 rollback_attempted: false,
@@ -424,6 +444,19 @@ impl OriginalAdministrativeCommand {
                 .to_owned()
         };
         for (index, statement) in catalog::STATEMENTS.iter().enumerate() {
+            #[cfg(test)]
+            if index == 0 {
+                let probe = {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|raw| raw.into_inner())
+                        .relation_probe
+                };
+                if let Some(probe) = probe {
+                    self.prepare_relation_probe(connection, &namespace, probe)
+                        .await;
+                }
+            }
             #[cfg(not(test))]
             let (statement_sql, payload_probe) = (statement.sql, false);
             #[cfg(test)]
@@ -544,6 +577,148 @@ impl OriginalAdministrativeCommand {
             }
         } else {
             self.cause(CommandCause::UnknownStatus);
+        }
+        #[cfg(test)]
+        {
+            let restore_probe = {
+                let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                state.relation_probe.is_some()
+                    && !self.state.is_poisoned()
+                    && state
+                        .observed_status
+                        .as_ref()
+                        .and_then(|status| status.as_deref())
+                        == Some("aborted")
+            };
+            if restore_probe {
+                match sqlx::query(catalog::STATEMENTS[0].sql)
+                    .bind(&namespace)
+                    .fetch_all(&mut **connection)
+                    .await
+                {
+                    Ok(rows) => {
+                        let checked = {
+                            let mut state =
+                                self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                            state.relation_restored = Some(rows);
+                            state.relation_restored.as_ref().map(|rows| {
+                                catalog::retained_payload_bytes(rows, 0)
+                                    .map(|_| catalog::inspect_relations(rows))
+                            })
+                        };
+                        match checked {
+                            Some(Ok(Ok(_))) => {}
+                            Some(Err(raw)) => self.cause(CommandCause::Catalog(raw)),
+                            Some(Ok(Err(raw))) => self.cause(CommandCause::Relations(raw)),
+                            _ => self.cause(CommandCause::UnknownStatus),
+                        }
+                    }
+                    Err(raw) => self.cause(CommandCause::Driver(raw)),
+                }
+            }
+        }
+    }
+
+    // Actual transactional catalog adversaries on an explicitly isolated current19
+    // fixture. Native rows/DDL results are captured before every classification.
+    #[cfg(test)]
+    async fn prepare_relation_probe(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        namespace: &str,
+        probe: catalog::NativeRelationProbe,
+    ) {
+        let qualified = format!("\"{}\"", namespace.replace('"', "\"\""));
+        match sqlx::query(&format!(
+            "SELECT format_version FROM {qualified}.codex_schema_meta WHERE singleton"
+        ))
+        .fetch_one(&mut *connection)
+        .await
+        {
+            Ok(row) => {
+                let decoded = {
+                    let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                    state.relation_format = Some(row);
+                    state.refused |= self.state.is_poisoned();
+                    state
+                        .relation_format
+                        .as_ref()
+                        .map(|row| row.try_get::<i32, _>("format_version"))
+                };
+                match decoded {
+                    Some(Ok(19)) => {}
+                    Some(Err(raw)) => {
+                        self.cause(CommandCause::Driver(raw));
+                        return;
+                    }
+                    _ => {
+                        self.cause(CommandCause::UnknownStatus);
+                        return;
+                    }
+                }
+            }
+            Err(raw) => {
+                self.cause(CommandCause::Driver(raw));
+                return;
+            }
+        }
+        match sqlx::query(catalog::STATEMENTS[0].sql)
+            .bind(namespace)
+            .fetch_all(&mut *connection)
+            .await
+        {
+            Ok(rows) => {
+                let validation = {
+                    let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                    state.relation_baseline = Some(rows);
+                    state.refused |= self.state.is_poisoned();
+                    state.relation_baseline.as_ref().map(|rows| {
+                        catalog::retained_payload_bytes(rows, 0)
+                            .map(|_| catalog::inspect_relations(rows))
+                    })
+                };
+                match validation {
+                    Some(Ok(Ok(observed)))
+                        if !observed.generation_relations_present
+                            && !observed.memory_v2_relations_present => {}
+                    Some(Err(raw)) => {
+                        self.cause(CommandCause::Catalog(raw));
+                        return;
+                    }
+                    Some(Ok(Err(raw))) => {
+                        self.cause(CommandCause::Relations(raw));
+                        return;
+                    }
+                    _ => {
+                        self.cause(CommandCause::UnknownStatus);
+                        return;
+                    }
+                }
+            }
+            Err(raw) => {
+                self.cause(CommandCause::Driver(raw));
+                return;
+            }
+        }
+        for (index, sql) in probe.ddl(namespace).iter().enumerate() {
+            let admitted = {
+                let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                !state.refused && !self.state.is_poisoned()
+            };
+            if !admitted {
+                break;
+            }
+            let result = sqlx::query(sql).execute(&mut *connection).await;
+            let result = result.map_err(Arc::new);
+            let failed = result.is_err();
+            {
+                let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                state.relation_ddl[index] = Some(result);
+                state.refused |= self.state.is_poisoned() || failed;
+            }
+            if failed {
+                break;
+            }
         }
     }
 

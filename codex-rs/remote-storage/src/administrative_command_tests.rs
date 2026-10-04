@@ -11,6 +11,7 @@ enum Mode {
     Aborted,
     BudgetExact,
     BudgetOverflow,
+    Relation(catalog::NativeRelationProbe),
 }
 struct Failure {
     runtime: Option<Arc<OriginalRuntimeOrigin>>,
@@ -149,6 +150,10 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
             Mode::BudgetOverflow => Some(catalog::NativePayloadProbe::Overflow),
             _ => None,
         };
+        state.relation_probe = match mode {
+            Mode::Relation(probe) => Some(probe),
+            _ => None,
+        };
     }
     failure.command = Some(Arc::clone(&original));
     let dispatched = original.start_preflight();
@@ -256,6 +261,88 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
                         .and_then(|status| status.as_deref())
                         == Some("aborted")
             }
+            Mode::Relation(probe) => {
+                let expected = state.causes.iter().flatten().count() == 1
+                    && state
+                        .causes
+                        .iter()
+                        .flatten()
+                        .any(|cause| match (probe, cause.as_ref()) {
+                            (
+                                catalog::NativeRelationProbe::Unknown,
+                                CommandCause::Relations(catalog::RelationRefusal::NonCanonical {
+                                    relation,
+                                }),
+                            ) => relation == "codex_relation_control_unknown",
+                            (
+                                catalog::NativeRelationProbe::WrongKind,
+                                CommandCause::Relations(catalog::RelationRefusal::NonCanonical {
+                                    relation,
+                                }),
+                            ) => relation == "idx_threads_recency_id",
+                            (
+                                catalog::NativeRelationProbe::MissingIndex,
+                                CommandCause::Relations(catalog::RelationRefusal::Missing {
+                                    relation,
+                                }),
+                            ) => *relation == "idx_threads_recency_id",
+                            (
+                                catalog::NativeRelationProbe::Partial20
+                                | catalog::NativeRelationProbe::Partial21,
+                                CommandCause::Relations(catalog::RelationRefusal::PartialExtension),
+                            ) => true,
+                            _ => false,
+                        });
+                let before = state.relation_baseline.as_ref().and_then(|rows| {
+                    remember_decode(
+                        rows.iter()
+                            .map(|row| row.try_get::<i64, _>("relation_oid"))
+                            .collect::<Result<Vec<_>, _>>(),
+                        &mut failure,
+                        3,
+                    )
+                });
+                let restored = state.relation_restored.as_ref().and_then(|rows| {
+                    remember_decode(
+                        rows.iter()
+                            .map(|row| row.try_get::<i64, _>("relation_oid"))
+                            .collect::<Result<Vec<_>, _>>(),
+                        &mut failure,
+                        4,
+                    )
+                });
+                let actual_fixture = state.relation_format.as_ref().is_some_and(|row| {
+                    remember_decode(row.try_get::<i32, _>("format_version"), &mut failure, 2)
+                        .is_some_and(|format| format == 19)
+                });
+                let ddl_count = if matches!(probe, catalog::NativeRelationProbe::WrongKind) {
+                    2
+                } else {
+                    1
+                };
+                code.as_deref() == Some("25P01")
+                    && !query_good
+                    && expected
+                    && actual_fixture
+                    && state.relation_ddl.iter().flatten().count() == ddl_count
+                    && state.relation_ddl.iter().flatten().all(Result::is_ok)
+                    && before.as_ref().is_some_and(|oids| oids.len() == 89)
+                    && before == restored
+                    && restored.is_some()
+                    && state.raw_catalog[0]
+                        .as_ref()
+                        .is_some_and(|rows| !rows.is_empty())
+                    && state.raw_catalog[1..].iter().all(Option::is_none)
+                    && state.catalog_relations.is_none()
+                    && state.rollback_attempted
+                    && !state.commit_attempted
+                    && state.xid.is_some()
+                    && state
+                        .observed_status
+                        .as_ref()
+                        .and_then(|status| status.as_deref())
+                        == Some("aborted")
+            }
         };
         raw_expected
             && state.terminal
@@ -264,7 +351,7 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
             && !original.state.is_poisoned()
     };
     let setup_good = match mode {
-        Mode::Idle | Mode::BudgetExact | Mode::BudgetOverflow => {
+        Mode::Idle | Mode::BudgetExact | Mode::BudgetOverflow | Mode::Relation(_) => {
             failure.setup.iter().all(Option::is_none)
         }
         Mode::Begin => failure.setup[0].as_ref().is_some_and(Result::is_ok),
@@ -330,4 +417,34 @@ async fn default_native_catalog_payload_budget() -> Result<(), Failure> {
 async fn named_native_catalog_payload_budget() -> Result<(), Failure> {
     control(true, Mode::BudgetExact).await?;
     control(true, Mode::BudgetOverflow).await
+}
+
+#[tokio::test]
+#[ignore = "requires exclusively isolated current19 default namespace/admin DDL capability; transactional real SQL"]
+async fn default_native_relation_refusals() -> Result<(), Failure> {
+    for probe in [
+        catalog::NativeRelationProbe::Unknown,
+        catalog::NativeRelationProbe::WrongKind,
+        catalog::NativeRelationProbe::MissingIndex,
+        catalog::NativeRelationProbe::Partial20,
+        catalog::NativeRelationProbe::Partial21,
+    ] {
+        control(false, Mode::Relation(probe)).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires exclusively isolated current19 named namespace/admin DDL capability; transactional real SQL"]
+async fn named_native_relation_refusals() -> Result<(), Failure> {
+    for probe in [
+        catalog::NativeRelationProbe::Unknown,
+        catalog::NativeRelationProbe::WrongKind,
+        catalog::NativeRelationProbe::MissingIndex,
+        catalog::NativeRelationProbe::Partial20,
+        catalog::NativeRelationProbe::Partial21,
+    ] {
+        control(true, Mode::Relation(probe)).await?;
+    }
+    Ok(())
 }

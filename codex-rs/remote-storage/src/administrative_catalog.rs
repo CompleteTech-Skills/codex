@@ -456,3 +456,36 @@ impl NativePayloadProbe {
         }
     }
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) enum NativeRelationProbe {
+    Unknown,
+    WrongKind,
+    MissingIndex,
+    Partial20,
+    Partial21,
+}
+
+#[cfg(test)]
+impl NativeRelationProbe {
+    pub(super) fn ddl(self, namespace: &str) -> Vec<String> {
+        let qualified = format!("\"{}\"", namespace.replace('"', "\"\""));
+        match self {
+            Self::Unknown => vec![format!(
+                "CREATE TABLE {qualified}.codex_relation_control_unknown (probe INTEGER)"
+            )],
+            Self::WrongKind => vec![
+                format!("DROP INDEX {qualified}.idx_threads_recency_id"),
+                format!("CREATE TABLE {qualified}.idx_threads_recency_id (probe INTEGER)"),
+            ],
+            Self::MissingIndex => vec![format!("DROP INDEX {qualified}.idx_threads_recency_id")],
+            Self::Partial20 => vec![format!(
+                "CREATE TABLE {qualified}.storage_generation_principals (probe INTEGER)"
+            )],
+            Self::Partial21 => vec![format!(
+                "CREATE TABLE {qualified}.memory_v2_jobs (probe INTEGER)"
+            )],
+        }
+    }
+}
