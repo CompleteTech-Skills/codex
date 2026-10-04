@@ -276,6 +276,10 @@ impl OriginalMigrationStartup {
                         .sdk_done = true;
                 }));
             }
+            #[cfg(test)]
+            if let Some(task) = close.task.as_ref() {
+                close.original_task_id = Some(task.id());
+            }
             close.task.take()
         };
         if let Some(task) = task {
@@ -345,6 +349,8 @@ impl OriginalMigrationPoolClosed {
 }
 #[derive(Default)]
 struct SdkCloseState {
+    #[cfg(test)]
+    original_task_id: Option<tokio::task::Id>,
     task: Option<JoinHandle<()>>,
     started: bool,
     sdk_done: bool,
@@ -480,3 +486,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "migration_sdk_close_tests.rs"]
+mod sdk_close_tests;
