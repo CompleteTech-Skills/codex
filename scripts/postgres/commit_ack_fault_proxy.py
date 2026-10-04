@@ -267,6 +267,16 @@ def main():
                         backend.settimeout(10)
                         relay = OriginalRelay(frontend, backend)
                         result = relay.run()
+                        result.update(
+                            {
+                                "pid": os.getpid(),
+                                "relay_port": listener.getsockname()[1],
+                                "provider_port": port,
+                                "provider_leaf_sha256": hashlib.sha256(
+                                    expected_leaf
+                                ).hexdigest(),
+                            }
+                        )
                         create_receipt(inputs["result_file"], result)
 
 

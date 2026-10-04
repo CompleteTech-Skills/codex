@@ -107,7 +107,7 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
     let namespace = named
         .then(|| NamedNamespace::new("codex_storage_isolation"))
         .transpose()?;
-    let settings = ConnectionSettings {
+    let mut settings = ConnectionSettings {
         host: "localhost".into(),
         port: u16::try_from(receipt["port"].as_u64().ok_or("missing fixture port")?)?,
         database: "codex".into(),
@@ -120,8 +120,19 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
         limits: PoolLimits {
             connect_timeout: Duration::from_secs(5),
             acquire_timeout: Duration::from_secs(5),
-            max_connections: 2,
+            max_connections: if fault == 5 { 2 } else { 1 },
         },
+    };
+    let relay_inputs = if fault == 6 {
+        let ready_path = std::env::var("CODEX_TEST_BOOTSTRAP_COMMIT_RELAY_READY")?;
+        let ready: serde_json::Value = serde_json::from_slice(&std::fs::read(ready_path)?)?;
+        settings.port = u16::try_from(ready["port"].as_u64().ok_or("relay port absent")?)?;
+        Some((
+            ready,
+            std::env::var("CODEX_TEST_BOOTSTRAP_COMMIT_RELAY_RESULT")?,
+        ))
+    } else {
+        None
     };
     // Capture the SAME latent SDK pool before the factory's first SQL poll.
     let mut captured = None;
@@ -243,7 +254,7 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
                             ));
                         }));
                     }
-                    task.abort();
+                    if fault != 6 { task.abort(); }
                     probe.release.notify_one();
                     let joined = task.await.map_err(Arc::new);
                     *owner.control_terminal.lock()
@@ -266,7 +277,9 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
                             Err(BootstrapError::Migration)
                         }
                         Ok(result) => {
-                            witnessed = false;
+                            if fault == 6 {
+                                witnessed &= result == Err(BootstrapError::Unavailable);
+                            } else { witnessed = false; }
                             result
                         }
                     }
@@ -306,6 +319,56 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
     let proof = match reconciled {
         Ok(proof) => proof,
         Err(original) => {
+            if fault == 6 {
+                // This report is observation from ROOT's protected original
+                // relay process, never a SQL/session cleanup capability.
+                let actual_session = {
+                    let state = owner
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.session.is_some() && state.xid.is_some() && state.outcome.is_none()
+                };
+                let driver_cause = owner.original_driver_causes().is_some_and(|causes| {
+                    causes
+                        .iter()
+                        .flatten()
+                        .any(|cause| cause.downcast_ref::<sqlx::Error>().is_some())
+                });
+                let report = relay_inputs
+                    .as_ref()
+                    .and_then(|(_, path)| std::fs::read(path).ok())
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                let actual_server_tag = report.as_ref().is_some_and(|report| {
+                    report["server_commit_tag_observed"] == true
+                        && report["driver_commit_tag_forwarded"] == false
+                        && report["original_threads_joined"] == true
+                        && report["all_original_threads_started"] == true
+                        && report["cleanup_refused"] == false
+                        && report["release_authority"] == false
+                        && report["provider_port"].as_u64() == receipt["port"].as_u64()
+                        && relay_inputs.as_ref().is_some_and(|(ready, _)| {
+                            ready["pid"].as_u64().is_some()
+                                && report["pid"].as_u64() == ready["pid"].as_u64()
+                                && report["relay_port"].as_u64() == ready["port"].as_u64()
+                        })
+                });
+                if witnessed && actual_session && driver_cause && actual_server_tag {
+                    eprintln!(
+                        "actual bootstrap COMMIT reply withheld: original session/xid/cause retained; no cleanup ACK"
+                    );
+                } else {
+                    eprintln!(
+                        "COMMIT uncertainty control inconclusive: retaining same originals for ROOT reconciliation"
+                    );
+                }
+                // No success verdict or SDK close from a server tag, driver
+                // error, idle observation, or timeout. Same host stays owned.
+                let retained = (owner, pool, original, result, relay_inputs, report);
+                let terminal = std::future::pending::<Result<()>>().await;
+                let _ = retained;
+                return terminal;
+            }
             let retained = (owner, pool, original, result);
             let terminal = std::future::pending::<Result<()>>().await;
             let _ = retained;
@@ -356,7 +419,7 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
     }
-    if (fault == 0 && result.is_err()) || !witnessed || late || !closed {
+    if fault == 6 || (fault == 0 && result.is_err()) || !witnessed || late || !closed {
         return Err(Box::new(Failure {
             original: owner,
             result,
@@ -376,6 +439,31 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
         }));
     }
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "ROOT retained uncertainty host only: actual default relay/session reconciliation required"]
+async fn actual_default_commit_reply_lost_original_session_retained() -> Result<()> {
+    selected_bootstrap(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_LOST_ACK_STATE",
+        )?),
+        false,
+        6,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "ROOT retained uncertainty host only: actual named relay/session reconciliation required"]
+async fn actual_named_commit_reply_lost_original_session_retained() -> Result<()> {
+    selected_bootstrap(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_LOST_ACK_STATE",
+        )?),
+        true,
+        6,
+    )
+    .await
 }
 #[tokio::test]
 #[ignore = "requires an admitted isolated default PostgreSQL bootstrap fixture"]
