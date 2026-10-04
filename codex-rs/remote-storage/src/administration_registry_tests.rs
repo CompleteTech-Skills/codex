@@ -3,6 +3,113 @@ use super::*;
 use codex_keyring_store::DefaultKeyringStore;
 use codex_postgres_runtime::PoolError;
 
+async fn poisoned_registry_control(named: bool) -> Result<(), Failure> {
+    let registry = OriginalAdministrativeRegistry::new();
+    let mut failure = Failure {
+        registry: Arc::clone(&registry),
+        original: None,
+        input: None,
+        first_capture: None,
+        second_capture: None,
+        first_observation: None,
+        second_observation: None,
+        admission: None,
+        late_admission: None,
+        cleanup: None,
+        acquisition: None,
+        archives: std::array::from_fn(|_| None),
+        raw_poison: None,
+    };
+    let input = match crate::administration_startup::tests::input(named) {
+        Ok(input) => input,
+        Err(error) => {
+            failure.input = Some(error);
+            return Err(failure);
+        }
+    };
+    let keyring = DefaultKeyringStore;
+    let resolver = HostCredentialResolver::new(&keyring);
+    let borrowed = match registry.capture(Arc::clone(&input), &resolver) {
+        Ok(borrowed) => Some(borrowed),
+        Err(error) => {
+            failure.first_capture = Some(error);
+            None
+        }
+    };
+    let original = borrowed
+        .as_ref()
+        .map(|borrowed| Arc::clone(&borrowed.original));
+    failure.original = original.clone();
+    if let Some(borrowed) = &borrowed {
+        failure.first_observation = borrowed.observe_original().await.err();
+    }
+    let pool = original
+        .as_ref()
+        .and_then(|original| original.captured_pool());
+    let controller = Arc::clone(&registry);
+    let task = tokio::spawn(async move {
+        if let Ok(_guard) = controller.state.lock() {
+            panic!("injected administrative registry poison");
+        }
+    });
+    // Cache the actual joined panic cause BEFORE any original cleanup await.
+    failure.raw_poison = task.await.err().map(Arc::new);
+    drop(borrowed);
+    let late = registry.capture(Arc::clone(&input), &resolver);
+    let refused_late = matches!(&late, Err(error) if error.reason == "registry_poisoned");
+    match late {
+        Ok(unexpected) => drop(unexpected),
+        Err(error) => failure.late_admission = Some(error),
+    }
+    let cleanup = registry.close_input(&input).await;
+    let refused_cleanup = matches!(&cleanup, Err(error) if error.reason == "registry_poisoned");
+    failure.cleanup = cleanup.err();
+    let handoff = registry.take_failure_archive();
+    let same_archive = matches!(&handoff, Err(error) if error.reason == "registry_poisoned"
+        && error.archive.as_ref().is_some_and(|archive| archive.len() == 1
+            && original.as_ref().is_some_and(|original|
+                archive.originals.iter().flatten().any(|saved| Arc::ptr_eq(saved, original)))));
+    match handoff {
+        Ok(archive) => failure.archives[0] = Some(archive),
+        Err(error) => failure.admission = Some(error),
+    }
+    let closed = original
+        .as_ref()
+        .is_some_and(|original| original.archive_closed_original());
+    if !closed {
+        return Err(failure);
+    }
+    let sdk_closed = if let Some(pool) = pool {
+        match pool.acquire().await {
+            Err(PoolError::Closed) => true,
+            Err(error) => {
+                failure.acquisition = Some(error);
+                false
+            }
+            Ok(unexpected) => {
+                drop(unexpected);
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if !refused_late
+        || !refused_cleanup
+        || !same_archive
+        || !sdk_closed
+        || failure.first_capture.is_some()
+        || failure.first_observation.is_some()
+        || !failure
+            .raw_poison
+            .as_ref()
+            .is_some_and(|cause| cause.is_panic())
+    {
+        return Err(failure);
+    }
+    Ok(())
+}
+
 async fn refused_role_control(named: bool) -> Result<(), Failure> {
     let registry = OriginalAdministrativeRegistry::new();
     let mut failure = Failure {
@@ -18,6 +125,7 @@ async fn refused_role_control(named: bool) -> Result<(), Failure> {
         cleanup: None,
         acquisition: None,
         archives: std::array::from_fn(|_| None),
+        raw_poison: None,
     };
     let variable = if named {
         "CODEX_REAL_EXTERNAL_ADMIN_NAMED_DENIED_INPUT"
@@ -127,6 +235,7 @@ struct Failure {
     cleanup: Option<AdministrativeRegistryRefusal>,
     acquisition: Option<PoolError>,
     archives: [Option<AdministrativeFailureArchive>; 2],
+    raw_poison: Option<Arc<tokio::task::JoinError>>,
 }
 impl fmt::Debug for Failure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -143,6 +252,7 @@ impl fmt::Debug for Failure {
             &self.cleanup,
             &self.acquisition,
             &self.archives,
+            &self.raw_poison,
         );
         formatter.write_str("ExternalRegistryControlFailure([originals retained])")
     }
@@ -162,6 +272,7 @@ async fn control(named: bool) -> Result<(), Failure> {
         cleanup: None,
         acquisition: None,
         archives: std::array::from_fn(|_| None),
+        raw_poison: None,
     };
     let input = match crate::administration_startup::tests::input(named) {
         Ok(input) => input,
@@ -290,4 +401,15 @@ async fn default_failed_role_originals_archive_before_fresh_retry() -> Result<()
 #[ignore = "requires authenticated named login missing admin privileges; no grants"]
 async fn named_failed_role_originals_archive_before_fresh_retry() -> Result<(), Failure> {
     refused_role_control(true).await
+}
+
+#[tokio::test]
+#[ignore = "requires admitted default admin fixture; real original registry poison cleanup"]
+async fn default_poison_reconciles_known_originals_before_owning_refusal() -> Result<(), Failure> {
+    poisoned_registry_control(false).await
+}
+#[tokio::test]
+#[ignore = "requires admitted named admin fixture; real original registry poison cleanup"]
+async fn named_poison_reconciles_known_originals_before_owning_refusal() -> Result<(), Failure> {
+    poisoned_registry_control(true).await
 }

@@ -35,6 +35,7 @@ pub struct AdministrativeRegistryRefusal {
     original_registry: Arc<OriginalAdministrativeRegistry>,
     original_startup: Option<Arc<OriginalAdministrativeStartup>>,
     returned: Option<AdministrativeStartupRefusal>,
+    archive: Option<AdministrativeFailureArchive>,
     reason: &'static str,
 }
 impl fmt::Debug for AdministrativeRegistryRefusal {
@@ -43,6 +44,7 @@ impl fmt::Debug for AdministrativeRegistryRefusal {
             &self.original_registry,
             &self.original_startup,
             &self.returned,
+            &self.archive,
         );
         formatter.write_str(self.reason)
     }
@@ -115,6 +117,7 @@ impl OriginalAdministrativeRegistry {
             original_registry: Arc::clone(self),
             original_startup: original,
             returned,
+            archive: None,
             reason,
         }
     }
@@ -211,11 +214,13 @@ impl OriginalAdministrativeRegistry {
             .acquire_owned()
             .await
             .map_err(|_| self.refusal(None, None, "cleanup_admission_refused"))?;
-        let (index, original) = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| self.refusal(None, None, "registry_poisoned"))?;
+        let (index, original, registry_poison) = {
+            // Cleanup-only recovery snapshots the SAME known owners. Capture
+            // and archive handoff still reject this permanently poisoned gate.
+            let (mut state, poison) = match self.state.lock() {
+                Ok(state) => (state, false),
+                Err(error) => (error.into_inner(), true),
+            };
             let mut found = None;
             for (index, slot) in state.slots.iter_mut().enumerate() {
                 if let Slot::Active {
@@ -239,18 +244,21 @@ impl OriginalAdministrativeRegistry {
                     }
                 }
             }
-            found.ok_or_else(|| self.refusal(None, None, "original_not_registered"))?
+            let (index, original) =
+                found.ok_or_else(|| self.refusal(None, None, "original_not_registered"))?;
+            (index, original, poison)
         };
         let returned = original.close_original().await;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| self.refusal(Some(Arc::clone(&original)), None, "registry_poisoned"))?;
+        let (mut state, final_poison) = match self.state.lock() {
+            Ok(state) => (state, false),
+            Err(error) => (error.into_inner(), true),
+        };
+        let poison = registry_poison || final_poison;
         if !matches!(&state.slots[index], Slot::Active { original: saved, borrowers: 0, .. } if Arc::ptr_eq(saved, &original))
         {
             return Err(self.refusal(Some(original), returned.err(), "original_registry_changed"));
         }
-        if returned.is_ok() {
+        if returned.is_ok() && !poison {
             state.slots[index] = Slot::Empty;
         } else {
             // Reserve was made before dispatch; no allocation or cause rewrite.
@@ -267,6 +275,9 @@ impl OriginalAdministrativeRegistry {
         if state.slots.iter().all(|slot| matches!(slot, Slot::Empty)) {
             state.hold = None;
         }
+        if poison {
+            return Err(self.refusal(Some(original), returned.err(), "registry_poisoned"));
+        }
         returned.map_err(|returned| {
             self.refusal(Some(original), Some(returned), "original_cleanup_refused")
         })
@@ -276,10 +287,10 @@ impl OriginalAdministrativeRegistry {
     pub fn take_failure_archive(
         self: &Arc<Self>,
     ) -> Result<AdministrativeFailureArchive, AdministrativeRegistryRefusal> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| self.refusal(None, None, "registry_poisoned"))?;
+        let (mut state, poison) = match self.state.lock() {
+            Ok(state) => (state, false),
+            Err(error) => (error.into_inner(), true),
+        };
         let mut archive = AdministrativeFailureArchive {
             originals: std::array::from_fn(|_| None),
         };
@@ -292,6 +303,11 @@ impl OriginalAdministrativeRegistry {
         }
         if state.slots.iter().all(|slot| matches!(slot, Slot::Empty)) {
             state.hold = None;
+        }
+        if poison {
+            let mut refused = self.refusal(None, None, "registry_poisoned");
+            refused.archive = Some(archive);
+            return Err(refused);
         }
         Ok(archive)
     }
