@@ -42,6 +42,7 @@ pub struct StorageServiceInputs {
 /// The one implementation behind the CLI, the API and the TUI.
 pub struct StorageService {
     pub(crate) inputs: Arc<StorageServiceInputs>,
+    pub(crate) original_candidate: Option<Arc<RemotePostgresProfile>>,
     pub(crate) journal: Arc<Journal>,
     running: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
     pub(crate) migration_startups: Arc<crate::MigrationStartupRegistry>,
@@ -68,8 +69,13 @@ impl Drop for RunGuard<'_> {
 impl StorageService {
     pub fn new(inputs: StorageServiceInputs) -> Self {
         let journal = Journal::new(&inputs.codex_home);
+        let original_candidate = inputs
+            .candidate
+            .as_ref()
+            .map(|profile| Arc::new(profile.clone()));
         Self {
             inputs: Arc::new(inputs),
+            original_candidate,
             journal: Arc::new(journal),
             running: Arc::new(std::sync::Mutex::default()),
             original_operations: Arc::default(),
@@ -88,6 +94,7 @@ impl StorageService {
     pub(crate) fn operation_context(&self) -> Self {
         Self {
             inputs: Arc::clone(&self.inputs),
+            original_candidate: self.original_candidate.as_ref().map(Arc::clone),
             journal: Arc::clone(&self.journal),
             running: Arc::clone(&self.running),
             migration_startups: Arc::clone(&self.migration_startups),

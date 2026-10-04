@@ -5,6 +5,9 @@
 //! same blocker codes, the same active backend and the same recovery actions. Credentials are
 //! referenced, never carried: results contain codes and counts, not secrets or row contents.
 
+mod administration_binding;
+pub use administration_binding::OriginalServiceAdministration;
+pub use administration_binding::ServiceAdministrationPreparationRefusal;
 mod journal;
 mod migration_startups;
 pub use migration_startups::MigrationStartupRegistry;
