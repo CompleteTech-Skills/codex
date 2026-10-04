@@ -201,6 +201,8 @@ impl RemoteStorage {
                     origin
                         .bind_expected_login(settings.username.clone())
                         .map_err(RemoteStorageError::Connection)?;
+                    #[cfg(test)]
+                    origin.hold_before_factory().await;
                     let mut original_capture = |pool: Arc<PostgresPool>| {
                         // Exterior operation slot receives even a refused original pool.
                         let external = capture(Arc::clone(&pool));

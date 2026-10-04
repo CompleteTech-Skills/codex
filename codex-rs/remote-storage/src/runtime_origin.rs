@@ -43,6 +43,8 @@ struct State {
     collision: Option<JoinHandle<Result<Arc<RuntimeNativeOrigin>, ()>>>,
     runtime_failure: Option<tokio::runtime::TryCurrentError>,
     hold: Option<Arc<OriginalRuntimeOrigin>>,
+    #[cfg(test)]
+    constructor_probe: Option<Arc<ConstructorProbe>>,
 }
 /// Exact profile and SDK owner, not an endpoint comparison or caller tuple.
 pub struct OriginalRuntimeOrigin {
@@ -86,6 +88,8 @@ impl OriginalRuntimeOrigin {
                 collision: None,
                 runtime_failure: None,
                 hold: None,
+                #[cfg(test)]
+                constructor_probe: None,
             }),
         })
     }
@@ -214,6 +218,27 @@ impl OriginalRuntimeOrigin {
             return Err(refusal());
         }
         Ok(()) // Physical constructor terminal only, not admission/native outcome.
+    }
+    #[cfg(test)]
+    pub(crate) async fn hold_before_factory(&self) {
+        let probe = {
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .constructor_probe
+                .clone()
+        };
+        if let Some(probe) = probe {
+            if let Some(ready) = probe
+                .ready
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                let _delivered = ready.send(tokio::task::id());
+            }
+            let _release = probe.release.acquire().await;
+        }
     }
     pub(crate) fn bind_expected_login(&self, login: String) -> Result<(), PoolError> {
         let mut state = self.state.lock().map_err(|_| PoolError::Unavailable)?;
@@ -616,3 +641,12 @@ impl Drop for RuntimeConstructorLoan {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) struct ConstructorProbe {
+    ready: Mutex<Option<tokio::sync::oneshot::Sender<tokio::task::Id>>>,
+    release: Semaphore,
+}
+#[cfg(test)]
+#[path = "runtime_origin_tests.rs"]
+mod tests;
