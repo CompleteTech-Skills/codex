@@ -443,3 +443,7 @@ impl OriginalAdministrativeStartup {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "administration_startup_tests.rs"]
+mod tests;

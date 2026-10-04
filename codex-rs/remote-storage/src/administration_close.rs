@@ -31,6 +31,16 @@ struct State {
     sdk_ack: bool,
     sdk_joined: bool,
     sdk_failure: Option<Arc<tokio::task::JoinError>>,
+    #[cfg(test)]
+    sdk_probe: Option<Arc<SdkProbe>>,
+    #[cfg(test)]
+    sdk_task_id: Option<tokio::task::Id>,
+}
+
+#[cfg(test)]
+pub(super) struct SdkProbe {
+    pub(super) ready: Mutex<Option<tokio::sync::oneshot::Sender<(tokio::task::Id, bool)>>>,
+    pub(super) release: Semaphore,
 }
 
 pub(super) struct OriginalAdministrativeClose {
@@ -53,6 +63,10 @@ impl OriginalAdministrativeClose {
                 sdk_ack: false,
                 sdk_joined: false,
                 sdk_failure: None,
+                #[cfg(test)]
+                sdk_probe: None,
+                #[cfg(test)]
+                sdk_task_id: None,
             }),
             serial: Arc::new(Semaphore::new(1)),
         })
@@ -152,17 +166,51 @@ impl OriginalAdministrativeClose {
             if state.sdk_task.is_none() && !state.sdk_joined && state.sdk_failure.is_none() {
                 if let Some(pool) = state.pool.clone() {
                     let body = Arc::clone(self);
+                    #[cfg(test)]
+                    let probe = state.sdk_probe.clone();
                     state.sdk_task = Some(tokio::spawn(async move {
                         {
                             let _registered =
                                 body.state.lock().unwrap_or_else(|error| error.into_inner());
                         }
+                        #[cfg(test)]
+                        if let Some(probe) = probe {
+                            // Poll the SAME actual SDK future once before the
+                            // witness. No replacement SDK task/future is created.
+                            let mut original_close = Box::pin(pool.close_original_sdk());
+                            let done = std::future::poll_fn(|context| {
+                                std::task::Poll::Ready(matches!(
+                                    original_close.as_mut().poll(context),
+                                    std::task::Poll::Ready(())
+                                ))
+                            })
+                            .await;
+                            if let Some(ready) = probe
+                                .ready
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .take()
+                            {
+                                let _delivered = ready.send((tokio::task::id(), !done));
+                            }
+                            let _release = probe.release.acquire().await;
+                            if !done {
+                                original_close.await;
+                            }
+                        } else {
+                            pool.close_original_sdk().await;
+                        }
+                        #[cfg(not(test))]
                         pool.close_original_sdk().await;
                         body.state
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .sdk_ack = true;
                     }));
+                    #[cfg(test)]
+                    {
+                        state.sdk_task_id = state.sdk_task.as_ref().map(JoinHandle::id);
+                    }
                 } else if matches!(state.source, Source::Absent) {
                     // No SDK existed after proved never-dispatched/known terminal
                     // startup. This is not a receipt that a missing pool closed.
@@ -188,6 +236,34 @@ impl OriginalAdministrativeClose {
             && (state.pool.is_none() || state.sdk_ack)
             && state.native_failure.is_none()
             && state.sdk_failure.is_none()
+            && !self.state.is_poisoned()
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_probe(&self, probe: Arc<SdkProbe>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .sdk_probe = Some(probe);
+    }
+
+    #[cfg(test)]
+    pub(super) fn same_sdk_task_restored(&self, task: tokio::task::Id) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.sdk_task_id == Some(task)
+            && state
+                .sdk_task
+                .as_ref()
+                .is_some_and(|original| original.id() == task)
+    }
+
+    #[cfg(test)]
+    pub(super) fn known_native_sdk_closed(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.native_joined
+            && matches!(state.native_result, Some(Ok(())))
+            && state.sdk_joined
+            && state.sdk_ack
             && !self.state.is_poisoned()
     }
 }
