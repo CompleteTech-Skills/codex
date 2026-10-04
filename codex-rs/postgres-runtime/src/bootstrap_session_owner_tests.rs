@@ -40,8 +40,182 @@ impl Drop for BlockerLoan {
     }
 }
 
+// Exterior owner of BOTH actual factory futures before any first acquire.
+// Cancellation retains the same task/pools; it does not certify SDK closure.
+struct FactoryOwner {
+    state: Mutex<FactoryState>,
+    join: Arc<tokio::sync::Semaphore>,
+}
+#[derive(Default)]
+struct FactoryState {
+    registered: bool,
+    original: Option<Arc<crate::PostgresPool>>,
+    diagnostic: Option<Arc<crate::PostgresPool>>,
+    task: Option<tokio::task::JoinHandle<FactoryResults>>,
+    terminal: Option<std::result::Result<Arc<FactoryResults>, Arc<tokio::task::JoinError>>>,
+    hold: Option<Arc<FactoryOwner>>,
+}
+#[derive(Clone)]
+struct FactoryResults {
+    original: std::result::Result<Arc<crate::PostgresPool>, crate::PoolError>,
+    diagnostic: Option<std::result::Result<Arc<crate::PostgresPool>, crate::PoolError>>,
+}
+struct FactoryLoan {
+    original: Arc<FactoryOwner>,
+    task: Option<tokio::task::JoinHandle<FactoryResults>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl Drop for FactoryLoan {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            self.original
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .task = Some(task);
+        }
+    }
+}
+struct FactoryRefusal(Arc<FactoryOwner>);
+impl std::fmt::Debug for FactoryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_safe(f)
+    }
+}
+impl std::fmt::Display for FactoryRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_safe(f)
+    }
+}
+impl FactoryRefusal {
+    fn fmt_safe(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = &self.0;
+        f.write_str("original bootstrap factory task/pools retained; completion uncertain")
+    }
+}
+impl std::error::Error for FactoryRefusal {}
+impl FactoryOwner {
+    fn capture(
+        settings: ConnectionSettings,
+        namespace: Option<NamedNamespace>,
+        diagnostic_settings: Option<ConnectionSettings>,
+        diagnostic_namespace: Option<NamedNamespace>,
+    ) -> Arc<Self> {
+        let original = Arc::new(Self {
+            state: Mutex::new(FactoryState::default()),
+            join: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let mut state = original
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.hold = Some(Arc::clone(&original)); // BEFORE dispatch; body terminal cannot erase owner.
+        let actual = Arc::clone(&original);
+        state.task = Some(tokio::spawn(async move {
+            // Same lock gates first factory poll until the actual JH is stored.
+            let admitted = actual.state.lock().is_ok_and(|state| state.registered);
+            if !admitted {
+                return FactoryResults {
+                    original: Err(crate::PoolError::Unavailable),
+                    diagnostic: None,
+                };
+            }
+            let result = crate::PostgresPool::connect_retained_in_namespace(
+                settings,
+                namespace.as_ref(),
+                &mut |pool| {
+                    let (mut state, poison) = match actual.state.lock() {
+                        Ok(state) => (state, false),
+                        Err(cause) => (cause.into_inner(), true),
+                    };
+                    state.original = Some(pool); // Exact latent SDK BEFORE fallible refusal/first acquire.
+                    if poison {
+                        Err(crate::PoolError::Unavailable)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+            let diagnostic = if let Some(settings) = diagnostic_settings {
+                Some(
+                    crate::PostgresPool::connect_retained_in_namespace(
+                        settings,
+                        diagnostic_namespace.as_ref(),
+                        &mut |pool| {
+                            let (mut state, poison) = match actual.state.lock() {
+                                Ok(state) => (state, false),
+                                Err(cause) => (cause.into_inner(), true),
+                            };
+                            state.diagnostic = Some(pool);
+                            if poison {
+                                Err(crate::PoolError::Unavailable)
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+            FactoryResults {
+                original: result,
+                diagnostic,
+            }
+        }));
+        state.registered = true; // Immutable dispatch fact; loaning the JH cannot erase it.
+        drop(state);
+        original
+    }
+    fn release_after_known_sdk_closure(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.task.is_some() || !matches!(&state.terminal, Some(Ok(_))) {
+            return false;
+        }
+        state.hold.take();
+        true
+    }
+    async fn finish(self: &Arc<Self>) -> std::result::Result<Arc<FactoryResults>, FactoryRefusal> {
+        let refusal = || FactoryRefusal(Arc::clone(self));
+        let permit = Arc::clone(&self.join)
+            .acquire_owned()
+            .await
+            .map_err(|_| refusal())?;
+        let task = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.task.take()
+        };
+        let mut loan = FactoryLoan {
+            original: Arc::clone(self),
+            task,
+            _permit: permit,
+        };
+        if let Some(task) = loan.task.as_mut() {
+            let joined = task.await.map(Arc::new).map_err(Arc::new);
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .terminal = Some(joined);
+            loan.task = None; // Only SAME physical JH completion permits clearing.
+        }
+        let state = self.state.lock().map_err(|_| refusal())?;
+        match &state.terminal {
+            Some(Ok(result)) => Ok(Arc::clone(result)),
+            _ => Err(refusal()),
+        }
+    }
+}
+
 struct Failure {
     original: Arc<BootstrapSessionOwner>,
+    factories: Arc<FactoryOwner>,
     result: std::result::Result<(), BootstrapError>,
     acquisition: Option<crate::PoolError>,
     task_failure: Option<Arc<tokio::task::JoinError>>,
@@ -64,6 +238,7 @@ impl Failure {
     fn fmt_safe(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let retained = (
             &self.original,
+            &self.factories,
             &self.result,
             &self.acquisition,
             &self.task_failure,
@@ -246,36 +421,27 @@ async fn selected_bootstrap_with_diagnostic(
     } else {
         None
     };
-    // Capture the SAME latent SDK pool before the factory's first SQL poll.
-    let mut captured = None;
-    let connected = crate::PostgresPool::connect_retained_in_namespace(
+    // Actual factory task and latent SDK slots are exterior BEFORE first poll.
+    let factories = FactoryOwner::capture(
         settings,
-        namespace.as_ref(),
-        &mut |pool| {
-            captured = Some(pool);
-            Ok(())
-        },
-    )
-    .await;
-    let Some(pool) = captured else {
-        return Err("no SDK dispatch captured".into());
+        namespace.clone(),
+        diagnostic_settings,
+        diagnostic_namespace,
+    );
+    let factory_weak = Arc::downgrade(&factories);
+    let factory_results = factories.finish().await?;
+    let (pool, diagnostic_pool) = {
+        let state = factories
+            .state
+            .lock()
+            .map_err(|_| FactoryRefusal(Arc::clone(&factories)))?;
+        (state.original.clone(), state.diagnostic.clone())
     };
-    let mut diagnostic_pool = None;
-    let diagnostic_result = if let Some(settings) = diagnostic_settings {
-        Some(
-            crate::PostgresPool::connect_retained_in_namespace(
-                settings,
-                diagnostic_namespace.as_ref(),
-                &mut |actual| {
-                    diagnostic_pool = Some(actual); // SAME latent SDK before any acquisition.
-                    Ok(())
-                },
-            )
-            .await,
-        )
-    } else {
-        None
+    let Some(pool) = pool else {
+        return Err(Box::new(FactoryRefusal(factories)));
     };
+    let connected = factory_results.original.clone();
+    let diagnostic_result = factory_results.diagnostic.clone();
     let owner = match diagnostic_pool.as_ref() {
         Some(diagnostic) => {
             BootstrapSessionOwner::new_recoverable(Arc::clone(&pool), Arc::clone(diagnostic))
@@ -382,7 +548,9 @@ async fn selected_bootstrap_with_diagnostic(
                 false
             }
         };
-        if closed && diagnostic_closed {
+        let factory_released =
+            closed && diagnostic_closed && factories.release_after_known_sdk_closure();
+        if factory_released {
             owner
                 .control_hold
                 .lock()
@@ -399,9 +567,11 @@ async fn selected_bootstrap_with_diagnostic(
             || diagnostic_late
             || !closed
             || !diagnostic_closed
+            || !factory_released
         {
             return Err(Box::new(Failure {
                 original: owner,
+                factories,
                 result: Err(BootstrapError::Migration),
                 acquisition,
                 task_failure: None,
@@ -410,6 +580,10 @@ async fn selected_bootstrap_with_diagnostic(
                 relay_report: None,
                 relay_error: None,
             }));
+        }
+        drop(factories);
+        if let Some(original) = factory_weak.upgrade() {
+            return Err(Box::new(FactoryRefusal(original)));
         }
         return Ok(());
     }
@@ -770,6 +944,7 @@ async fn selected_bootstrap_with_diagnostic(
     if !covers {
         return Err(Box::new(Failure {
             original: owner,
+            factories,
             result,
             acquisition: None,
             task_failure: task_failure.clone(),
@@ -822,7 +997,9 @@ async fn selected_bootstrap_with_diagnostic(
             false
         }
     };
-    if closed {
+    let factory_released =
+        closed && diagnostic_closed && factories.release_after_known_sdk_closure();
+    if factory_released {
         owner
             .control_hold
             .lock()
@@ -839,9 +1016,11 @@ async fn selected_bootstrap_with_diagnostic(
         || !diagnostic_ok
         || !lost_reply_witness
         || !foreign_origin_witness
+        || !factory_released
     {
         return Err(Box::new(Failure {
             original: owner,
+            factories,
             result,
             acquisition,
             task_failure: task_failure.clone(),
@@ -859,6 +1038,7 @@ async fn selected_bootstrap_with_diagnostic(
     {
         return Err(Box::new(Failure {
             original: owner,
+            factories,
             result,
             acquisition,
             task_failure: task_failure.clone(),
@@ -867,6 +1047,10 @@ async fn selected_bootstrap_with_diagnostic(
             relay_report: relay_report.clone(),
             relay_error: relay_error.clone(),
         }));
+    }
+    drop(factories);
+    if let Some(original) = factory_weak.upgrade() {
+        return Err(Box::new(FactoryRefusal(original)));
     }
     Ok(())
 }
