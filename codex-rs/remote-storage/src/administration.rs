@@ -17,6 +17,7 @@ pub struct RemoteAdministrativeObserver {
     keyring: Arc<dyn KeyringStore>,
     registry: Arc<OriginalAdministrativeRegistry>,
 }
+
 /// Outward-only original owner; never cached into the registry it retains.
 pub struct AdministrativeObservationRefusal {
     original: Arc<RemoteAdministrativeObserver>,
@@ -104,3 +105,7 @@ impl RemoteAdministrativeObserver {
         self.registry.take_failure_archive()
     }
 }
+
+#[cfg(test)]
+#[path = "administration_tests.rs"]
+mod tests;
