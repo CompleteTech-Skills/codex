@@ -62,13 +62,15 @@ impl BootstrapSessionOwner {
         diagnostic_pool: Arc<PostgresPool>,
     ) -> Arc<Self> {
         let aliases_original = Arc::ptr_eq(&pool, &diagnostic_pool);
+        let selected_namespace_matches = pool.selected_search_path.is_some()
+            && pool.selected_search_path == diagnostic_pool.selected_search_path;
         let owner = Self::with_diagnostic(
             pool,
             Some(crate::bootstrap_diagnostic_session::DiagnosticSession::new(
                 diagnostic_pool,
             )),
         );
-        if aliases_original {
+        if aliases_original || !selected_namespace_matches {
             owner
                 .state
                 .lock()
