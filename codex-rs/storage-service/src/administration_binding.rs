@@ -11,6 +11,8 @@ use std::sync::Arc;
 mod operation_plan;
 pub use operation_plan::AdministrativeOperationPlanRefusal;
 pub(crate) use operation_plan::OperationPlanFacts;
+#[cfg(test)]
+pub(crate) use operation_plan::OperationPlanRevalidationRefusal;
 pub use operation_plan::OriginalAdministrativeOperationPlan;
 
 /// Prepared synchronously before credential lookup or administrative dispatch.

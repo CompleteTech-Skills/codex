@@ -92,6 +92,17 @@ impl std::fmt::Display for OperationPlanRevalidationRefusal {
     }
 }
 impl std::error::Error for OperationPlanRevalidationRefusal {}
+#[cfg(test)]
+impl OperationPlanRevalidationRefusal {
+    pub(crate) fn actual_changed_record(&self) -> Option<&OperationRecord> {
+        self.returned
+            .as_deref()
+            .filter(|returned| *returned != self.expected.as_ref())
+    }
+    pub(crate) fn actual_read_error(&self) -> Option<&std::io::Error> {
+        self.cause.as_ref()
+    }
+}
 pub struct AdministrativeOperationPlanRefusal {
     binding: Arc<OriginalServiceAdministration>,
     origin: Arc<RuntimeNativeOrigin>,
@@ -125,6 +136,36 @@ impl std::fmt::Display for AdministrativeOperationPlanRefusal {
     }
 }
 impl std::error::Error for AdministrativeOperationPlanRefusal {}
+#[cfg(test)]
+impl AdministrativeOperationPlanRefusal {
+    pub(crate) fn actual_plan_mismatch(&self, operation_id: Uuid, plan_id: Uuid) -> bool {
+        self.cause.0 == crate::BlockerCode::StalePlan
+            && self.preflight.is_none()
+            && self.journal_failure.is_none()
+            && self
+                .record
+                .as_ref()
+                .is_some_and(|record| record.operation_id == operation_id)
+            && self.returned_record == self.record
+            && self
+                .plan
+                .as_ref()
+                .is_some_and(|plan| plan.plan_id == plan_id && plan.is_startable())
+    }
+    pub(crate) fn actual_foreign_binding(
+        &self,
+        incoming: &Arc<OriginalAdministrativeOperationPlan>,
+    ) -> bool {
+        self.cause.0 == crate::BlockerCode::Internal
+            && self.preflight.is_none()
+            && self.journal_failure.is_none()
+            && self
+                .operation
+                .as_ref()
+                .is_some_and(|operation| Arc::ptr_eq(operation, incoming))
+            && !incoming.belongs_to_binding(&self.binding)
+    }
+}
 impl OriginalAdministrativeOperationPlan {
     pub fn belongs_to_binding(&self, binding: &Arc<OriginalServiceAdministration>) -> bool {
         Arc::ptr_eq(&self.binding, binding)

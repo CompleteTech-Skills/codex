@@ -213,6 +213,25 @@ impl Resources {
             && !actual[0].1.retains_original_causes()
             && archives[actual[0].0].is_some()
     }
+    #[cfg(test)]
+    pub(crate) fn actual_plan_refusal_before_administrative_capture(
+        &self,
+    ) -> Option<Arc<dyn std::error::Error + Send + Sync>> {
+        let plans = self.administrative_operations.state.lock().ok()?;
+        let observers = self.administrative_observers.state.lock().ok()?;
+        let attempts = self.administrative_attempts.state.lock().ok()?;
+        let commands = self.administrative_commands.state.lock().ok()?;
+        if observers.entries.iter().any(|entry| entry.reserved)
+            || attempts.entries.iter().any(|entry| entry.reserved)
+            || commands.entries.iter().any(|entry| entry.reserved)
+        {
+            return None;
+        }
+        plans
+            .entries
+            .iter()
+            .find_map(|entry| entry.returned_failure.as_ref().map(Arc::clone))
+    }
     pub(crate) fn retains_original_causes(&self) -> bool {
         if self
             .administrative_operations

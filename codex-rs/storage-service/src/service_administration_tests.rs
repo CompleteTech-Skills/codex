@@ -31,8 +31,23 @@ impl std::fmt::Display for Failure {
     }
 }
 impl std::error::Error for Failure {}
+struct PreparationFailure(crate::ServiceAdministrationPreparationRefusal);
+impl std::fmt::Debug for PreparationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _original = &self.0;
+        f.write_str("AdministrativePreparationFailure([actual refusal retained])")
+    }
+}
+impl std::fmt::Display for PreparationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+impl std::error::Error for PreparationFailure {}
 
-async fn canceled_public_preflight(named: bool) -> super::tests::ControlResult<()> {
+fn fixture_binding(
+    named: bool,
+) -> super::tests::ControlResult<Arc<crate::OriginalServiceAdministration>> {
     let variable = if named {
         "CODEX_REAL_EXTERNAL_ADMIN_NAMED_INPUT"
     } else {
@@ -80,7 +95,12 @@ async fn canceled_public_preflight(named: bool) -> super::tests::ControlResult<(
     }));
     let binding = service
         .prepare_administration(login, credential)
-        .map_err(|_| "administrative preparation refused before dispatch")?;
+        .map_err(PreparationFailure)?;
+    Ok(binding)
+}
+async fn canceled_public_preflight(named: bool) -> super::tests::ControlResult<()> {
+    let binding = fixture_binding(named)?;
+    let service = Arc::clone(binding.original_service());
     let origin = match binding.observe_runtime_origin().await {
         Ok(origin) => origin,
         Err(cause) => {
@@ -122,8 +142,14 @@ async fn canceled_public_preflight(named: bool) -> super::tests::ControlResult<(
             .originals
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let history = service
+            .original_operations
+            .history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         originals
             .iter()
+            .chain(history.iter())
             .find(|original| original.kind == Kind::AdministrativePreflight)
             .map(Arc::clone)
     };
@@ -199,3 +225,6 @@ async fn default_public_administrative_caller_cancellation() -> super::tests::Co
 async fn named_public_administrative_caller_cancellation() -> super::tests::ControlResult<()> {
     canceled_public_preflight(true).await
 }
+
+#[path = "service_administrative_plan_tests.rs"]
+mod operation_plan_tests;
