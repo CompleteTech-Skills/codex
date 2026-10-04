@@ -670,3 +670,141 @@ async fn real_named_thirty_two_canceled_callers_automatic_sdk_reuse() -> Control
     )
     .await
 }
+
+async fn selected_concurrent_original_sdk_borrowers(
+    state: &std::path::Path,
+    namespace: &str,
+    prefix: &str,
+) -> ControlResult<()> {
+    for poison in [false, true] {
+        let home = tempfile::tempdir()?.keep();
+        let service = sdk_service(&home, state, namespace, prefix)?;
+        let mut originals: Vec<Arc<Original>> = Vec::new();
+        let mut probes: Vec<Arc<Probe>> = Vec::new();
+        let mut original_pools: Vec<Arc<codex_postgres_runtime::PostgresPool>> = Vec::new();
+        originals.try_reserve(3)?;
+        probes.try_reserve(3)?;
+        original_pools.try_reserve(2)?;
+        let verdict: ControlResult<()> = async {
+            let first_probe = Arc::new(Probe { exercise_sdk: true, hold_after_sdk: true, ..Probe::default() });
+            probes.push(Arc::clone(&first_probe));
+            *service.original_operations.probe.lock().map_err(|_| "probe poisoned")? = Some(Arc::clone(&first_probe));
+            let first = service.original_operations.capture(service.operation_context(), Kind::Activate, Some(active(&service)?), None)?;
+            originals.push(Arc::clone(&first)); first_probe.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(20), first_probe.sdk_ready.notified()).await?;
+            let runtimes = first.resources.actual_runtime_snapshot().map_err(|_| "runtime snapshot refused")?;
+            let runtime = runtimes.into_iter().flatten().next().ok_or("actual runtime missing")?;
+            original_pools.push(Arc::clone(runtime.pool()));
+            let start = service.migration_startups.original_startups()?.into_iter().next().ok_or("actual startup missing")?;
+            if !Arc::ptr_eq(start.original_runtime(), runtime.pool()) { return Err("original runtime identity differs".into()); }
+            original_pools.push(start.finish_original().await.map_err(|_| "actual startup outcome refused")?);
+            let second_probe = Arc::new(Probe { exercise_sdk: true, hold_after_sdk: true, hold_connection: true,
+                shared_runtime: Some(Arc::clone(&runtime)), ..Probe::default() });
+            probes.push(Arc::clone(&second_probe));
+            *service.original_operations.probe.lock().map_err(|_| "probe poisoned")? = Some(Arc::clone(&second_probe));
+            let second = service.original_operations.capture(service.operation_context(), Kind::Activate, Some(active(&service)?), None)?;
+            originals.push(Arc::clone(&second)); second_probe.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(20), second_probe.sdk_ready.notified()).await?;
+            // B holds a real checked-out connection from A's SAME migrator pool.
+            first_probe.sdk_release.notify_one();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if service.migration_startups.actual_entry_closing(runtime.pool())? { break; }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<(), StorageError>(())
+            }).await??;
+            if first.resources.cleanup_completed() { return Err("SDK closed while admitted original borrower still active".into()); }
+            if poison { service.migration_startups.poison_actual_registry(); }
+            let late_probe = Arc::new(Probe { exercise_sdk: true, shared_runtime: Some(Arc::clone(&runtime)), ..Probe::default() });
+            probes.push(Arc::clone(&late_probe));
+            *service.original_operations.probe.lock().map_err(|_| "probe poisoned")? = Some(Arc::clone(&late_probe));
+            let late = service.original_operations.capture(service.operation_context(), Kind::Activate, Some(active(&service)?), None)?;
+            originals.push(Arc::clone(&late)); late_probe.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if late.resources.body_has_returned().map_err(|_| "late body observation refused")? { break; }
+                    tokio::task::yield_now().await;
+                }
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+            }).await??;
+            if !late.resources.actual_body_failed().map_err(|_| "late body result refused")? ||
+                late.resources.cleanup_completed() || first.resources.cleanup_completed() {
+                return Err("late admission granted or shared SDK closed before real borrower returned".into());
+            }
+            // Cancel only an actual public cleanup waiter while B remains live.
+            let mut caller = Box::pin(service.original_operations.finish(Arc::clone(&first)));
+            let early = tokio::select! { biased; _ = &mut caller => true, _ = tokio::task::yield_now() => false };
+            drop(caller);
+            if early { return Err("cleanup completed while same original connection remained borrowed".into()); }
+            Ok(())
+        }.await;
+        // ALL paths release the actual first-poll/body/held-connection gates and
+        // reconcile SAME operation+cleanup handles before diagnostics.
+        for probe in &probes {
+            probe.release.notify_one();
+            probe.sdk_release.notify_one();
+        }
+        let mut outcomes = Vec::new();
+        for original in &originals {
+            outcomes.push(
+                service
+                    .original_operations
+                    .finish(Arc::clone(original))
+                    .await,
+            );
+        }
+        let mut sdk_closed = true;
+        for pool in &original_pools {
+            sdk_closed &= match pool.acquire().await {
+                Err(codex_postgres_runtime::PoolError::Closed) => true,
+                Ok(connection) => {
+                    drop(connection);
+                    false
+                }
+                Err(_) => false,
+            };
+        }
+        verdict?;
+        if outcomes.len() != 3 || !sdk_closed || outcomes[2].is_ok() {
+            return Err("actual concurrent/late original SDK ownership cleanup failed".into());
+        }
+        if poison {
+            if outcomes.iter().any(Result::is_ok)
+                || service.migration_startups.original_startups().is_ok()
+            {
+                return Err(
+                    "poisoned registry minted successful admission/cleanup diagnostic".into(),
+                );
+            }
+        } else if outcomes[0].is_err()
+            || outcomes[1].is_err()
+            || originals
+                .iter()
+                .any(|original| !original.resources.cleanup_completed())
+        {
+            return Err("admitted originals failed same SDK cleanup or late refusal cleanup remained stranded".into());
+        }
+    }
+    Ok(())
+}
+#[tokio::test]
+#[ignore = "requires ROOT admitted default SQL fixture and execution host"]
+async fn real_default_concurrent_original_sdk_borrower_late_admission_poison_cleanup()
+-> ControlResult<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_OWNERSHIP_STATE")?;
+    selected_concurrent_original_sdk_borrowers(std::path::Path::new(&state), "codex_storage", "")
+        .await
+}
+#[tokio::test]
+#[ignore = "requires ROOT admitted named SQL fixture and execution host"]
+async fn real_named_concurrent_original_sdk_borrower_late_admission_poison_cleanup()
+-> ControlResult<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_ISOLATION_STATE")?;
+    selected_concurrent_original_sdk_borrowers(
+        std::path::Path::new(&state),
+        "codex_storage_isolation",
+        "isolation_",
+    )
+    .await
+}

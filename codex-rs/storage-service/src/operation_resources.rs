@@ -143,6 +143,34 @@ impl Resources {
                 })
         })
     }
+    #[cfg(test)]
+    pub(crate) fn actual_runtime_snapshot(
+        &self,
+    ) -> Result<[Option<Arc<RemoteStorage>>; CAPACITY], Refusal> {
+        let state = self.runtimes.state.lock().map_err(|_| Refusal)?;
+        Ok(std::array::from_fn(|index| {
+            state.entries[index].installed.as_ref().map(Arc::clone)
+        }))
+    }
+    #[cfg(test)]
+    pub(crate) fn actual_body_failed(&self) -> Result<bool, Refusal> {
+        self.body_result
+            .lock()
+            .map(|result| matches!(*result, Some(Err(_))))
+            .map_err(|_| Refusal)
+    }
+    pub(crate) fn owns_original_runtime_pool(
+        &self,
+        original: &Arc<codex_postgres_runtime::PostgresPool>,
+    ) -> Result<bool, Refusal> {
+        let state = self.runtime_pools.state.lock().map_err(|_| Refusal)?;
+        Ok(state.entries.iter().any(|entry| {
+            entry
+                .installed
+                .as_ref()
+                .is_some_and(|pool| Arc::ptr_eq(pool, original))
+        }))
+    }
     pub(crate) fn retain_staged_config(&self, original: SqliteConfig) -> Result<(), Refusal> {
         let slot = self.staged_configs.reserve()?;
         slot.install(original).map_err(|_| Refusal)?;
@@ -384,9 +412,14 @@ impl Resources {
                             .flatten()
                             .find(|runtime| Arc::ptr_eq(runtime.pool(), &pool))
                         {
-                            if startups.close_for(runtime, &original).await.is_err() {
-                                complete = false;
-                                continue;
+                            match startups.close_for(runtime, &original).await {
+                                Ok(receipt) => {
+                                    complete &= !receipt.refused;
+                                }
+                                Err(_) => {
+                                    complete = false;
+                                    continue; // No actual startup ACK: keep original Runtime SDK.
+                                }
                             }
                         }
                         pool.close_original_sdk().await;

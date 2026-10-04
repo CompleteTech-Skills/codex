@@ -112,13 +112,40 @@ impl Operations {
                 #[cfg(test)]
                 if probe.as_ref().is_some_and(|probe| probe.exercise_sdk) {
                     // Real constructors/registry inside SAME pre-registered task.
-                    let runtime = service.connect().await?;
+                    let runtime = if let Some(runtime) = probe
+                        .as_ref()
+                        .and_then(|probe| probe.shared_runtime.as_ref())
+                    {
+                        // Retain the actual first producer's SAME owners in this registered
+                        // frame before any real shared-pool borrow or SQL is polled.
+                        resources
+                            .reserve_runtime()
+                            .map_err(|_| unavailable())?
+                            .capture_original_arc(Arc::clone(runtime))
+                            .map_err(|_| unavailable())?;
+                        resources
+                            .reserve_runtime_pool()
+                            .map_err(|_| unavailable())?
+                            .capture_original_arc(Arc::clone(runtime.pool()))
+                            .map_err(|_| unavailable())?;
+                        Arc::clone(runtime)
+                    } else {
+                        service.connect().await?
+                    };
                     let pool = service.migration_pool_for(&runtime).await?;
-                    let connection = pool.acquire().await.map_err(|_| unavailable())?;
-                    drop(connection); // Real borrower ends before actual SDK-close boundary.
-                    if let Some(probe) = probe.as_ref().filter(|probe| probe.fail_after_sdk) {
+                    let mut connection = Some(pool.acquire().await.map_err(|_| unavailable())?);
+                    if !probe.as_ref().is_some_and(|probe| probe.hold_connection) {
+                        drop(connection.take());
+                    }
+                    if let Some(probe) = probe
+                        .as_ref()
+                        .filter(|probe| probe.fail_after_sdk || probe.hold_after_sdk)
+                    {
                         probe.sdk_ready.notify_one();
                         probe.sdk_release.notified().await;
+                    }
+                    drop(connection); // Actual held borrower releases before body terminal.
+                    if probe.as_ref().is_some_and(|probe| probe.fail_after_sdk) {
                         std::panic::resume_unwind(Box::new("original operation SDK fault"));
                     }
                 }
@@ -429,6 +456,9 @@ impl StorageService {
 struct Probe {
     exercise_sdk: bool,
     fail_after_sdk: bool,
+    hold_after_sdk: bool,
+    hold_connection: bool,
+    shared_runtime: Option<Arc<codex_remote_storage::RemoteStorage>>,
     sdk_ready: tokio::sync::Notify,
     sdk_release: tokio::sync::Notify,
     entered: tokio::sync::Notify,

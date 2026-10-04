@@ -28,6 +28,12 @@ struct Entry {
     borrowers: Vec<Arc<Resources>>,
     closing: bool,
 }
+// Private actual cleanup evidence, separate from the preserved admission diagnostic.
+// NoStartup is constructed only under an unpoisoned actual registry observation.
+pub(crate) struct StartupCleanup {
+    _original: Option<codex_postgres_runtime::OriginalMigrationCleanupCompleted>,
+    pub(crate) refused: bool,
+}
 impl MigrationStartupRegistry {
     fn borrow_existing(
         &self,
@@ -107,32 +113,38 @@ impl MigrationStartupRegistry {
         &self,
         runtime: &Arc<RemoteStorage>,
         borrower: &Arc<Resources>,
-    ) -> Result<(), StorageError> {
-        let (original, borrowers) = {
-            let mut state = self.state.lock().map_err(|_| unavailable())?;
+    ) -> Result<StartupCleanup, StorageError> {
+        if !borrower
+            .owns_original_runtime_pool(runtime.pool())
+            .map_err(|_| unavailable())?
+        {
+            return Err(unavailable());
+        }
+        let (original, borrowers, registry_poison) = {
+            let (mut state, poison) = match self.state.lock() {
+                Ok(state) => (state, false),
+                Err(cause) => (cause.into_inner(), true),
+            };
             let Some(entry) = state
                 .originals
                 .iter_mut()
                 .find(|entry| Arc::ptr_eq(entry.original.original_runtime(), runtime.pool()))
             else {
-                // No migration SDK was produced for this original runtime.
-                return Ok(());
+                if poison {
+                    return Err(unavailable());
+                }
+                return Ok(StartupCleanup {
+                    _original: None,
+                    refused: false,
+                });
             };
-            if !entry
-                .borrowers
-                .iter()
-                .any(|saved| Arc::ptr_eq(saved, borrower))
-            {
-                return Err(unavailable());
-            }
-            // Same registry gate seals later borrows BEFORE any actual SDK close.
+            // Cleanup-only late refusal gains no borrower membership/SQL grant.
+            // Seal under the SAME gate and retain every actual admitted owner.
             entry.closing = true;
             let borrowers: [Option<Arc<Resources>>; MAX_ORIGINAL_STARTUPS] =
                 std::array::from_fn(|index| entry.borrowers.get(index).map(Arc::clone));
-            (Arc::clone(&entry.original), borrowers)
+            (Arc::clone(&entry.original), borrowers, poison)
         };
-        // The SAME retained cleanup task waits for already-admitted original bodies;
-        // no unknown/aborted body is relabeled terminal, and no close races a borrower.
         for saved in borrowers.into_iter().flatten() {
             saved
                 .wait_body_returned()
@@ -146,21 +158,51 @@ impl MigrationStartupRegistry {
         if !Arc::ptr_eq(receipt.original(), &original) {
             return Err(unavailable());
         }
-        let retain_causes = original
-            .retains_original_causes()
-            .map_err(|_| unavailable())?;
-        let mut state = self.state.lock().map_err(|_| unavailable())?;
-        if let Some(index) = state
+        // A cause-observation refusal never erases the original or its actual ACK.
+        let causes = original.retains_original_causes();
+        let (mut state, final_poison) = match self.state.lock() {
+            Ok(state) => (state, false),
+            Err(cause) => (cause.into_inner(), true),
+        };
+        let refused = registry_poison || final_poison || causes.is_err();
+        if !refused {
+            if let Some(index) = state
+                .originals
+                .iter()
+                .position(|entry| Arc::ptr_eq(&entry.original, &original))
+            {
+                let removed = state.originals.remove(index);
+                if causes.unwrap_or(true) {
+                    state.history.push(removed.original);
+                }
+            }
+        } // Poison/unknown diagnostic retains the SAME original entry and causes.
+        Ok(StartupCleanup {
+            _original: Some(receipt),
+            refused,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn poison_actual_registry(self: &Arc<Self>) {
+        let original = Arc::clone(self);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _state = original
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::panic::resume_unwind(Box::new("original startup registry poison control"));
+        }));
+    }
+    #[cfg(test)]
+    pub(crate) fn actual_entry_closing(
+        &self,
+        runtime: &Arc<PostgresPool>,
+    ) -> Result<bool, StorageError> {
+        let state = self.state.lock().map_err(|_| unavailable())?;
+        Ok(state
             .originals
             .iter()
-            .position(|entry| Arc::ptr_eq(&entry.original, &original))
-        {
-            let removed = state.originals.remove(index);
-            if retain_causes {
-                state.history.push(removed.original);
-            }
-        }
-        Ok(())
+            .any(|entry| Arc::ptr_eq(entry.original.original_runtime(), runtime) && entry.closing))
     }
     pub(crate) fn causes_for_runtime(
         &self,
