@@ -38,6 +38,7 @@ pub(super) enum CommandCause {
     MissingSession,
     UnknownStatus,
     Wait(tokio::sync::AcquireError),
+    Catalog(catalog::PayloadRefusal),
 }
 
 struct State {
@@ -51,6 +52,7 @@ struct State {
     xid: Option<String>,
     raw_rows: Option<Vec<PgRow>>,
     raw_catalog: [Option<Vec<PgRow>>; 6],
+    catalog_payload_bytes: usize,
     observed_status: Option<Option<String>>,
     commit_attempted: bool,
     rollback_attempted: bool,
@@ -94,6 +96,9 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
                 CommandCause::Wait(raw) => {
                     let _ = raw;
                 }
+                CommandCause::Catalog(raw) => {
+                    let _ = raw;
+                }
                 CommandCause::MissingSession | CommandCause::UnknownStatus => {}
             }
         }
@@ -101,6 +106,7 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
             &state.joined_failure,
             &state.raw_rows,
             &state.raw_catalog,
+            state.catalog_payload_bytes,
             &state.raw_stamp,
             &state.native_baseline,
             &state.xid,
@@ -215,6 +221,7 @@ impl OriginalAdministrativeCommand {
                 xid: None,
                 raw_rows: None,
                 raw_catalog: std::array::from_fn(|_| None),
+                catalog_payload_bytes: 0,
                 observed_status: None,
                 commit_attempted: false,
                 rollback_attempted: false,
@@ -419,6 +426,20 @@ impl OriginalAdministrativeCommand {
                             || rows.len() > statement.rows
                             || (index == 0 && rows.is_empty());
                         state.raw_catalog[index] = Some(rows); // Before ANY decode/refusal.
+                        let measured = match state.raw_catalog[index].as_ref() {
+                            Some(rows) => {
+                                catalog::retained_payload_bytes(rows, state.catalog_payload_bytes)
+                            }
+                            None => Err(catalog::PayloadRefusal::MissingSnapshot),
+                        };
+                        match measured {
+                            Ok(bytes) => state.catalog_payload_bytes = bytes,
+                            Err(raw) => {
+                                drop(state);
+                                self.cause(CommandCause::Catalog(raw));
+                                break;
+                            }
+                        }
                         if index == 1 {
                             state.raw_catalog[index].as_ref().map(|rows| {
                                 rows.iter()

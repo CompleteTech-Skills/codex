@@ -9,6 +9,73 @@ pub(super) struct Statement {
     pub(super) sql: &'static str,
     pub(super) rows: usize,
 }
+
+// Limits semantic inspection of retained native values, not prior SQLx receive
+// allocation, row overhead, or server-side aggregate construction.
+pub(super) const PAYLOAD_BUDGET: usize = 8 * 1024 * 1024;
+
+pub(super) enum PayloadRefusal {
+    MissingSnapshot,
+    Driver(sqlx::Error),
+    NativeValue(Box<dyn std::error::Error + Send + Sync>),
+    Budget {
+        retained_before: usize,
+        next_value_bytes: usize,
+    },
+}
+
+pub(super) fn retained_payload_bytes(
+    rows: &[sqlx::postgres::PgRow],
+    retained_before: usize,
+) -> Result<usize, PayloadRefusal> {
+    use sqlx::Row;
+    use sqlx::ValueRef;
+
+    let mut total = retained_before;
+    for row in rows {
+        for index in 0..row.columns().len() {
+            let value = row.try_get_raw(index).map_err(PayloadRefusal::Driver)?;
+            if value.is_null() {
+                continue;
+            }
+            let bytes = value.as_bytes().map_err(PayloadRefusal::NativeValue)?.len();
+            let next = total
+                .checked_add(bytes)
+                .filter(|next| *next <= PAYLOAD_BUDGET);
+            match next {
+                Some(next) => total = next,
+                None => {
+                    return Err(PayloadRefusal::Budget {
+                        retained_before: total,
+                        next_value_bytes: bytes,
+                    });
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+impl std::fmt::Debug for PayloadRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSnapshot => {}
+            Self::Driver(raw) => {
+                let _ = raw;
+            }
+            Self::NativeValue(raw) => {
+                let _ = raw;
+            }
+            Self::Budget {
+                retained_before,
+                next_value_bytes,
+            } => {
+                let _ = (retained_before, next_value_bytes);
+            }
+        }
+        formatter.write_str("CatalogPayloadRefused([native values retained])")
+    }
+}
 pub(super) const STATEMENTS: [Statement; 6] = [
     Statement {
         rows: 64,
