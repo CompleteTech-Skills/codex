@@ -18,6 +18,10 @@ pub struct BootstrapSessionOwner {
     join: Arc<Semaphore>,
     #[cfg(test)]
     stamp_probe: Mutex<Option<Arc<StampProbe>>>,
+    #[cfg(test)]
+    commit_probe: Mutex<Option<Arc<StampProbe>>>,
+    #[cfg(test)]
+    outcome_probe: Mutex<Option<Arc<StampProbe>>>,
 }
 struct State {
     sealed: bool,
@@ -41,6 +45,10 @@ impl BootstrapSessionOwner {
             join: Arc::new(Semaphore::new(1)),
             #[cfg(test)]
             stamp_probe: Mutex::new(None),
+            #[cfg(test)]
+            commit_probe: Mutex::new(None),
+            #[cfg(test)]
+            outcome_probe: Mutex::new(None),
             state: Mutex::new(State {
                 sealed: false,
                 cleanup_complete: false,
@@ -233,6 +241,8 @@ impl BootstrapSessionOwner {
             .xid
             .clone()
             .ok_or(BootstrapError::Migration)?;
+        #[cfg(test)]
+        self.wait_probe(&self.commit_probe).await;
         self.query(sqlx::query("COMMIT").execute(&mut *transaction), false)
             .await?;
         let status = self
@@ -262,11 +272,21 @@ impl BootstrapSessionOwner {
         if poison {
             return Err(BootstrapError::Migration);
         }
+        #[cfg(test)]
+        self.wait_probe(&self.outcome_probe).await;
         self.query(transaction.rollback(), false).await?;
         if !committed {
             return Err(BootstrapError::Migration);
         }
         Ok(())
+    }
+    #[cfg(test)]
+    async fn wait_probe(&self, slot: &Mutex<Option<Arc<StampProbe>>>) {
+        let probe = slot.lock().ok().and_then(|probe| probe.clone());
+        if let Some(probe) = probe {
+            probe.entered.notify_one();
+            probe.release.notified().await;
+        }
     }
     /// Seal new loans, reconcile the SAME session, then release it to its own pool.
     /// SDK/task caller must retain this owner through cancellation and uncertainty.

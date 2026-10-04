@@ -123,11 +123,13 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
                     }
                 } else {
                     let probe = Arc::new(StampProbe::default());
-                    *owner
-                        .stamp_probe
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(Arc::clone(&probe));
+                    *match fault {
+                        3 => &owner.commit_probe,
+                        4 => &owner.outcome_probe,
+                        _ => &owner.stamp_probe,
+                    }
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&probe));
                     let actual = Arc::clone(&owner);
                     let selected = namespace.clone();
                     let start = Arc::new(tokio::sync::Notify::new());
@@ -237,7 +239,7 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
     }
     if !covers
         || refused != (fault == 2)
-        || !matches!(outcome, Some((_, committed)) if committed == (fault == 0))
+        || !matches!(outcome, Some((_, committed)) if committed == (fault == 0 || fault == 4))
     {
         return Err(Box::new(Failure {
             original: owner,
@@ -284,4 +286,53 @@ async fn actual_named_xid_abort_and_poison_reconcile_original() -> Result<()> {
     let state = std::env::var("CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_STATE")?;
     selected_bootstrap(Path::new(&state), true, 1).await?;
     selected_bootstrap(Path::new(&state), true, 2).await
+}
+
+#[tokio::test]
+#[ignore = "requires a separate admitted empty default precommit fixture"]
+async fn actual_default_after_ddl_before_commit_abort() -> Result<()> {
+    selected_bootstrap(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_PRECOMMIT_STATE",
+        )?),
+        false,
+        3,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires a separate admitted empty named precommit fixture"]
+async fn actual_named_after_ddl_before_commit_abort() -> Result<()> {
+    selected_bootstrap(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_PRECOMMIT_STATE",
+        )?),
+        true,
+        3,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires a separate admitted empty default postcommit fixture"]
+async fn actual_default_committed_status_before_return_abort() -> Result<()> {
+    selected_bootstrap(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_POSTCOMMIT_STATE",
+        )?),
+        false,
+        4,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires a separate admitted empty named postcommit fixture"]
+async fn actual_named_committed_status_before_return_abort() -> Result<()> {
+    selected_bootstrap(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_POSTCOMMIT_STATE",
+        )?),
+        true,
+        4,
+    )
+    .await
 }
