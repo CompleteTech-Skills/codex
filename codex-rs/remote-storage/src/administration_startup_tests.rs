@@ -9,7 +9,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
-struct Failure {
+pub(crate) struct Failure {
     original: Option<Arc<OriginalAdministrativeStartup>>,
     admission: Option<AdministrativeStartupRefusal>,
     cleanup: Option<AdministrativeStartupRefusal>,
@@ -37,12 +37,19 @@ fn input_failure(code: &'static str) -> Failure {
         input: Some(code),
     }
 }
-fn input(named: bool) -> Result<Arc<RemoteAdministrationInput>, Failure> {
+pub(crate) fn input(named: bool) -> Result<Arc<RemoteAdministrationInput>, Failure> {
     let variable = if named {
         "CODEX_REAL_EXTERNAL_ADMIN_NAMED_INPUT"
     } else {
         "CODEX_REAL_EXTERNAL_ADMIN_INPUT"
     };
+    input_at(named, variable)
+}
+
+pub(crate) fn input_at(
+    named: bool,
+    variable: &str,
+) -> Result<Arc<RemoteAdministrationInput>, Failure> {
     let path = PathBuf::from(
         std::env::var_os(variable)
             .ok_or_else(|| input_failure("explicit external admin input required"))?,

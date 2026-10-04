@@ -499,4 +499,4 @@ impl OriginalAdministrativeStartup {
 
 #[cfg(test)]
 #[path = "administration_startup_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -22,6 +22,7 @@ enum Slot {
     },
     Archived(Arc<OriginalAdministrativeStartup>),
 }
+
 struct State {
     slots: [Slot; CAPACITY],
     hold: Option<Arc<OriginalAdministrativeRegistry>>,
@@ -295,3 +296,7 @@ impl OriginalAdministrativeRegistry {
         Ok(archive)
     }
 }
+
+#[cfg(test)]
+#[path = "administration_registry_tests.rs"]
+mod tests;
