@@ -4204,7 +4204,17 @@ impl Session {
         &self,
         step_context: &StepContext,
         world_state: &WorldState,
-    ) -> (Vec<ResponseItem>, WorldStateSnapshot) {
+    ) -> CodexResult<(Vec<ResponseItem>, WorldStateSnapshot)> {
+        self.build_initial_context_for_window(step_context, world_state, None)
+            .await
+    }
+
+    pub(crate) async fn build_initial_context_for_window(
+        &self,
+        step_context: &StepContext,
+        world_state: &WorldState,
+        prepared_ids: Option<AutoCompactWindowIds>,
+    ) -> CodexResult<(Vec<ResponseItem>, WorldStateSnapshot)> {
         let turn_context = step_context.turn.as_ref();
         let mut developer_sections = Vec::<RenderedFragment>::with_capacity(8);
         let mut contextual_user_sections = Vec::<RenderedFragment>::with_capacity(2);
@@ -4214,7 +4224,7 @@ impl Session {
             let state = self.state.lock().await;
             (
                 state.session_configuration.session_source.clone(),
-                state.auto_compact_window_ids(),
+                prepared_ids.unwrap_or_else(|| state.auto_compact_window_ids()),
             )
         };
         let separate_guardian_developer_message =
@@ -4257,11 +4267,11 @@ impl Session {
         let context_contributors = self.services.extensions.context_contributors().to_vec();
         for contributor in &context_contributors {
             for fragment in contributor
-                .contribute_thread_context(
+                .contribute_thread_context_checked(
                     &self.services.session_extension_data,
                     &self.services.thread_extension_data,
                 )
-                .await
+                .await?
             {
                 match fragment.slot() {
                     PromptSlot::ContextWindow => {
@@ -4438,7 +4448,7 @@ impl Session {
         for item in &mut items {
             item.set_turn_id_if_missing(&turn_context.sub_id);
         }
-        (items, world_state_snapshot)
+        Ok((items, world_state_snapshot))
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -4489,6 +4499,19 @@ impl Session {
         )
     }
 
+    pub(crate) async fn prepare_context_window(&self) -> crate::state::PreparedContextWindow {
+        self.state.lock().await.prepare_context_window()
+    }
+    pub(crate) async fn commit_context_window(
+        &self,
+        prepared: crate::state::PreparedContextWindow,
+        clear_prefill: bool,
+    ) -> CodexResult<(u64, AutoCompactWindowIds)> {
+        let mut state = self.state.lock().await;
+        Ok(prepared.commit(&mut state, clear_prefill)?)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn advance_auto_compact_window(&self) -> (u64, AutoCompactWindowIds) {
         let mut state = self.state.lock().await;
         state.advance_auto_compact_window()
@@ -4499,16 +4522,15 @@ impl Session {
         state.request_new_context_window();
     }
 
-    pub(crate) async fn take_new_context_window_request(&self) -> bool {
-        let mut state = self.state.lock().await;
-        state.take_new_context_window_request()
+    pub(crate) async fn new_context_window_requested(&self) -> bool {
+        self.state.lock().await.new_context_window_requested()
     }
 
     pub(crate) async fn start_new_context_window(
         &self,
         step_context: &StepContext,
         world_state: Arc<WorldState>,
-    ) -> u64 {
+    ) -> CodexResult<u64> {
         let turn_context = step_context.turn.as_ref();
         let history = self.clone_history().await;
         let input_goal_ids = crate::context::UserGoalUpdate::message_ids(history.raw_items());
@@ -4528,14 +4550,16 @@ impl Session {
             } else {
                 Vec::new()
             };
-        let window = {
-            let mut state = self.state.lock().await;
-            state.start_new_context_window()
-        };
-        let (window_number, window_ids) = window;
+        let prepared = self.prepare_context_window().await;
         let (context_items, world_state_snapshot) = self
-            .build_initial_context_with_world_state(step_context, world_state.as_ref())
-            .await;
+            .build_initial_context_for_window(
+                step_context,
+                world_state.as_ref(),
+                Some(prepared.ids()),
+            )
+            .await?;
+        let window = self.commit_context_window(prepared, true).await?;
+        let (window_number, window_ids) = window;
         let context_items = context_items
             .into_iter()
             .map(ResponseItemEnvelope::new)
@@ -4558,7 +4582,7 @@ impl Session {
         )
         .await;
         self.recompute_token_usage(turn_context).await;
-        window_number
+        Ok(window_number)
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -4597,7 +4621,7 @@ impl Session {
         let (mut context_items, world_state_item) = if should_inject_full_context {
             let (context_items, snapshot) = self
                 .build_initial_context_with_world_state(step_context, world_state.as_ref())
-                .await;
+                .await?;
             self.state
                 .lock()
                 .await

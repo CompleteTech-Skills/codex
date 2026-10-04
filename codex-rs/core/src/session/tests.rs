@@ -4022,7 +4022,8 @@ async fn start_new_context_window_persists_checkpoint_state() {
     let expected_snapshot = world_state.render_full().0.into_object();
     session
         .start_new_context_window(&step_context, world_state)
-        .await;
+        .await
+        .expect("fallible context should succeed");
 
     let live_history = session.clone_history().await;
     assert_eq!(
@@ -6671,6 +6672,7 @@ async fn build_initial_context(
     session
         .build_initial_context_with_world_state(&step_context, &world_state)
         .await
+        .expect("fallible context should succeed")
         .0
 }
 
@@ -10581,7 +10583,8 @@ async fn build_initial_context_reuses_in_flight_recommendation_prewarm() {
     tokio::pin!(initial_context);
     assert!(futures::poll!(initial_context.as_mut()).is_pending());
 
-    let (_, (initial_context, _)) = tokio::join!(prewarm, initial_context);
+    let (_, initial_context) = tokio::join!(prewarm, initial_context);
+    let (initial_context, _) = initial_context.expect("fallible context should succeed");
     assert_eq!(
         developer_input_texts(&initial_context)
             .into_iter()
@@ -11316,8 +11319,9 @@ async fn build_initial_context_uses_retained_step_after_model_change() {
         world_state: Arc::clone(&world_a),
         step_context: Arc::clone(&step_a),
     };
-    let (initial_a, _) =
-        crate::compact::build_compaction_initial_context(&session, &retained).await;
+    let (initial_a, _) = crate::compact::build_compaction_initial_context(&session, &retained)
+        .await
+        .expect("fallible context should succeed");
 
     let mut selected_b = step_a.settings.selected().clone();
     selected_b.collaboration_mode.settings.model = "model-b".to_string();
@@ -11345,10 +11349,13 @@ async fn build_initial_context_uses_retained_step_after_model_change() {
     let initial_b = session
         .build_initial_context_with_world_state(&step_b, &world_b)
         .await
+        .expect("fallible context should succeed")
         .0;
     let turn_contributions_b = session.build_turn_context_contribution_items(&step_b).await;
     let (restored_a, restored_snapshot) =
-        crate::compact::build_compaction_initial_context(&session, &retained).await;
+        crate::compact::build_compaction_initial_context(&session, &retained)
+            .await
+            .expect("fallible context should succeed");
 
     assert_eq!(restored_a, initial_a);
     assert_eq!(restored_snapshot, Some(world_a.render_full().0));
@@ -13419,4 +13426,129 @@ async fn rejected_mcp_refresh_then_corrected_user_config_blocks_ordinary_replace
             .is_some_and(|server| server.enabled),
         "rejection must not permit same-name ordinary-auth replacement in this session"
     );
+}
+
+struct LateCheckedContextFailure(Arc<std::io::Error>);
+impl codex_extension_api::ContextContributor for LateCheckedContextFailure {
+    fn contribute_thread_context_checked<'a>(
+        &'a self,
+        _: &'a codex_extension_api::ExtensionData,
+        _: &'a codex_extension_api::ExtensionData,
+    ) -> codex_extension_api::ExtensionFuture<
+        'a,
+        std::io::Result<Vec<codex_extension_api::PromptFragment>>,
+    > {
+        Box::pin(async move { Err(std::io::Error::other(Arc::clone(&self.0))) })
+    }
+}
+
+#[tokio::test]
+async fn late_checked_context_failure_preserves_history_window_and_request() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let raw = Arc::new(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "selected summary failure",
+    ));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(PromptExtensionTestContributor));
+    builder.prompt_contributor(Arc::new(LateCheckedContextFailure(Arc::clone(&raw))));
+    session.services.extensions = Arc::new(builder.build());
+    session
+        .services
+        .thread_extension_data
+        .insert(PromptExtensionTestState);
+    session
+        .record_conversation_items(
+            &turn_context,
+            turn_context.model_info(),
+            &[user_message("retain prior history")],
+        )
+        .await;
+    let step = session
+        .capture_step_context(Arc::new(turn_context), &CancellationToken::new())
+        .await
+        .unwrap();
+    let world = Arc::new(session.build_world_state_for_step(&step).await.unwrap());
+    session.request_new_context_window().await;
+    let before = session.clone_history().await;
+    let ids = session.state.lock().await.auto_compact_window_ids();
+    let error = session
+        .start_new_context_window(&step, Arc::clone(&world))
+        .await
+        .unwrap_err();
+    let CodexErrorDetails::Io(error) = error.details() else {
+        panic!("expected original IO refusal")
+    };
+    let retained = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<Arc<std::io::Error>>()
+        .unwrap();
+    assert!(Arc::ptr_eq(retained, &raw));
+    assert_eq!(
+        session.clone_history().await.annotated_items(),
+        before.annotated_items()
+    );
+    assert_eq!(session.state.lock().await.auto_compact_window_ids(), ids);
+    assert!(session.new_context_window_requested().await);
+    assert!(
+        session
+            .record_context_updates_and_set_reference_context_item(&step)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        session.clone_history().await.annotated_items(),
+        before.annotated_items()
+    );
+    assert_eq!(session.state.lock().await.auto_compact_window_ids(), ids);
+    assert!(session.new_context_window_requested().await);
+    let retained = crate::compact::InitialContextInjection::BeforeLastUserMessage {
+        world_state: world,
+        step_context: step,
+    };
+    assert!(
+        crate::compact::build_compaction_initial_context(&session, &retained)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        session.clone_history().await.annotated_items(),
+        before.annotated_items()
+    );
+    assert_eq!(session.state.lock().await.auto_compact_window_ids(), ids);
+    assert!(session.new_context_window_requested().await);
+}
+
+#[tokio::test]
+async fn prepared_context_window_commits_exact_rendered_ids_and_rejects_stale_predecessor() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    Arc::make_mut(&mut turn_context.config)
+        .features
+        .enable(Feature::TokenBudget)
+        .unwrap();
+    let step = session
+        .capture_step_context(Arc::new(turn_context), &CancellationToken::new())
+        .await
+        .unwrap();
+    let world = session.build_world_state_for_step(&step).await.unwrap();
+    let prepared = session.prepare_context_window().await;
+    let ids = prepared.ids();
+    let stale = session.prepare_context_window().await;
+    let (items, _) = session
+        .build_initial_context_for_window(&step, &world, Some(ids))
+        .await
+        .unwrap();
+    assert!(
+        developer_input_texts(&items)
+            .join("\n")
+            .contains(&ids.window_id.to_string())
+    );
+    let (_, committed) = session.commit_context_window(prepared, true).await.unwrap();
+    assert_eq!(committed, ids);
+    assert_eq!(session.state.lock().await.auto_compact_window_ids(), ids);
+    session.request_new_context_window().await;
+    assert!(session.commit_context_window(stale, true).await.is_err());
+    assert_eq!(session.state.lock().await.auto_compact_window_ids(), ids);
+    assert!(session.new_context_window_requested().await);
 }

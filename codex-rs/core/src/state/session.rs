@@ -28,6 +28,43 @@ use codex_protocol::protocol::TurnContextItem;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
+/// Prepared successor is private: render its IDs before committing any live mutation.
+pub(crate) struct PreparedContextWindow {
+    predecessor_number: u64,
+    predecessor_ids: AutoCompactWindowIds,
+    successor: AutoCompactWindow,
+}
+impl PreparedContextWindow {
+    pub(crate) fn ids(&self) -> AutoCompactWindowIds {
+        self.successor.ids()
+    }
+    pub(crate) fn commit(
+        self,
+        state: &mut SessionState,
+        clear_prefill: bool,
+    ) -> std::io::Result<(u64, AutoCompactWindowIds)> {
+        if state.auto_compact_window.window_number() != self.predecessor_number
+            || state.auto_compact_window.ids() != self.predecessor_ids
+        {
+            return Err(std::io::Error::other(
+                "context window predecessor changed during rendering",
+            ));
+        }
+        // Advance the current accounting state with the already-rendered ID;
+        // do not replace token usage observed while rendering with a snapshot.
+        state
+            .auto_compact_window
+            .advance_with_window_id(self.successor.ids().window_id);
+        if clear_prefill {
+            state.auto_compact_window.clear_prefill();
+        }
+        Ok((
+            state.auto_compact_window.window_number(),
+            state.auto_compact_window.ids(),
+        ))
+    }
+}
+
 /// Runtime request effort, initially unset and established by prewarm or sampling.
 /// Successful compaction allows a fresh baseline without an override.
 pub(crate) enum ReasoningEffortPin {
@@ -286,6 +323,16 @@ impl SessionState {
         self.auto_compact_window.claim_auto_compact_fallback()
     }
 
+    pub(crate) fn prepare_context_window(&self) -> PreparedContextWindow {
+        let mut successor = self.auto_compact_window;
+        successor.advance();
+        PreparedContextWindow {
+            predecessor_number: self.auto_compact_window.window_number(),
+            predecessor_ids: self.auto_compact_window.ids(),
+            successor,
+        }
+    }
+
     pub(crate) fn auto_compact_window_number(&self) -> u64 {
         self.auto_compact_window.window_number()
     }
@@ -302,6 +349,7 @@ impl SessionState {
         self.auto_compact_window.restore(window_number, ids);
     }
 
+    #[cfg(test)]
     pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
         self.auto_compact_window.advance()
     }
@@ -310,14 +358,8 @@ impl SessionState {
         self.auto_compact_window.request_new_context_window();
     }
 
-    pub(crate) fn take_new_context_window_request(&mut self) -> bool {
-        self.auto_compact_window.take_new_context_window_request()
-    }
-
-    pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        let window = self.auto_compact_window.advance();
-        self.auto_compact_window.clear_prefill();
-        window
+    pub(crate) fn new_context_window_requested(&self) -> bool {
+        self.auto_compact_window.new_context_window_requested()
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {

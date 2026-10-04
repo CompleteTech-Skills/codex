@@ -53,24 +53,72 @@ impl MemoriesExtensionConfig {
     }
 }
 
+/// Immutable backend association captured before context/tool lookup. A
+/// RemoteRequired value cannot fall through to a local filesystem backend.
+enum SelectedSummaryBackend {
+    Local,
+    RemoteRequired(Option<Arc<codex_core::RemoteBackend>>),
+}
+impl SelectedSummaryBackend {
+    fn capture() -> Self {
+        match codex_core::remote_backend() {
+            Some(original) => Self::RemoteRequired(Some(Arc::new(original.clone()))),
+            None => Self::Local,
+        }
+    }
+}
+struct MissingRemoteSummaryProvider {
+    version: MemoryVersion,
+    original: Option<Arc<codex_core::RemoteBackend>>,
+}
+impl std::fmt::Debug for MissingRemoteSummaryProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = &self.original;
+        f.debug_struct("MissingRemoteSummaryProvider")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+impl std::fmt::Display for MissingRemoteSummaryProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "selected {:?} remote memory artifact provider is unavailable",
+            self.version
+        )
+    }
+}
+impl std::error::Error for MissingRemoteSummaryProvider {}
+
 impl ContextContributor for MemoriesExtension {
-    fn contribute_thread_context<'a>(
+    fn contribute_thread_context_checked<'a>(
         &'a self,
         _session_store: &'a ExtensionData,
         thread_store: &'a ExtensionData,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<PromptFragment>> + Send + 'a>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<Vec<PromptFragment>>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let Some(config) = thread_store.get::<MemoriesExtensionConfig>() else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
             if !config.enabled {
-                return Vec::new();
+                return Ok(Vec::new());
             }
 
+            let selected = thread_store.get_or_init(SelectedSummaryBackend::capture);
+            if let SelectedSummaryBackend::RemoteRequired(original) = selected.as_ref() {
+                // No native artifact implementation exists yet. Refuse before
+                // ANY local summary read; retain the same selected association.
+                return Err(std::io::Error::other(MissingRemoteSummaryProvider {
+                    version: config.version,
+                    original: original.clone(),
+                }));
+            }
             let Some(instructions) =
                 build_memory_tool_developer_instructions(&config.codex_home, config.version).await
             else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
             let instructions = match config.version {
                 MemoryVersion::V1 => vec![instructions],
@@ -89,7 +137,7 @@ impl ContextContributor for MemoriesExtension {
                     fragments
                 }
             };
-            instructions
+            Ok(instructions
                 .into_iter()
                 .map(|instructions| {
                     PromptFragment::developer_policy(
@@ -97,7 +145,7 @@ impl ContextContributor for MemoriesExtension {
                         ContentItemKind("memories.instructions".to_string()),
                     )
                 })
-                .collect()
+                .collect())
         })
     }
 }
@@ -108,6 +156,9 @@ impl ThreadLifecycleContributor<Config> for MemoriesExtension {
         input: ThreadStartInput<'a, Config>,
     ) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            input
+                .thread_store
+                .get_or_init(SelectedSummaryBackend::capture);
             input
                 .thread_store
                 .insert(MemoriesExtensionConfig::from_config(input.config));
@@ -147,6 +198,12 @@ impl ToolContributor for MemoriesExtension {
             return Vec::new();
         }
 
+        let selected = thread_store.get_or_init(SelectedSummaryBackend::capture);
+        if matches!(selected.as_ref(), SelectedSummaryBackend::RemoteRequired(_)) {
+            // Checked context blocks the actual turn with an owning refusal.
+            // Do not construct local tool backends in that remote mode.
+            return Vec::new();
+        }
         tools::memory_tools(
             LocalMemoriesBackend::from_memory_root(
                 config
@@ -169,4 +226,45 @@ pub fn install(
     registry.config_contributor(extension.clone());
     registry.prompt_contributor(extension.clone());
     registry.tool_contributor(extension);
+}
+
+#[cfg(test)]
+mod checked_backend_tests {
+    use super::*;
+    #[tokio::test]
+    async fn remote_required_refuses_before_local_summary_or_tool_lookup() {
+        let home = tempfile::tempdir().unwrap();
+        let home = AbsolutePathBuf::from_absolute_path(home.path()).unwrap();
+        for version in [MemoryVersion::V1, MemoryVersion::V2] {
+            let directory = home.join(version.directory_name());
+            tokio::fs::create_dir_all(&directory).await.unwrap();
+            tokio::fs::write(directory.join("memory_summary.md"), [0xff])
+                .await
+                .unwrap();
+            let thread = ExtensionData::new("thread");
+            thread.insert(MemoriesExtensionConfig {
+                enabled: true,
+                dedicated_tools: true,
+                codex_home: home.clone(),
+                version,
+            });
+            thread.insert(SelectedSummaryBackend::RemoteRequired(None));
+            let session = ExtensionData::new("session");
+            let extension = MemoriesExtension::default();
+            let error = extension
+                .contribute_thread_context_checked(&session, &thread)
+                .await
+                .unwrap_err();
+            let cause = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<MissingRemoteSummaryProvider>()
+                .unwrap();
+            assert_eq!(cause.version, version);
+            assert!(extension.tools(&session, &thread).is_empty());
+            // A local read would instead expose InvalidData; the unavailable
+            // provider is the actual earlier checked boundary.
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        }
+    }
 }

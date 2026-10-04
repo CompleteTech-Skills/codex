@@ -89,10 +89,19 @@ pub(crate) struct CompactedHistoryMetadata {
     pub(crate) reviewer_compaction_hash: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) async fn build_compaction_initial_context(
     sess: &Session,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItemEnvelope>, Option<WorldStateSnapshot>) {
+) -> CodexResult<(Vec<ResponseItemEnvelope>, Option<WorldStateSnapshot>)> {
+    build_compaction_initial_context_for_window(sess, initial_context_injection, None).await
+}
+
+pub(crate) async fn build_compaction_initial_context_for_window(
+    sess: &Session,
+    initial_context_injection: &InitialContextInjection,
+    prepared_ids: Option<crate::state::AutoCompactWindowIds>,
+) -> CodexResult<(Vec<ResponseItemEnvelope>, Option<WorldStateSnapshot>)> {
     // Return the rendered state with its items so history and its baseline stay identical.
     match initial_context_injection {
         InitialContextInjection::BeforeLastUserMessage {
@@ -100,14 +109,14 @@ pub(crate) async fn build_compaction_initial_context(
             step_context,
         } => {
             let (items, snapshot) = sess
-                .build_initial_context_with_world_state(step_context, world_state.as_ref())
-                .await;
-            (
+                .build_initial_context_for_window(step_context, world_state.as_ref(), prepared_ids)
+                .await?;
+            Ok((
                 items.into_iter().map(ResponseItemEnvelope::new).collect(),
                 Some(snapshot),
-            )
+            ))
         }
-        InitialContextInjection::DoNotInject => (Vec::new(), None),
+        InitialContextInjection::DoNotInject => Ok((Vec::new(), None)),
     }
 }
 
@@ -368,10 +377,14 @@ async fn run_compact_task_inner_impl(
         // belongs to this compaction turn.
         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
     }
-    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
-
-    let (initial_context, world_state_baseline) =
-        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
+    let prepared = sess.prepare_context_window().await;
+    let (initial_context, world_state_baseline) = build_compaction_initial_context_for_window(
+        sess.as_ref(),
+        &initial_context_injection,
+        Some(prepared.ids()),
+    )
+    .await?;
+    let (window_number, window_ids) = sess.commit_context_window(prepared, false).await?;
     if !initial_context.is_empty() {
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);

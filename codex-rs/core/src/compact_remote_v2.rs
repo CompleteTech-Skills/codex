@@ -8,7 +8,6 @@ use crate::compact::CompactedHistoryMetadata;
 use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
-use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::compact_model_fallback::record_model_fallback;
@@ -321,9 +320,15 @@ async fn run_remote_compact_task_inner_impl(
         },
     );
     analytics_details.retained_image_count = Some(retained_images);
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
+    let prepared = sess.prepare_context_window().await;
     let (initial_context, world_state_baseline) =
-        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
+        crate::compact::build_compaction_initial_context_for_window(
+            sess.as_ref(),
+            &initial_context_injection,
+            Some(prepared.ids()),
+        )
+        .await?;
+    let (new_window_number, new_window_ids) = sess.commit_context_window(prepared, false).await?;
     let new_history =
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
 

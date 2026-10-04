@@ -194,8 +194,9 @@ async fn prompt_contribution_uses_memory_summary_when_enabled() {
     });
 
     let fragments = extension
-        .contribute_thread_context(&ExtensionData::new("session"), &thread_store)
-        .await;
+        .contribute_thread_context_checked(&ExtensionData::new("session"), &thread_store)
+        .await
+        .expect("local memory context should succeed");
 
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].slot(), PromptSlot::DeveloperPolicy);

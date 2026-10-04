@@ -370,6 +370,7 @@ async fn ignores_session_prefix_messages_when_truncating_rollout_from_start() {
     let mut items = session
         .build_initial_context_with_world_state(&step_context, &world_state)
         .await
+        .expect("fallible context should succeed")
         .0;
     items.push(user_msg("feature request"));
     items.push(assistant_msg("ack"));

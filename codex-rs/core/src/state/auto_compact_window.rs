@@ -75,9 +75,16 @@ impl AutoCompactWindow {
     }
 
     pub(super) fn advance(&mut self) -> (u64, AutoCompactWindowIds) {
+        self.advance_with_window_id(Uuid::now_v7())
+    }
+
+    pub(super) fn advance_with_window_id(
+        &mut self,
+        window_id: Uuid,
+    ) -> (u64, AutoCompactWindowIds) {
         self.window_number = self.window_number.saturating_add(1);
         self.ids.previous_window_id = Some(self.ids.window_id);
-        self.ids.window_id = Uuid::now_v7();
+        self.ids.window_id = window_id;
         self.new_context_window_requested = false;
         self.token_budget_reminder_delivered = false;
         self.auto_compact_fallback_delivered = false;
@@ -96,6 +103,11 @@ impl AutoCompactWindow {
         self.new_context_window_requested = true;
     }
 
+    pub(super) fn new_context_window_requested(&self) -> bool {
+        self.new_context_window_requested
+    }
+
+    #[cfg(test)]
     pub(super) fn take_new_context_window_request(&mut self) -> bool {
         let requested = self.new_context_window_requested;
         self.new_context_window_requested = false;

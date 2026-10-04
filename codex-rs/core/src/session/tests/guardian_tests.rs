@@ -1125,7 +1125,8 @@ async fn compaction_initial_context_preserves_separate_guardian_developer_messag
 
     let (refreshed, _) =
         crate::compact::build_compaction_initial_context(&session, &initial_context_injection)
-            .await;
+            .await
+            .expect("fallible context should succeed");
 
     let developer_messages = refreshed
         .iter()

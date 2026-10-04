@@ -683,7 +683,10 @@ async fn submitted_sparse_updates_preserve_captured_steps_and_ordering() {
             session.reference_context_item().await.unwrap().summary,
             step.settings.reasoning_summary,
         );
-        session.start_new_context_window(step, world_state).await;
+        session
+            .start_new_context_window(step, world_state)
+            .await
+            .expect("fallible context should succeed");
         assert_eq!(
             session.reference_context_item().await.unwrap().summary,
             step.settings.reasoning_summary,

@@ -599,7 +599,7 @@ pub(crate) async fn run_turn(
                 }
 
                 let should_roll_over = needs_follow_up
-                    && (sess.take_new_context_window_request().await || token_limit_reached);
+                    && (sess.new_context_window_requested().await || token_limit_reached);
                 let allow_auto_compact_fallback = !should_roll_over && !token_limit_reached;
                 super::token_budget::maybe_record(
                     sess.as_ref(),
