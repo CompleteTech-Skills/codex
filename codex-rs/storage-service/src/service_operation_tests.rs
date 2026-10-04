@@ -572,3 +572,101 @@ async fn missing_original_reaper_handle_never_mints_terminal_ack() -> ControlRes
     }
     Ok(())
 }
+
+// Fresh production capture must reclaim actual ready handles, without later per-RPC finish.
+async fn selected_thirty_two_automatic_sdk_cycles(
+    state: &std::path::Path,
+    namespace: &str,
+    prefix: &str,
+) -> ControlResult<()> {
+    let home = tempfile::tempdir()?.keep();
+    let service = sdk_service(&home, state, namespace, prefix)?;
+    let mut originals: Vec<Arc<Original>> = Vec::new();
+    originals.try_reserve(32)?;
+    let verdict: ControlResult<()> = async {
+        for _ in 0..32 {
+            let id = active(&service)?;
+            let probe = Arc::new(Probe { exercise_sdk: true, ..Probe::default() });
+            *service.original_operations.probe.lock().map_err(|_| "probe poisoned")? = Some(Arc::clone(&probe));
+            let original = service.original_operations.capture(service.operation_context(), Kind::Activate, Some(id), None)?;
+            originals.push(Arc::clone(&original)); // Before any fallible observation/await.
+            let entered = tokio::time::timeout(Duration::from_secs(5), probe.entered.notified()).await;
+            let mut caller = Box::pin(service.original_operations.finish(Arc::clone(&original)));
+            let early = tokio::select! { biased; _ = &mut caller => true, _ = tokio::task::yield_now() => false };
+            drop(caller); // No replacement command or per-operation finish drives progress.
+            probe.release.notify_one();
+            let automatic = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let ready_candidate = {
+                        let state = original.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.task.is_none() && state.result.is_some() && state.failure.is_none() &&
+                            state.reaper.as_ref().is_some_and(JoinHandle::is_finished)
+                    };
+                    // is_finished is only a scheduling candidate. NEXT actual capture
+                    // must physically poll this SAME handle Ready before reclamation.
+                    if ready_candidate && original.resources.cleanup_completed() { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await;
+            if entered.is_err() || early || automatic.is_err() { return Err("automatic production SDK cycle did not complete".into()); }
+            if originals.len() > 1 {
+                let previous = &originals[originals.len() - 2];
+                let physically_reaped = {
+                    let state = previous.state.lock().map_err(|_| "previous state poisoned")?;
+                    state.reaper_terminal && state.reaper.is_none() && state.reaper_failure.is_none()
+                };
+                if !physically_reaped { return Err("fresh capture did not physically reap same original cleanup task".into()); }
+            }
+        }
+        Ok(())
+    }.await;
+    // Reconcile every SAME retained original before ALL verdicts, including setup,
+    // capacity, candidate-deadline or unexpected-command failures.
+    let mut cleanup_ok = true;
+    let mut every_sdk_closed = true;
+    for original in &originals {
+        let outcome = service
+            .original_operations
+            .finish(Arc::clone(original))
+            .await;
+        cleanup_ok &= outcome.is_ok() && original.resources.cleanup_completed();
+        match original.resources.actual_runtime_sdk_snapshot() {
+            Ok(pools) => {
+                for pool in pools.iter().flatten() {
+                    every_sdk_closed &= match pool.acquire().await {
+                        Err(codex_postgres_runtime::PoolError::Closed) => true,
+                        Ok(connection) => {
+                            drop(connection);
+                            false
+                        }
+                        Err(_) => false,
+                    };
+                }
+            }
+            Err(_) => every_sdk_closed = false,
+        }
+    }
+    verdict?;
+    if originals.len() != 32 || !cleanup_ok || !every_sdk_closed {
+        return Err("automatic original SDK lifetime/reuse cleanup failed".into());
+    }
+    Ok(())
+}
+#[tokio::test]
+#[ignore = "requires ROOT admitted default SQL fixture and execution host"]
+async fn real_default_thirty_two_canceled_callers_automatic_sdk_reuse() -> ControlResult<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_OWNERSHIP_STATE")?;
+    selected_thirty_two_automatic_sdk_cycles(std::path::Path::new(&state), "codex_storage", "")
+        .await
+}
+#[tokio::test]
+#[ignore = "requires ROOT admitted named SQL fixture and execution host"]
+async fn real_named_thirty_two_canceled_callers_automatic_sdk_reuse() -> ControlResult<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_ISOLATION_STATE")?;
+    selected_thirty_two_automatic_sdk_cycles(
+        std::path::Path::new(&state),
+        "codex_storage_isolation",
+        "isolation_",
+    )
+    .await
+}
