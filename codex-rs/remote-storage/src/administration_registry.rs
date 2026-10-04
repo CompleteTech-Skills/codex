@@ -49,12 +49,21 @@ impl fmt::Debug for AdministrativeRegistryRefusal {
         formatter.write_str(self.reason)
     }
 }
+impl fmt::Display for AdministrativeRegistryRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+impl std::error::Error for AdministrativeRegistryRefusal {}
 pub struct AdministrativeObservationBorrow {
     registry: Arc<OriginalAdministrativeRegistry>,
     original: Arc<OriginalAdministrativeStartup>,
     slot: usize,
 }
 impl AdministrativeObservationBorrow {
+    pub(super) fn original_startup(&self) -> &Arc<OriginalAdministrativeStartup> {
+        &self.original
+    }
     /// Final registry observation and scoped-frame construction share the same
     /// admission mutex. No asynchronous work is dispatched by this closure.
     pub(super) fn finish_scoped<T>(
@@ -372,6 +381,21 @@ impl OriginalAdministrativeRegistry {
         }
         returned.map_err(|returned| {
             self.refusal(Some(original), Some(returned), "original_cleanup_refused")
+        })
+    }
+    pub(super) fn known_closed_input(&self, input: &Arc<RemoteAdministrationInput>) -> bool {
+        let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+        state.slots.iter().any(|slot| match slot {
+            Slot::Archived(original) => {
+                original.input_is(input) && original.known_physical_closed()
+            }
+            Slot::Active {
+                original,
+                borrowers: 0,
+                sealed: true,
+                ..
+            } => original.input_is(input) && original.known_physical_closed(),
+            _ => false, // Absence never proves a captured original was closed.
         })
     }
     /// Move finite known-closed failures into a caller-owned, raw-cause archive.

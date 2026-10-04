@@ -19,6 +19,7 @@ pub(crate) enum Kind {
     Cancel,
     Probe,
     AuthorityOrigin,
+    AdministrativePreflight,
     Schema,
     Plan(crate::PlanAction),
     Progress,
@@ -212,7 +213,11 @@ impl Operations {
             resources.record_body_returned(result.clone());
             let cleanup = resources.finish_cleanup(&service.migration_startups).await;
             let result = match cleanup {
-                Ok(receipt) if Arc::ptr_eq(receipt.original(), &resources) => result,
+                Ok(receipt)
+                    if Arc::ptr_eq(receipt.original(), &resources) && !receipt.refused() =>
+                {
+                    result
+                }
                 Err(owning) => {
                     let _ = owning.original;
                     Err(unavailable())

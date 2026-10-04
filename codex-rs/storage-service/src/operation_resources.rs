@@ -17,6 +17,14 @@ pub(crate) struct Resources {
     read_sources: Arc<Slots<codex_storage_migration::RetainedSqliteSource>>,
     bootstrap_sessions: Arc<Slots<codex_postgres_runtime::BootstrapSessionOwner>>,
     runtime_origins: Arc<Slots<codex_remote_storage::OriginalRuntimeOrigin>>,
+    administrative_observers: Arc<Slots<codex_remote_storage::RemoteAdministrativeObserver>>,
+    administrative_attempts: Arc<Slots<codex_remote_storage::OriginalAdministrativeSessionAttempt>>,
+    administrative_commands: Arc<Slots<codex_remote_storage::OriginalAdministrativeCommand>>,
+    administrative_archives:
+        Mutex<[Option<Arc<codex_remote_storage::AdministrativeCommandArchive>>; CAPACITY]>,
+    administrative_refused: Mutex<bool>,
+    administrative_cleanup_causes:
+        Mutex<[Option<Arc<dyn std::error::Error + Send + Sync>>; CAPACITY]>,
     runtime_origin_cleanup_causes:
         Mutex<[Option<Arc<codex_remote_storage::RuntimeOriginRefusal>>; CAPACITY]>,
     bootstrap_cleanup_causes:
@@ -46,6 +54,12 @@ impl Resources {
             read_sources: Arc::default(),
             bootstrap_sessions: Arc::default(),
             runtime_origins: Arc::default(),
+            administrative_observers: Arc::default(),
+            administrative_attempts: Arc::default(),
+            administrative_commands: Arc::default(),
+            administrative_archives: Mutex::new(std::array::from_fn(|_| None)),
+            administrative_refused: Mutex::new(false),
+            administrative_cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
             runtime_origin_cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
             bootstrap_cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
             cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
@@ -130,6 +144,21 @@ impl Resources {
         slot.capture_original_arc(Arc::clone(&origin))?;
         Ok(origin)
     }
+    pub(crate) fn reserve_administrative_observer(
+        &self,
+    ) -> Result<Creation<codex_remote_storage::RemoteAdministrativeObserver>, Refusal> {
+        self.administrative_observers.reserve()
+    }
+    pub(crate) fn reserve_administrative_attempt(
+        &self,
+    ) -> Result<Creation<codex_remote_storage::OriginalAdministrativeSessionAttempt>, Refusal> {
+        self.administrative_attempts.reserve()
+    }
+    pub(crate) fn reserve_administrative_command(
+        &self,
+    ) -> Result<Creation<codex_remote_storage::OriginalAdministrativeCommand>, Refusal> {
+        self.administrative_commands.reserve()
+    }
     pub(crate) fn reserve_runtime(&self) -> Result<Creation<RemoteStorage>, Refusal> {
         self.runtimes.reserve()
     }
@@ -148,6 +177,26 @@ impl Resources {
         }))
     }
     pub(crate) fn retains_original_causes(&self) -> bool {
+        if self
+            .administrative_cleanup_causes
+            .lock()
+            .map_or(true, |causes| causes.iter().any(Option::is_some))
+            || self
+                .administrative_commands
+                .state
+                .lock()
+                .map_or(true, |state| {
+                    state.entries.iter().any(|entry| {
+                        entry.returned_failure.is_some()
+                            || entry
+                                .installed
+                                .as_ref()
+                                .is_some_and(|command| command.retains_original_causes())
+                    })
+                })
+        {
+            return true;
+        }
         if self
             .admission_failure
             .lock()
@@ -404,8 +453,12 @@ struct Cleanup {
 /// Scoped completion of actual original SDK-close futures, never Home/socket authority.
 pub(crate) struct ResourcesClosed {
     original: Arc<Resources>,
+    administrative_refused: bool,
 }
 impl ResourcesClosed {
+    pub(crate) fn refused(&self) -> bool {
+        self.administrative_refused
+    }
     pub(crate) fn original(&self) -> &Arc<Resources> {
         &self.original
     }
@@ -454,6 +507,12 @@ impl Resources {
                     self.bootstrap_sessions.seal_cleanup_snapshot();
                 let (runtime_origins, origin_unresolved, origin_poison) =
                     self.runtime_origins.seal_cleanup_snapshot();
+                let (admin_observers, observer_unresolved, observer_poison) =
+                    self.administrative_observers.seal_cleanup_snapshot();
+                let (admin_attempts, attempt_unresolved, attempt_poison) =
+                    self.administrative_attempts.seal_cleanup_snapshot();
+                let (admin_commands, command_unresolved, command_poison) =
+                    self.administrative_commands.seal_cleanup_snapshot();
                 let original = Arc::clone(self);
                 let startups = Arc::clone(startups);
                 state.task = Some(tokio::spawn(async move {
@@ -463,7 +522,13 @@ impl Resources {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                     }
-                    let mut complete = !(cleanup_poison
+                    let mut complete = !(observer_unresolved
+                        || observer_poison
+                        || attempt_unresolved
+                        || attempt_poison
+                        || command_unresolved
+                        || command_poison
+                        || cleanup_poison
                         || body_poison
                         || runtime_poison
                         || pool_poison
@@ -479,6 +544,85 @@ impl Resources {
                         || bootstrap_poison
                         || origin_unresolved
                         || origin_poison);
+                    for (index, command) in admin_commands.iter().enumerate() {
+                        if let Some(command) = command {
+                            match command.close_into_archive().await {
+                                Ok(archive) => {
+                                    if command.retains_original_causes() {
+                                        *original
+                                            .administrative_refused
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                            true;
+                                    }
+                                    original
+                                        .administrative_archives
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        [index] = Some(Arc::new(archive));
+                                }
+                                Err(cause) => {
+                                    original
+                                        .administrative_cleanup_causes
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        [index] = Some(Arc::new(cause));
+                                    complete = false;
+                                }
+                            }
+                        }
+                    }
+                    for (index, observer) in admin_observers.iter().enumerate() {
+                        if let Some(observer) = observer {
+                            if admin_commands
+                                .iter()
+                                .flatten()
+                                .any(|command| command.belongs_to_observer(observer))
+                            {
+                                // SAME command owns frame/native close. Never double-close
+                                // its registry or mistake absent entry for an ACK.
+                                continue;
+                            }
+                            let closed = if let Some(attempt) = admin_attempts
+                                .iter()
+                                .flatten()
+                                .find(|attempt| attempt.belongs_to_observer(observer))
+                            {
+                                let result = attempt.close_original().await;
+                                if let Err(raw) = result {
+                                    original
+                                        .administrative_cleanup_causes
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        [index] = Some(Arc::new(raw));
+                                    *original
+                                        .administrative_refused
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                                }
+                                if !attempt.known_original_closed() {
+                                    complete = false;
+                                }
+                                continue;
+                            } else {
+                                observer.close_original().await.map_err(|raw| {
+                                    Arc::new(raw) as Arc<dyn std::error::Error + Send + Sync>
+                                })
+                            };
+                            if let Err(cause) = closed {
+                                original
+                                    .administrative_cleanup_causes
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)[index] =
+                                    Some(cause);
+                                *original
+                                    .administrative_refused
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                                complete &= observer.known_closed_failed_original();
+                            }
+                        }
+                    }
                     let mut blocked_origin_pools = std::array::from_fn::<_, CAPACITY, _>(|_| None);
                     for (index, owner) in runtime_origins.into_iter().enumerate() {
                         if let Some(owner) = owner {
@@ -609,8 +753,13 @@ impl Resources {
         if !self.cleanup_completed() {
             return Err(refused());
         }
+        let administrative_refused = self
+            .administrative_refused
+            .lock()
+            .map_or(true, |refused| *refused);
         Ok(ResourcesClosed {
             original: Arc::clone(self),
+            administrative_refused,
         })
     }
 }

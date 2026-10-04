@@ -1,4 +1,15 @@
 //! Explicit host-owned administrative observations, never an exclusive permit.
+#[path = "administrative_command.rs"]
+mod administrative_command;
+#[path = "administrative_session_attempt.rs"]
+mod administrative_session_attempt;
+pub use administrative_command::AdministrativeCommandArchive;
+pub use administrative_command::AdministrativeCommandRefusal;
+pub use administrative_command::OriginalAdministrativeCommand;
+pub use administrative_session_attempt::AdministrativeSessionAttemptCleanupRefusal;
+pub use administrative_session_attempt::AdministrativeSessionAttemptRefusal;
+pub use administrative_session_attempt::OriginalAdministrativeSessionAttempt;
+
 use crate::administration_registry::AdministrativeFailureArchive;
 use crate::administration_registry::AdministrativeObservationBorrow;
 use crate::administration_registry::AdministrativeRegistryRefusal;
@@ -78,6 +89,12 @@ impl AdministrativeObservationRefusal {
         &self.original
     }
 }
+impl std::fmt::Display for AdministrativeObservationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+impl std::error::Error for AdministrativeObservationRefusal {}
 impl RemoteAdministrativeObserver {
     pub fn new(input: Arc<RemoteAdministrationInput>, keyring: Arc<dyn KeyringStore>) -> Arc<Self> {
         Arc::new(Self {
@@ -85,6 +102,14 @@ impl RemoteAdministrativeObserver {
             keyring,
             registry: OriginalAdministrativeRegistry::new(),
         })
+    }
+    /// Caller retains this Observer before synchronous credential/startup capture,
+    /// then retains the returned attempt before its asynchronous session join.
+    pub fn prepare_runtime_session(
+        self: &Arc<Self>,
+        origin: Arc<RuntimeNativeOrigin>,
+    ) -> Result<Arc<OriginalAdministrativeSessionAttempt>, AdministrativeObservationRefusal> {
+        OriginalAdministrativeSessionAttempt::prepare(self, origin)
     }
     pub fn original_input(&self) -> &Arc<RemoteAdministrationInput> {
         &self.input
@@ -190,6 +215,11 @@ impl RemoteAdministrativeObserver {
     /// Retry this same owner to reconcile a known pending entry; absence refuses.
     pub async fn close_original(&self) -> Result<(), AdministrativeRegistryRefusal> {
         self.registry.close_input(&self.input).await
+    }
+    /// SAME known failed startup's local physical joins only, not business success.
+    /// Empty registry or unknown original never substitutes for native/SDK ACK.
+    pub fn known_closed_failed_original(&self) -> bool {
+        self.registry.known_closed_input(&self.input)
     }
     /// Transfer known locally closed raw failures before genuine fresh retries.
     /// The caller must retain the returned archive or owning poisoned refusal.

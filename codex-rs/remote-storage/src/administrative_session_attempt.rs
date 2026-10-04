@@ -14,6 +14,7 @@ use tokio::sync::OwnedMutexGuard;
 
 pub struct OriginalAdministrativeSessionAttempt {
     observer: Arc<RemoteAdministrativeObserver>,
+    startup: Arc<crate::administration_startup::OriginalAdministrativeStartup>,
     origin: Arc<RuntimeNativeOrigin>,
     borrowed: Arc<AsyncMutex<Option<AdministrativeObservationBorrow>>>,
     sealed: Mutex<bool>,
@@ -84,14 +85,51 @@ impl OriginalAdministrativeSessionAttempt {
             .capture_runtime_origin(Arc::clone(&observer.input), Arc::clone(&origin), &resolver)
             .map_err(|capture| refused(Some(capture)))?;
         Ok(Arc::new(Self {
+            startup: Arc::clone(borrowed.original_startup()),
             observer: Arc::clone(observer),
             origin,
             borrowed: Arc::new(AsyncMutex::new(Some(borrowed))),
             sealed: Mutex::new(false),
         }))
     }
+    pub(super) fn original_parts(
+        &self,
+    ) -> (
+        Arc<RemoteAdministrativeObserver>,
+        Arc<RuntimeNativeOrigin>,
+        Arc<crate::administration_startup::OriginalAdministrativeStartup>,
+    ) {
+        (
+            Arc::clone(&self.observer),
+            Arc::clone(&self.origin),
+            Arc::clone(&self.startup),
+        )
+    }
+    pub(super) fn refusal(self: &Arc<Self>) -> AdministrativeSessionAttemptRefusal {
+        AdministrativeSessionAttemptRefusal {
+            original: Arc::clone(self),
+            cause: None,
+        }
+    }
+    /// Prepare an exterior native-frame slot BEFORE its session join is polled.
+    /// Actual caller captures this command in its original operation Resources.
+    pub fn prepare_preflight(self: &Arc<Self>) -> Arc<super::OriginalAdministrativeCommand> {
+        super::OriginalAdministrativeCommand::prepare_attempt(Arc::clone(self))
+    }
+    pub async fn finish_preflight_frame(
+        self: &Arc<Self>,
+        command: &Arc<super::OriginalAdministrativeCommand>,
+    ) -> Result<(), AdministrativeSessionAttemptRefusal> {
+        command.capture_attempt_session(self).await
+    }
     pub fn belongs_to_observer(&self, observer: &Arc<RemoteAdministrativeObserver>) -> bool {
         Arc::ptr_eq(&self.observer, observer)
+    }
+    /// Observation of SAME original local physical joins only. No business or
+    /// exclusive proof; callers still preserve the actual close outcome.
+    pub fn known_original_closed(&self) -> bool {
+        *self.sealed.lock().unwrap_or_else(|raw| raw.into_inner())
+            && self.startup.known_physical_closed()
     }
     pub fn runtime_origin(&self) -> &Arc<RuntimeNativeOrigin> {
         &self.origin

@@ -145,6 +145,14 @@ impl Drop for TaskLoan {
 }
 
 impl OriginalAdministrativeStartup {
+    /// Local original task/native/SDK completion only, including dirty admission.
+    /// No remote xid outcome or administrative permission follows from closure.
+    pub(super) fn known_physical_closed(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.task.is_none()
+            && (state.returned.is_some() || state.join_failure.is_some())
+            && self.close.physical_terminal()
+    }
     pub(super) fn input_is(&self, input: &Arc<RemoteAdministrationInput>) -> bool {
         Arc::ptr_eq(&self.input, input)
     }

@@ -13,6 +13,8 @@ use std::sync::Arc;
 pub struct OriginalServiceAdministration {
     service: Arc<StorageService>,
     observer: Arc<RemoteAdministrativeObserver>,
+    preflight_id: uuid::Uuid,
+    native_origin: std::sync::Mutex<Option<Arc<codex_remote_storage::RuntimeNativeOrigin>>>,
 }
 
 /// Outward-only refusal retaining the actual service, never cached into it.
@@ -47,10 +49,11 @@ impl OriginalServiceAdministration {
 pub struct ServiceRuntimeOriginRefusal {
     original: Arc<OriginalServiceAdministration>,
     cause: crate::StorageError,
+    native_origin: Option<Arc<codex_remote_storage::RuntimeNativeOrigin>>,
 }
 impl std::fmt::Debug for ServiceRuntimeOriginRefusal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let _retained = (&self.original, &self.cause);
+        let _retained = (&self.original, &self.cause, &self.native_origin);
         formatter.write_str("ServiceRuntimeOriginRefused([original retained])")
     }
 }
@@ -93,6 +96,7 @@ impl OriginalServiceAdministration {
         result.map_err(|cause| ServiceRuntimeOriginRefusal {
             original: Arc::clone(self),
             cause,
+            native_origin: None,
         })
     }
 }
@@ -118,10 +122,100 @@ impl StorageService {
         )?;
         Ok(Arc::new(OriginalServiceAdministration {
             service: Arc::clone(self),
+            preflight_id: uuid::Uuid::new_v4(),
+            native_origin: std::sync::Mutex::new(None),
             observer: RemoteAdministrativeObserver::new(
                 Arc::new(input),
                 Arc::clone(&self.inputs.keyring),
             ),
         }))
+    }
+}
+
+impl OriginalServiceAdministration {
+    /// Actual registered nonmutating preflight only. Host validation is required
+    /// before first poll; result grants no writer retirement or exclusive access.
+    pub async fn preflight_original(
+        self: &Arc<Self>,
+        origin: Arc<codex_remote_storage::RuntimeNativeOrigin>,
+    ) -> Result<(), ServiceRuntimeOriginRefusal> {
+        let refused = || ServiceRuntimeOriginRefusal {
+            original: Arc::clone(self),
+            cause: crate::StorageError(crate::BlockerCode::Internal),
+            native_origin: Some(Arc::clone(&origin)),
+        };
+        if !origin.belongs_to_target(self.observer.original_input().target()) {
+            return Err(refused());
+        }
+        {
+            let mut original = self.native_origin.lock().map_err(|_| refused())?;
+            if let Some(captured) = original.as_ref() {
+                if !Arc::ptr_eq(captured, &origin) {
+                    return Err(refused());
+                }
+            } else {
+                *original = Some(Arc::clone(&origin));
+            }
+        }
+        let retained_origin = Arc::clone(&origin);
+        let observer = Arc::clone(&self.observer);
+        let result = self
+            .service
+            .original_observation(
+                crate::service_operations::Kind::AdministrativePreflight,
+                Some(self.preflight_id),
+                move |service| async move {
+                    let refused = || crate::StorageError(crate::BlockerCode::Internal);
+                    let resources = service.operation_resources.as_ref().ok_or_else(refused)?;
+                    let observer_slot = resources
+                        .reserve_administrative_observer()
+                        .map_err(|_| refused())?;
+                    let attempt_slot = resources
+                        .reserve_administrative_attempt()
+                        .map_err(|_| refused())?;
+                    let command_slot = resources
+                        .reserve_administrative_command()
+                        .map_err(|_| refused())?;
+                    observer_slot
+                        .capture_original_arc(Arc::clone(&observer))
+                        .map_err(|_| refused())?;
+                    let attempt = match observer.prepare_runtime_session(origin) {
+                        Ok(attempt) => attempt,
+                        Err(raw) => {
+                            let cause = Arc::new(raw);
+                            observer_slot.record_retained_failure(cause.clone());
+                            attempt_slot.record_returned_failure(cause.clone());
+                            command_slot.record_returned_failure(cause);
+                            return Err(refused());
+                        }
+                    };
+                    attempt_slot
+                        .capture_original_arc(Arc::clone(&attempt))
+                        .map_err(|_| refused())?;
+                    let command = attempt.prepare_preflight();
+                    command_slot
+                        .capture_original_arc(Arc::clone(&command))
+                        .map_err(|_| refused())?;
+                    if let Err(raw) = attempt.finish_preflight_frame(&command).await {
+                        command_slot.record_retained_failure(Arc::new(raw));
+                        return Err(refused());
+                    }
+                    if let Err(raw) = command.start_preflight() {
+                        command_slot.record_retained_failure(Arc::new(raw));
+                        return Err(refused());
+                    }
+                    if let Err(raw) = command.finish_original().await {
+                        command_slot.record_retained_failure(Arc::new(raw));
+                        return Err(refused());
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+        result.map_err(|cause| ServiceRuntimeOriginRefusal {
+            original: Arc::clone(self),
+            cause,
+            native_origin: Some(retained_origin),
+        })
     }
 }

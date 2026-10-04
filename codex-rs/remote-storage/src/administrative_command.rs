@@ -1,13 +1,15 @@
-//! Undeclared child-module prerequisite for administration.rs.
+//! Original administrative preflight and physical cleanup owner.
 //! Retains the SAME scoped original administrative session before SQL dispatch.
-//! Only read-only retirement preflight is defined; no role mutation, enrollment,
+//! Only nonmutating application-data preflight is defined; native transaction
+//! commands and session destruction have effects. No role mutation, enrollment,
 //! backend termination, prepared resolution or exclusive permit is implemented.
-//! Actual confirmed-plan association and privilege/catalog closure must arrive
-//! with real callers before declaration. Returned rows/status never mint authority.
+//! Actual confirmed-plan association and privilege/catalog closure remain
+//! mandatory before mutating retirement callers. Returned rows/status never mint authority.
 
+use super::AdministrativeSessionAttemptRefusal;
 use super::OriginalAdministrativeRuntimeSession;
+use super::OriginalAdministrativeSessionAttempt;
 use super::RemoteAdministrativeObserver;
-use crate::administration_registry::AdministrativeRegistryRefusal;
 use crate::administration_startup::OriginalAdministrativeStartup;
 use crate::runtime_origin::RuntimeNativeOrigin;
 use sqlx::Row;
@@ -18,6 +20,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+type CloseOutcome = Result<(), Arc<dyn std::error::Error + Send + Sync>>;
 const CAUSES: usize = 8;
 const PREFLIGHT: &str = "SELECT role.oid::bigint AS role_oid, role.rolname::text AS role_name,
     role.rolcanlogin, role.rolsuper, role.rolcreaterole, role.rolcreatedb,
@@ -53,19 +56,20 @@ struct State {
     observer: Arc<RemoteAdministrativeObserver>,
     origin: Arc<RuntimeNativeOrigin>,
     startup: Arc<OriginalAdministrativeStartup>,
-    close_task: Option<JoinHandle<Result<(), AdministrativeRegistryRefusal>>>,
-    close_returned: Option<Result<(), Arc<AdministrativeRegistryRefusal>>>,
+    attempt: Option<Arc<OriginalAdministrativeSessionAttempt>>,
+    close_task: Option<JoinHandle<CloseOutcome>>,
+    close_returned: Option<CloseOutcome>,
     close_joined_failure: Option<Arc<tokio::task::JoinError>>,
 }
 
-pub(super) struct OriginalAdministrativeCommand {
+pub struct OriginalAdministrativeCommand {
     original: Arc<AsyncMutex<Option<OriginalAdministrativeRuntimeSession>>>,
     state: Mutex<State>,
     join: Arc<Semaphore>,
     close_join: Arc<Semaphore>,
 }
 
-pub(super) struct AdministrativeCommandRefusal {
+pub struct AdministrativeCommandRefusal {
     original: Arc<OriginalAdministrativeCommand>,
 }
 impl std::fmt::Debug for AdministrativeCommandRefusal {
@@ -126,7 +130,7 @@ impl Drop for TaskLoan {
     }
 }
 
-pub(super) struct AdministrativeCommandArchive {
+pub struct AdministrativeCommandArchive {
     original: Arc<OriginalAdministrativeCommand>,
 }
 impl std::fmt::Debug for AdministrativeCommandArchive {
@@ -135,9 +139,13 @@ impl std::fmt::Debug for AdministrativeCommandArchive {
         formatter.write_str("AdministrativeCommandArchive([original causes retained])")
     }
 }
+enum CloseSource {
+    Frame(OriginalAdministrativeRuntimeSession),
+    Attempt(Arc<OriginalAdministrativeSessionAttempt>),
+}
 struct CloseTaskLoan {
     original: Arc<OriginalAdministrativeCommand>,
-    task: Option<JoinHandle<Result<(), AdministrativeRegistryRefusal>>>,
+    task: Option<JoinHandle<CloseOutcome>>,
 }
 impl Drop for CloseTaskLoan {
     fn drop(&mut self) {
@@ -151,13 +159,46 @@ impl Drop for CloseTaskLoan {
     }
 }
 
+impl std::fmt::Display for AdministrativeCommandRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+impl std::error::Error for AdministrativeCommandRefusal {}
 impl OriginalAdministrativeCommand {
-    pub(super) fn prepare(original: OriginalAdministrativeRuntimeSession) -> Arc<Self> {
+    pub fn belongs_to_observer(&self, observer: &Arc<RemoteAdministrativeObserver>) -> bool {
+        let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+        Arc::ptr_eq(&state.observer, observer)
+    }
+    pub fn retains_original_causes(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+        self.state.is_poisoned()
+            || state.refused
+            || state.causes.iter().any(Option::is_some)
+            || state.joined_failure.is_some()
+            || state.close_joined_failure.is_some()
+            || state.close_returned.as_ref().is_some_and(Result::is_err)
+    }
+
+    pub fn prepare(original: OriginalAdministrativeRuntimeSession) -> Arc<Self> {
         let observer = Arc::clone(&original.original);
         let origin = Arc::clone(&original.origin);
         let startup = Arc::clone(original.borrowed.original_startup());
+        Self::reserve(Some(original), None, observer, origin, startup)
+    }
+    pub(super) fn prepare_attempt(attempt: Arc<OriginalAdministrativeSessionAttempt>) -> Arc<Self> {
+        let (observer, origin, startup) = attempt.original_parts();
+        Self::reserve(None, Some(attempt), observer, origin, startup)
+    }
+    fn reserve(
+        frame: Option<OriginalAdministrativeRuntimeSession>,
+        attempt: Option<Arc<OriginalAdministrativeSessionAttempt>>,
+        observer: Arc<RemoteAdministrativeObserver>,
+        origin: Arc<RuntimeNativeOrigin>,
+        startup: Arc<OriginalAdministrativeStartup>,
+    ) -> Arc<Self> {
         let original = Arc::new(Self {
-            original: Arc::new(AsyncMutex::new(Some(original))),
+            original: Arc::new(AsyncMutex::new(frame)),
             state: Mutex::new(State {
                 task: None,
                 dispatched: false,
@@ -177,6 +218,7 @@ impl OriginalAdministrativeCommand {
                 observer,
                 origin,
                 startup,
+                attempt,
                 close_task: None,
                 close_returned: None,
                 close_joined_failure: None,
@@ -195,6 +237,34 @@ impl OriginalAdministrativeCommand {
         original
     }
 
+    pub(super) async fn capture_attempt_session(
+        self: &Arc<Self>,
+        attempt: &Arc<OriginalAdministrativeSessionAttempt>,
+    ) -> Result<(), AdministrativeSessionAttemptRefusal> {
+        // This exterior slot was retained in Resources BEFORE first native join.
+        let mut slot = Arc::clone(&self.original).lock_owned().await;
+        {
+            let state = self.state.lock().map_err(|_| attempt.refusal())?;
+            if state.sealed
+                || state.refused
+                || state.dispatched
+                || slot.is_some()
+                || !state
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|original| Arc::ptr_eq(original, attempt))
+            {
+                return Err(attempt.refusal());
+            }
+        }
+        let frame = attempt.finish_original().await?;
+        *slot = Some(frame); // SAME returned guard/borrower before any next await.
+        let state = self.state.lock().map_err(|_| attempt.refusal())?;
+        if state.sealed || state.refused {
+            return Err(attempt.refusal());
+        }
+        Ok(())
+    }
     fn cause(&self, cause: CommandCause) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.refused = true;
@@ -205,7 +275,7 @@ impl OriginalAdministrativeCommand {
         // exist for this single immutable dispatch. No retry overwrites history.
     }
 
-    pub(super) fn start_preflight(self: &Arc<Self>) -> Result<(), AdministrativeCommandRefusal> {
+    pub fn start_preflight(self: &Arc<Self>) -> Result<(), AdministrativeCommandRefusal> {
         let refused = || AdministrativeCommandRefusal {
             original: Arc::clone(self),
         };
@@ -354,9 +424,7 @@ impl OriginalAdministrativeCommand {
         }
     }
 
-    pub(super) async fn finish_original(
-        self: &Arc<Self>,
-    ) -> Result<(), AdministrativeCommandRefusal> {
+    pub async fn finish_original(self: &Arc<Self>) -> Result<(), AdministrativeCommandRefusal> {
         let refused = || AdministrativeCommandRefusal {
             original: Arc::clone(self),
         };
@@ -405,7 +473,7 @@ impl OriginalAdministrativeCommand {
     }
     /// Reconcile the SAME query task, then register the actual close before
     /// consuming the scoped frame. Empty original Option never proves closure.
-    pub(super) async fn close_into_archive(
+    pub async fn close_into_archive(
         self: &Arc<Self>,
     ) -> Result<AdministrativeCommandArchive, AdministrativeCommandRefusal> {
         let refused = || AdministrativeCommandRefusal {
@@ -448,7 +516,13 @@ impl OriginalAdministrativeCommand {
                     return Err(refused());
                 }
             };
-            let frame = slot.take().ok_or_else(refused)?;
+            let source = match slot.take() {
+                Some(frame) => CloseSource::Frame(frame),
+                None => match state.attempt.as_ref() {
+                    Some(attempt) => CloseSource::Attempt(Arc::clone(attempt)),
+                    None => return Err(refused()),
+                },
+            };
             let original = Arc::clone(self);
             // observer/origin/startup were stored before frame was first polled.
             // The original frame/registry owns native resources even if this
@@ -460,7 +534,16 @@ impl OriginalAdministrativeCommand {
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
                 }
-                frame.close_original().await
+                match source {
+                    CloseSource::Frame(frame) => frame
+                        .close_original()
+                        .await
+                        .map_err(|raw| Arc::new(raw) as Arc<dyn std::error::Error + Send + Sync>),
+                    CloseSource::Attempt(attempt) => attempt
+                        .close_original()
+                        .await
+                        .map_err(|raw| Arc::new(raw) as Arc<dyn std::error::Error + Send + Sync>),
+                }
             }));
         }
         let task = {
@@ -478,7 +561,7 @@ impl OriginalAdministrativeCommand {
             let returned = loan.task.as_mut().ok_or_else(refused)?.await;
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             match returned {
-                Ok(result) => state.close_returned = Some(result.map_err(Arc::new)),
+                Ok(result) => state.close_returned = Some(result),
                 Err(raw) => state.close_joined_failure = Some(Arc::new(raw)),
             }
             loan.task = None; // Raw original close result cached before clear.
