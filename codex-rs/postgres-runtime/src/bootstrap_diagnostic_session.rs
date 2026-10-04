@@ -35,6 +35,7 @@ struct State {
     original: Option<RetainedWriteSession>,
     acquisition: Option<crate::PoolError>,
     origin: Option<NativeOrigin>,
+    original_request: Option<(NativeOrigin, Arc<String>)>,
     observation: Option<(Arc<String>, bool)>,
     causes: [Cause; 8],
     sealed: bool,
@@ -62,6 +63,7 @@ impl DiagnosticSession {
                 original: None,
                 acquisition: None,
                 origin: None,
+                original_request: None,
                 observation: None,
                 causes: std::array::from_fn(|_| Cause::default()),
                 sealed: false,
@@ -113,6 +115,21 @@ impl DiagnosticSession {
             let mut state = self.state.lock().map_err(|_| refusal())?;
             if state.sealed {
                 return Err(refusal());
+            }
+            // Retain the genuine command association BEFORE diagnostic acquire.
+            // A retry may query the same request; it cannot rebind this owner to
+            // another command, even an equal textual xid from a foreign origin.
+            match &state.original_request {
+                Some((origin, xid))
+                    if origin != original_origin || !Arc::ptr_eq(xid, original_xid) =>
+                {
+                    return Err(refusal());
+                }
+                Some(_) => {}
+                None => {
+                    state.original_request =
+                        Some((original_origin.clone(), Arc::clone(original_xid)));
+                }
             }
             if state.attempted && state.original.is_none() {
                 return Err(refusal());
