@@ -212,6 +212,7 @@ pub fn discard_plan(home: &Path) -> io::Result<()> {
 
 /// Run or finish the swap. Safe to repeat.
 pub fn install(home: &Path, plan: &InstallPlan) -> io::Result<()> {
+    validate_staged_sqlite_sidecars(&plan.staged_home)?;
     std::fs::create_dir_all(&plan.backup_dir)?;
     let manifest = plan.backup_dir.join(MANIFEST_FILE);
     if !manifest.exists() {
@@ -280,6 +281,36 @@ pub fn verify_backup(plan: &InstallPlan) -> io::Result<bool> {
 #[cfg(test)]
 mod staged_sidecar_tests {
     use super::*;
+
+    #[test]
+    fn late_staged_wal_refuses_before_backup_and_can_retry_the_same_plan() {
+        let home = tempfile::tempdir().expect("isolated live home");
+        let stage = tempfile::tempdir().expect("isolated stage");
+        let live = home.path().join("memories_v2_1.sqlite");
+        let staged = stage.path().join("memories_v2_1.sqlite");
+        let wal = stage.path().join("memories_v2_1.sqlite-wal");
+        std::fs::write(&live, b"original live database").unwrap();
+        std::fs::write(&staged, b"verified staged database").unwrap();
+        let plan = plan_install(home.path(), stage.path(), Uuid::new_v4()).unwrap();
+        std::fs::write(&wal, b"late staged sidecar").unwrap();
+        assert_eq!(
+            install(home.path(), &plan).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!plan.backup_dir.exists());
+        assert_eq!(read_plan(home.path()).unwrap(), Some(plan.clone()));
+        assert_eq!(std::fs::read(&live).unwrap(), b"original live database");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"verified staged database");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"late staged sidecar");
+
+        // Fixture bytes are not a real WAL. Removing this fixture obstruction
+        // only tests same-plan retry; production must checkpoint, never delete WAL.
+        std::fs::remove_file(&wal).unwrap();
+        install(home.path(), &plan).unwrap();
+        install(home.path(), &plan).unwrap();
+        assert_eq!(std::fs::read(&live).unwrap(), b"verified staged database");
+        assert!(verify_backup(&plan).unwrap());
+    }
 
     #[test]
     fn staged_sidecar_refusal_preserves_files_and_creates_no_plan() {
