@@ -17,7 +17,6 @@ use codex_postgres_runtime::PostgresPool;
 use codex_postgres_runtime::bootstrap_codex_storage;
 use codex_postgres_runtime::bootstrap_named_namespace;
 use codex_remote_storage::LoginRole;
-use codex_remote_storage::RemoteStorage;
 use codex_remote_storage::RemoteStorageError;
 use codex_remote_storage::connection_settings;
 use codex_state::SqliteConfig;
@@ -121,6 +120,23 @@ impl StorageService {
     /// The active backend and what blocks changing it. Only a request that asks to probe reaches
     /// the network.
     pub async fn status(&self, probe_remote: bool) -> StorageStatus {
+        match self
+            .original_observation(
+                crate::service_operations::Kind::Status(probe_remote),
+                None,
+                move |service| async move { Ok(service.status_original(probe_remote).await) },
+            )
+            .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                let mut status = self.status_original(false).await;
+                status.blockers.push(error.0);
+                status
+            }
+        }
+    }
+    pub(crate) async fn status_original(&self, probe_remote: bool) -> StorageStatus {
         let state = codex_storage_authority::authority_state(&self.inputs.codex_home);
         let (authority, active_backend, generation, dataset, ever) = match &state {
             Ok(AuthorityState::Unmanaged) => (
@@ -211,6 +227,27 @@ impl StorageService {
 
     /// Test the saved profile with the runtime login. Nothing is created or changed.
     pub async fn check_connection(&self) -> ConnectionReport {
+        match self
+            .original_observation(
+                crate::service_operations::Kind::Probe,
+                None,
+                |service| async move { Ok(service.check_connection_original().await) },
+            )
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => ConnectionReport {
+                stage: CheckStage::Connect,
+                blocker: Some(error.0),
+                schema_format: None,
+                dataset_state: None,
+                dataset_id: None,
+                generation: None,
+                empty: None,
+            },
+        }
+    }
+    pub(crate) async fn check_connection_original(&self) -> ConnectionReport {
         let mut report = ConnectionReport {
             stage: CheckStage::Profile,
             blocker: None,
@@ -220,12 +257,11 @@ impl StorageService {
             generation: None,
             empty: None,
         };
-        let Some(profile) = &self.inputs.candidate else {
+        if self.inputs.candidate.is_none() {
             report.blocker = Some(BlockerCode::NoCandidateProfile);
             return report;
-        };
-        let resolver = HostCredentialResolver::new(self.inputs.keyring.as_ref());
-        let storage = match RemoteStorage::connect(profile, &resolver).await {
+        }
+        let storage = match self.connect_original_remote().await {
             Ok(storage) => storage,
             Err(error) => {
                 report.stage = match error {
@@ -262,18 +298,24 @@ impl StorageService {
             }
             Err(error) => {
                 report.blocker = Some(error.into());
-                storage.close().await;
                 return report;
             }
         }
         finish_target_inspection(&mut report, target_is_empty(storage.pool()).await);
-        storage.close().await;
         report
     }
 
     /// Create or upgrade the dataset's tables with the schema-owner credential. This is the only
     /// action that reads that credential, and it never touches existing history.
     pub async fn initialize_schema(&self) -> Result<i32, StorageError> {
+        self.original_observation(
+            crate::service_operations::Kind::Schema,
+            None,
+            |service| async move { service.initialize_schema_original().await },
+        )
+        .await
+    }
+    pub(crate) async fn initialize_schema_original(&self) -> Result<i32, StorageError> {
         let profile = self
             .inputs
             .candidate
@@ -282,20 +324,53 @@ impl StorageService {
         let resolver = HostCredentialResolver::new(self.inputs.keyring.as_ref());
         let (settings, namespace) = connection_settings(profile, &resolver, LoginRole::Migrator)
             .map_err(|error| StorageError(error.into()))?;
-        let pool = PostgresPool::connect(settings)
-            .await
-            .map_err(|error| StorageError(RemoteStorageError::Connection(error).into()))?;
+        let resources = self
+            .operation_resources
+            .as_ref()
+            .ok_or(StorageError(BlockerCode::Internal))?;
+        let slot = resources
+            .reserve_runtime_pool()
+            .map_err(|_| StorageError(BlockerCode::ConnectionFailed))?;
+        // Same genuine schema-owner login/settings; no Runtime activation/schema
+        // admission is required for an empty or not-yet-created namespace.
+        let mut capture = |pool| {
+            slot.capture_original_arc(pool)
+                .map_err(|_| codex_postgres_runtime::PoolError::Unavailable)
+        };
+        let connected =
+            PostgresPool::connect_retained_in_namespace(settings, namespace.as_ref(), &mut capture)
+                .await;
+        let pool = match connected {
+            Ok(pool) => pool,
+            Err(error) => {
+                slot.record_returned_failure(Arc::new(error));
+                return Err(StorageError(RemoteStorageError::Connection(error).into()));
+            }
+        };
         let result = match &namespace {
             Some(namespace) => bootstrap_named_namespace(&pool, namespace).await,
             None => bootstrap_codex_storage(&pool).await,
         };
-        let _ = pool.close().await;
-        result.map_err(|_| StorageError(BlockerCode::SchemaInvalid))?;
+        if let Err(original) = result {
+            slot.record_returned_failure(Arc::new(original));
+            return Err(StorageError(BlockerCode::SchemaInvalid));
+        } // SAME registered operation owns actual SDK closure before result delivery.
         Ok(codex_postgres_runtime::client_schema_format())
     }
 
     /// Describe what an action would do and what blocks it, without changing anything.
     pub async fn plan(&self, action: PlanAction) -> Result<StoragePlan, StorageError> {
+        self.original_observation(
+            crate::service_operations::Kind::Plan(action),
+            None,
+            move |service| async move { service.plan_original(action).await },
+        )
+        .await
+    }
+    pub(crate) async fn plan_original(
+        &self,
+        action: PlanAction,
+    ) -> Result<StoragePlan, StorageError> {
         let inputs = PlanInputs {
             authority: codex_storage_authority::authority_state(&self.inputs.codex_home),
             connection: self.check_connection().await,
@@ -332,6 +407,17 @@ impl StorageService {
         &self,
         operation_id: Uuid,
     ) -> Result<OperationRecord, StorageError> {
+        self.original_observation(
+            crate::service_operations::Kind::Progress,
+            Some(operation_id),
+            move |service| async move { service.operation_progress_original(operation_id).await },
+        )
+        .await
+    }
+    pub(crate) async fn operation_progress_original(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<OperationRecord, StorageError> {
         let mut record = self.operation(operation_id)?;
         let copying = matches!(
             record.state,
@@ -354,7 +440,6 @@ impl StorageService {
         {
             record.copied = rows;
         }
-        storage.close().await;
         Ok(record)
     }
 

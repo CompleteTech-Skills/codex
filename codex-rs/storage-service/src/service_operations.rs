@@ -17,12 +17,28 @@ pub(crate) enum Kind {
     Activate,
     Recover,
     Cancel,
+    Probe,
+    Schema,
+    Plan(crate::PlanAction),
+    Progress,
+    Attach,
+    PrepareMigration,
+    PrepareReturn,
+    Status(bool),
 }
 #[derive(Clone)]
 pub(crate) enum Output {
     Record(Box<OperationRecord>),
     Recovery(RecoveryReport),
+    Observed(Arc<dyn std::any::Any + Send + Sync>),
 }
+type OperationBody = Box<
+    dyn FnOnce(
+            StorageService,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Output, StorageError>> + Send>,
+        > + Send,
+>;
 #[derive(Default)]
 pub(crate) struct Operations {
     originals: Mutex<Vec<Arc<Original>>>,
@@ -56,10 +72,20 @@ fn unavailable() -> StorageError {
 impl Operations {
     fn capture(
         &self,
+        service: StorageService,
+        kind: Kind,
+        id: Option<Uuid>,
+        record: Option<OperationRecord>,
+    ) -> Result<Arc<Original>, StorageError> {
+        self.capture_body(service, kind, id, record, None)
+    }
+    fn capture_body(
+        &self,
         mut service: StorageService,
         kind: Kind,
         id: Option<Uuid>,
         record: Option<OperationRecord>,
+        body: Option<OperationBody>,
     ) -> Result<Arc<Original>, StorageError> {
         #[cfg(test)]
         let probe = self.probe.lock().map_err(|_| unavailable())?.clone();
@@ -149,6 +175,9 @@ impl Operations {
                         std::panic::resume_unwind(Box::new("original operation SDK fault"));
                     }
                 }
+                if let Some(body) = body {
+                    return body(service.operation_context()).await;
+                }
                 match kind {
                     Kind::Forward => service
                         .run_migration_original(record.ok_or_else(unavailable)?)
@@ -167,6 +196,7 @@ impl Operations {
                         .cancel_original(id.ok_or_else(unavailable)?)
                         .await
                         .map(|record| Output::Record(Box::new(record))),
+                    _ => Err(unavailable()), // An observed route requires its actual body.
                 }
             }
             .await;
@@ -438,6 +468,38 @@ impl Drop for Loan {
     }
 }
 impl StorageService {
+    // Type erasure carries only the actual original body's result projection;
+    // all resources/tasks/native ownership stay in the same external Original.
+    pub(crate) async fn original_observation<T, F, Fut>(
+        &self,
+        kind: Kind,
+        id: Option<Uuid>,
+        body: F,
+    ) -> Result<T, StorageError>
+    where
+        T: Clone + Send + Sync + 'static,
+        F: FnOnce(StorageService) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, StorageError>> + Send + 'static,
+    {
+        let body: OperationBody = Box::new(move |service| {
+            Box::pin(async move {
+                body(service)
+                    .await
+                    .map(|value| Output::Observed(Arc::new(value)))
+            })
+        });
+        let original = self.original_operations.capture_body(
+            self.operation_context(),
+            kind,
+            id,
+            None,
+            Some(body),
+        )?;
+        match self.original_operations.finish(original).await? {
+            Output::Observed(value) => value.downcast_ref::<T>().cloned().ok_or_else(unavailable),
+            _ => Err(unavailable()),
+        }
+    }
     pub(crate) async fn original_operation(
         &self,
         kind: Kind,

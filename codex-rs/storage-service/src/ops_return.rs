@@ -148,6 +148,23 @@ impl StorageService {
         plan_id: Uuid,
         confirmation: Confirmation,
     ) -> Result<(OperationRecord, bool), StorageError> {
+        self.original_observation(
+            crate::service_operations::Kind::PrepareReturn,
+            Some(operation_id),
+            move |service| async move {
+                service
+                    .prepare_return_original(operation_id, plan_id, confirmation)
+                    .await
+            },
+        )
+        .await
+    }
+    pub(crate) async fn prepare_return_original(
+        &self,
+        operation_id: Uuid,
+        plan_id: Uuid,
+        confirmation: Confirmation,
+    ) -> Result<(OperationRecord, bool), StorageError> {
         if let Some(existing) = self.journal.read(operation_id).map_err(internal)? {
             if existing.action != PlanAction::Return {
                 return Err(StorageError(BlockerCode::OperationConflict));

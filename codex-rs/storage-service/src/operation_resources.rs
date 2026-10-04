@@ -270,9 +270,13 @@ impl<T> Creation<T> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = state.entries.get_mut(self.index) {
-            if entry.reserved && entry.installed.is_none() {
-                entry.returned_failure = Some(cause);
-                entry.absence_proven = true;
+            if entry.reserved {
+                if entry.returned_failure.is_none() {
+                    entry.returned_failure = Some(cause);
+                }
+                if entry.installed.is_none() {
+                    entry.absence_proven = true;
+                }
             }
         }
     }

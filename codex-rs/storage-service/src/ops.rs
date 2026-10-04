@@ -63,24 +63,42 @@ fn internal<E>(_: E) -> StorageError {
 
 impl StorageService {
     pub(crate) async fn connect(&self) -> Result<std::sync::Arc<RemoteStorage>, StorageError> {
-        let profile = self
-            .inputs
-            .candidate
-            .as_ref()
-            .ok_or(StorageError(BlockerCode::NoCandidateProfile))?;
+        if self.inputs.candidate.is_none() {
+            return Err(StorageError(BlockerCode::NoCandidateProfile));
+        }
+        self.connect_original_remote()
+            .await
+            .map_err(|error| StorageError(error.into()))
+    }
+    pub(crate) async fn connect_original_remote(
+        &self,
+    ) -> Result<std::sync::Arc<RemoteStorage>, codex_remote_storage::RemoteStorageError> {
+        let profile = self.inputs.candidate.as_ref().ok_or(
+            codex_remote_storage::RemoteStorageError::Connection(
+                codex_postgres_runtime::PoolError::InvalidSettings,
+            ),
+        )?;
         let resolver = HostCredentialResolver::new(self.inputs.keyring.as_ref());
         let reserved = self
             .operation_resources
             .as_ref()
             .map(|resources| resources.reserve_runtime())
             .transpose()
-            .map_err(|_| StorageError(BlockerCode::ConnectionFailed))?;
+            .map_err(|_| {
+                codex_remote_storage::RemoteStorageError::Connection(
+                    codex_postgres_runtime::PoolError::Unavailable,
+                )
+            })?;
         let pool_slot = self
             .operation_resources
             .as_ref()
             .map(|resources| resources.reserve_runtime_pool())
             .transpose()
-            .map_err(|_| StorageError(BlockerCode::ConnectionFailed))?;
+            .map_err(|_| {
+                codex_remote_storage::RemoteStorageError::Connection(
+                    codex_postgres_runtime::PoolError::Unavailable,
+                )
+            })?;
         let result = if let Some(pool_slot) = pool_slot.as_ref() {
             let mut capture = |pool| {
                 pool_slot
@@ -100,14 +118,16 @@ impl StorageService {
                 if let Some(slot) = pool_slot {
                     slot.record_returned_failure(std::sync::Arc::new(original));
                 }
-                return Err(StorageError(original.into()));
+                return Err(original);
             }
         };
         match reserved {
             Some(original) => original.install(storage).map_err(|owning| {
                 // Original is already retained in its pre-dispatch resource slot.
                 let _ = (&owning.original_value, owning.original_slots());
-                StorageError(BlockerCode::ConnectionFailed)
+                codex_remote_storage::RemoteStorageError::Connection(
+                    codex_postgres_runtime::PoolError::Unavailable,
+                )
             }),
             None => Ok(std::sync::Arc::new(storage)),
         }
@@ -162,6 +182,23 @@ impl StorageService {
         plan_id: Uuid,
         confirmation: Confirmation,
     ) -> Result<(OperationRecord, bool), StorageError> {
+        self.original_observation(
+            crate::service_operations::Kind::PrepareMigration,
+            Some(operation_id),
+            move |service| async move {
+                service
+                    .prepare_migration_original(operation_id, plan_id, confirmation)
+                    .await
+            },
+        )
+        .await
+    }
+    pub(crate) async fn prepare_migration_original(
+        &self,
+        operation_id: Uuid,
+        plan_id: Uuid,
+        confirmation: Confirmation,
+    ) -> Result<(OperationRecord, bool), StorageError> {
         if let Some(existing) = self.journal.read(operation_id).map_err(internal)? {
             // A repeated request answers with what is already there.
             return Ok((existing, false));
@@ -202,6 +239,24 @@ impl StorageService {
     /// stays untouched and stops being authoritative. The operator names the dataset they mean,
     /// so a second client can never join a namespace it did not intend to.
     pub async fn attach_dataset(
+        &self,
+        operation_id: Uuid,
+        plan_id: Uuid,
+        dataset_id: Uuid,
+        confirmation: Confirmation,
+    ) -> Result<OperationRecord, StorageError> {
+        self.original_observation(
+            crate::service_operations::Kind::Attach,
+            Some(operation_id),
+            move |service| async move {
+                service
+                    .attach_dataset_original(operation_id, plan_id, dataset_id, confirmation)
+                    .await
+            },
+        )
+        .await
+    }
+    pub(crate) async fn attach_dataset_original(
         &self,
         operation_id: Uuid,
         plan_id: Uuid,
