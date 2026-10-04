@@ -108,14 +108,22 @@ impl OriginalMigrationStartup {
                     return;
                 }
             }
-            let result = PostgresPool::connect_with_search_path(
+            let mut capture = |pool| {
+                original
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pool = Some(pool);
+            };
+            let result = PostgresPool::connect_retained_with_search_path(
                 settings,
                 original.original_runtime.selected_search_path.clone(),
                 Some(original.login.clone()),
+                &mut capture,
             )
             .await;
             let pool = match result {
-                Ok(pool) => Arc::new(pool),
+                Ok(pool) => pool,
                 Err(error) => {
                     original
                         .state

@@ -184,7 +184,7 @@ fn require_qualified_server_version(version: &str) -> Result<(), PoolError> {
     }
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ConnectionTarget {
     host: String,
     port: u16,
@@ -208,6 +208,11 @@ pub struct PostgresPool {
     acquire_timeout: Duration,
     selected_search_path: Option<String>,
     activation_binding: std::sync::OnceLock<Arc<session_binding::ActivationBinding>>,
+}
+
+enum ConnectedPool {
+    Legacy(PostgresPool),
+    Retained(Arc<PostgresPool>),
 }
 
 impl PostgresPool {
@@ -251,6 +256,31 @@ impl PostgresPool {
         search_path: Option<String>,
         migration_login: Option<migration_login::MigrationLogin>,
     ) -> Result<Self, PoolError> {
+        match Self::connect_factory(settings, search_path, migration_login, None).await? {
+            ConnectedPool::Legacy(pool) => Ok(pool),
+            ConnectedPool::Retained(_) => Err(PoolError::Unavailable),
+        }
+    }
+
+    // Actual SDK pool is captured BEFORE any physical acquire/after_connect Role SQL.
+    async fn connect_retained_with_search_path(
+        settings: ConnectionSettings,
+        search_path: Option<String>,
+        migration_login: Option<migration_login::MigrationLogin>,
+        capture: &mut (dyn FnMut(Arc<Self>) + Send),
+    ) -> Result<Arc<Self>, PoolError> {
+        match Self::connect_factory(settings, search_path, migration_login, Some(capture)).await? {
+            ConnectedPool::Retained(pool) => Ok(pool),
+            ConnectedPool::Legacy(_) => Err(PoolError::Unavailable),
+        }
+    }
+
+    async fn connect_factory(
+        settings: ConnectionSettings,
+        search_path: Option<String>,
+        migration_login: Option<migration_login::MigrationLogin>,
+        capture: Option<&mut (dyn FnMut(Arc<Self>) + Send)>,
+    ) -> Result<ConnectedPool, PoolError> {
         let original_target = Some(ConnectionTarget::from_settings(&settings));
         let selected_search_path = search_path.clone();
         let limits = settings.limits;
@@ -301,81 +331,105 @@ impl PostgresPool {
             .map(|login| login.reserve_driver())
             .transpose()
             .map_err(|_| PoolError::Unavailable)?;
-        let pool = timeout(
-            limits.connect_timeout,
-            PgPoolOptions::new()
-                .max_connections(limits.max_connections)
-                // SQLx uses this limit during startup too. The outer timeouts
-                // enforce each operation's own deadline.
-                .acquire_timeout(limits.connect_timeout.max(limits.acquire_timeout))
-                .after_connect({
+        let configured = PgPoolOptions::new()
+            .max_connections(limits.max_connections)
+            // SQLx uses this limit during startup too. The outer timeouts
+            // enforce each operation's own deadline.
+            .acquire_timeout(limits.connect_timeout.max(limits.acquire_timeout))
+            .after_connect({
+                let rejected_version = Arc::clone(&rejected_version);
+                move |connection, _| {
                     let rejected_version = Arc::clone(&rejected_version);
-                    move |connection, _| {
-                        let rejected_version = Arc::clone(&rejected_version);
-                        let search_path = search_path.clone();
-                        let migration_login = migration_login.clone();
-                        Box::pin(async move {
-                            if let Some(login) = migration_login {
-                                login.initialize(&mut *connection).await?;
-                            }
-                            if let Some(search_path) = search_path {
-                                sqlx::query("SELECT set_config('search_path', $1, false)")
-                                    .bind(search_path)
-                                    .execute(&mut *connection)
-                                    .await
-                                    .map_err(|error| {
-                                        sqlx::Error::Configuration(Box::new(classify(&error)))
-                                    })?;
-                            }
-                            let version =
-                                sqlx::query_scalar::<_, String>("SHOW server_version_num")
-                                    .fetch_one(connection)
-                                    .await
-                                    .map_err(|error| {
-                                        sqlx::Error::Configuration(Box::new(classify(&error)))
-                                    })?;
-                            require_qualified_server_version(&version).map_err(|error| {
-                                rejected_version.store(true, Ordering::Relaxed);
-                                sqlx::Error::Configuration(Box::new(error))
-                            })
+                    let search_path = search_path.clone();
+                    let migration_login = migration_login.clone();
+                    Box::pin(async move {
+                        if let Some(login) = migration_login {
+                            login.initialize(&mut *connection).await?;
+                        }
+                        if let Some(search_path) = search_path {
+                            sqlx::query("SELECT set_config('search_path', $1, false)")
+                                .bind(search_path)
+                                .execute(&mut *connection)
+                                .await
+                                .map_err(|error| {
+                                    sqlx::Error::Configuration(Box::new(classify(&error)))
+                                })?;
+                        }
+                        let version = sqlx::query_scalar::<_, String>("SHOW server_version_num")
+                            .fetch_one(connection)
+                            .await
+                            .map_err(|error| {
+                                sqlx::Error::Configuration(Box::new(classify(&error)))
+                            })?;
+                        require_qualified_server_version(&version).map_err(|error| {
+                            rejected_version.store(true, Ordering::Relaxed);
+                            sqlx::Error::Configuration(Box::new(error))
                         })
+                    })
+                }
+            });
+        let mut retained = None;
+        let connected = if let Some(capture) = capture {
+            let original = Arc::new(Self {
+                pool: configured.min_connections(0).connect_lazy_with(options),
+                original_target: original_target.clone(),
+                acquire_timeout: limits.acquire_timeout,
+                selected_search_path: selected_search_path.clone(),
+                activation_binding: std::sync::OnceLock::new(),
+            });
+            capture(Arc::clone(&original));
+            // Capture is synchronous; the first physical acquire cannot outrun it.
+            let result = timeout(limits.connect_timeout, original.pool.acquire())
+                .await
+                .map(|result| {
+                    result.map(|connection| {
+                        drop(connection);
+                        original.pool.clone()
+                    })
+                });
+            retained = Some(original);
+            result
+        } else {
+            // Preserve existing unretained/default construction semantics exactly.
+            timeout(limits.connect_timeout, configured.connect_with(options)).await
+        };
+        let pool = connected
+            .map_err(|_| PoolError::Timeout)
+            .and_then(|result| match result {
+                Ok(pool) => {
+                    if let Some(reservation) = driver_reservation {
+                        reservation.success();
                     }
-                })
-                .connect_with(options),
-        )
-        .await
-        .map_err(|_| PoolError::Timeout)
-        .and_then(|result| match result {
-            Ok(pool) => {
-                if let Some(reservation) = driver_reservation {
-                    reservation.success();
+                    Ok(pool)
                 }
-                Ok(pool)
-            }
-            Err(original) => {
-                let classified = classify(&original);
-                if let Some(reservation) = driver_reservation {
-                    let _ = reservation.failure(original);
+                Err(original) => {
+                    let classified = classify(&original);
+                    if let Some(reservation) = driver_reservation {
+                        let _ = reservation.failure(original);
+                    }
+                    Err(classified)
                 }
-                Err(classified)
-            }
-        })
-        .map_err(|error| {
-            // SQLx discards and retries failed after_connect checks. Preserve the
-            // initial version rejection when no qualified connection was found.
-            if rejected_version.load(Ordering::Relaxed) {
-                PoolError::UnsupportedServer
-            } else {
-                error
-            }
-        })?;
-        Ok(Self {
-            pool,
-            original_target,
-            acquire_timeout: limits.acquire_timeout,
-            selected_search_path,
-            activation_binding: std::sync::OnceLock::new(),
-        })
+            })
+            .map_err(|error| {
+                // SQLx discards and retries failed after_connect checks. Preserve the
+                // initial version rejection when no qualified connection was found.
+                if rejected_version.load(Ordering::Relaxed) {
+                    PoolError::UnsupportedServer
+                } else {
+                    error
+                }
+            })?;
+        if let Some(original) = retained {
+            Ok(ConnectedPool::Retained(original))
+        } else {
+            Ok(ConnectedPool::Legacy(Self {
+                pool,
+                original_target,
+                acquire_timeout: limits.acquire_timeout,
+                selected_search_path,
+                activation_binding: std::sync::OnceLock::new(),
+            }))
+        }
     }
 
     pub async fn health(&self) -> Result<(), PoolError> {
