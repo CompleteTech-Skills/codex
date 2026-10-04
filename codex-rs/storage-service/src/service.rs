@@ -24,7 +24,6 @@ use codex_storage_authority::AuthorityState;
 use codex_storage_authority::HostCredentialResolver;
 use codex_storage_authority::RemotePostgresProfile;
 use codex_storage_migration::SqliteSource;
-use codex_storage_migration::estimate_source;
 use codex_storage_migration::target_is_empty;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -418,8 +417,14 @@ UNION ALL SELECT extnamespace FROM pg_catalog.pg_extension
             authority: codex_storage_authority::authority_state(&self.inputs.codex_home),
             connection: self.check_connection().await,
             estimate: if action == PlanAction::Migrate {
-                let source = SqliteSource::new(self.inputs.sqlite.clone());
-                estimate_source(&source)
+                let resources = self
+                    .operation_resources
+                    .as_ref()
+                    .ok_or(StorageError(BlockerCode::Internal))?;
+                let source = resources
+                    .retain_read_source(SqliteSource::new(self.inputs.sqlite.clone()))
+                    .map_err(|_| StorageError(BlockerCode::SourceUnreadable))?;
+                codex_storage_migration::estimate_retained_source(&source)
                     .await
                     .map_err(|_| StorageError(BlockerCode::SourceUnreadable))?
                     .into()

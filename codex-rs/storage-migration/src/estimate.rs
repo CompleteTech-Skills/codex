@@ -38,6 +38,39 @@ pub async fn estimate_source(source: &SqliteSource) -> Result<SourceEstimate> {
     let logs = source.pool(SourceDatabase::Logs).await?;
     let memories = source.pool(SourceDatabase::Memories).await?;
     let board = source.pool(SourceDatabase::Board).await?;
+    estimate_pools(source, [state, goals, queue, logs, memories, board]).await
+}
+/// Preview using SDK originals already retained by the external source owner.
+pub async fn estimate_retained_source(
+    source: &crate::source::RetainedSqliteSource,
+) -> Result<SourceEstimate> {
+    let mut pools = std::array::from_fn::<_, 6, _>(|_| None);
+    for (index, database) in [
+        SourceDatabase::State,
+        SourceDatabase::Goals,
+        SourceDatabase::Queue,
+        SourceDatabase::Logs,
+        SourceDatabase::Memories,
+        SourceDatabase::Board,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        pools[index] = source.pool(database).await?;
+    }
+    match estimate_pools(source.source(), pools).await {
+        Ok(estimate) => Ok(estimate),
+        Err(cause) => {
+            source.retain_query_failure(cause);
+            anyhow::bail!("retained source estimate query failed");
+        }
+    }
+}
+async fn estimate_pools(
+    source: &SqliteSource,
+    pools: [Option<SqlitePool>; 6],
+) -> Result<SourceEstimate> {
+    let [state, goals, queue, logs, memories, board] = pools;
     let mut estimate = SourceEstimate {
         threads: count(&state, "SELECT COUNT(*) FROM threads").await?,
         sections: count(&state, "SELECT COUNT(*) FROM thread_sections").await?,

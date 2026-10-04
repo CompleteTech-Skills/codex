@@ -14,6 +14,7 @@ pub(crate) struct Resources {
     runtime_pools: Arc<Slots<codex_postgres_runtime::PostgresPool>>,
     targets: Arc<Slots<SqliteTarget>>,
     staged_configs: Arc<Slots<SqliteConfig>>,
+    read_sources: Arc<Slots<codex_storage_migration::RetainedSqliteSource>>,
     cleanup_causes: Mutex<[Option<Arc<std::io::Error>>; CAPACITY]>,
     admission_failure: Mutex<Option<Refusal>>,
     body_result: Mutex<Option<Result<crate::service_operations::Output, crate::StorageError>>>,
@@ -36,6 +37,7 @@ impl Resources {
             runtime_pools: Arc::default(),
             targets: Arc::default(),
             staged_configs: Arc::default(),
+            read_sources: Arc::default(),
             cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
             body_result: Mutex::new(None),
             admission_failure: Mutex::new(None),
@@ -189,6 +191,14 @@ impl Resources {
         let slot = self.staged_configs.reserve()?;
         slot.install(original).map_err(|_| Refusal)?;
         Ok(())
+    }
+    pub(crate) fn retain_read_source(
+        &self,
+        source: codex_storage_migration::SqliteSource,
+    ) -> Result<Arc<codex_storage_migration::RetainedSqliteSource>, Refusal> {
+        let slot = self.read_sources.reserve()?;
+        slot.install(codex_storage_migration::RetainedSqliteSource::new(source))
+            .map_err(|_| Refusal)
     }
     pub(crate) fn reserve_target(&self) -> Result<Creation<SqliteTarget>, Refusal> {
         self.targets.reserve()
@@ -386,6 +396,8 @@ impl Resources {
                     self.targets.seal_cleanup_snapshot();
                 let (configs, config_unresolved, config_poison) =
                     self.staged_configs.seal_cleanup_snapshot();
+                let (read_sources, read_unresolved, read_poison) =
+                    self.read_sources.seal_cleanup_snapshot();
                 let original = Arc::clone(self);
                 let startups = Arc::clone(startups);
                 state.task = Some(tokio::spawn(async move {
@@ -404,7 +416,17 @@ impl Resources {
                         || runtime_unresolved
                         || pool_unresolved
                         || target_unresolved
-                        || config_unresolved);
+                        || config_unresolved
+                        || read_unresolved
+                        || read_poison);
+                    for source in read_sources.into_iter().flatten() {
+                        // Diagnostic failure stays in the SAME externally retained source;
+                        // it is distinct from the actual SDK-close completion below.
+                        complete &= source.original_read_causes().is_ok();
+                        if source.close_original_read_pools().await.is_err() {
+                            complete = false;
+                        }
+                    }
                     for target in targets.into_iter().flatten() {
                         target.close().await;
                     }
