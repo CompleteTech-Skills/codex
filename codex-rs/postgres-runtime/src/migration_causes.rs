@@ -38,7 +38,6 @@ impl MigrationCauses {
             finished: false,
         })
     }
-    #[cfg(test)]
     pub(crate) fn retained_count(&self) -> Result<usize, sqlx::Error> {
         let slots = self.0.lock().map_err(|_| refused())?;
         Ok(slots

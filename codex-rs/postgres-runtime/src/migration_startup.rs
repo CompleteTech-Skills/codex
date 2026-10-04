@@ -14,6 +14,8 @@ pub struct OriginalMigrationStartup {
     login: MigrationLogin,
     state: Mutex<State>,
     join: Semaphore,
+    close: Mutex<SdkCloseState>,
+    close_join: Semaphore,
 }
 struct State {
     settings: Option<ConnectionSettings>,
@@ -72,6 +74,8 @@ impl OriginalMigrationStartup {
                 terminal: false,
             }),
             join: Semaphore::new(1),
+            close: Mutex::new(SdkCloseState::default()),
+            close_join: Semaphore::new(1),
         });
         if refused {
             Err(original.refused())
@@ -186,6 +190,128 @@ impl OriginalMigrationStartup {
             .map(Arc::clone)
             .ok_or_else(|| self.refused())
     }
+    /// Only an actual completed original SQLx pool-close task can construct this.
+    /// It grants no native socket, Home, selected generation, or writer-drain authority.
+    pub async fn close_original(
+        self: &Arc<Self>,
+    ) -> Result<OriginalMigrationPoolClosed, MigrationStartupRefusal> {
+        // Cleanup observes physical startup completion independently of admission.
+        // Poison remains a refusal, but must not prevent reaping the same original.
+        let startup_refused = {
+            let _join = self.join.acquire().await.map_err(|_| self.refused())?;
+            let task = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .task
+                .take();
+            if let Some(task) = task {
+                let mut loan = TaskLoan {
+                    original: Arc::clone(self),
+                    task: Some(task),
+                };
+                let result = match loan.task.as_mut() {
+                    Some(task) => task.await,
+                    None => return Err(self.refused()),
+                };
+                loan.task.take();
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.terminal = true;
+                if let Err(cause) = result {
+                    state.join_failure = Some(cause);
+                }
+            }
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.started && !state.terminal {
+                return Err(self.refused());
+            }
+            self.state.is_poisoned()
+                || state.refusal.is_some()
+                || state.activation_refusal.is_some()
+                || state.join_failure.is_some()
+        };
+        let pool = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pool
+            .as_ref()
+            .map(Arc::clone);
+        // No pool is only physically empty after startup was reaped or never dispatched.
+        let Some(pool) = pool else {
+            return Err(self.refused());
+        };
+        let _permit = self
+            .close_join
+            .acquire()
+            .await
+            .map_err(|_| self.refused())?;
+        let task = {
+            let mut close = self
+                .close
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !close.started {
+                close.started = true;
+                let original = Arc::clone(self);
+                close.task = Some(tokio::spawn(async move {
+                    // Same gate keeps first pool-close poll behind exact handle insertion.
+                    {
+                        let _entry = original
+                            .close
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    pool.pool.close().await;
+                    original
+                        .close
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .sdk_done = true;
+                }));
+            }
+            close.task.take()
+        };
+        if let Some(task) = task {
+            let mut loan = CloseLoan {
+                original: Arc::clone(self),
+                task: Some(task),
+            };
+            let result = match loan.task.as_mut() {
+                Some(task) => task.await,
+                None => return Err(self.refused()),
+            };
+            loan.task.take();
+            let mut close = self
+                .close
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            close.joined = true;
+            if let Err(cause) = result {
+                close.failure = Some(cause);
+            }
+        }
+        let close = self.close.lock().map_err(|_| self.refused())?;
+        if startup_refused || !close.sdk_done || !close.joined || close.failure.is_some() {
+            return Err(self.refused());
+        }
+        Ok(OriginalMigrationPoolClosed {
+            original: Arc::clone(self),
+        })
+    }
+    /// Diagnostic for preserving original retry/interruption causes on archive.
+    pub fn retains_original_causes(self: &Arc<Self>) -> Result<bool, MigrationStartupRefusal> {
+        self.login
+            .retained_cause_count()
+            .map(|count| count != 0)
+            .map_err(|_| self.refused())
+    }
     fn refused(self: &Arc<Self>) -> MigrationStartupRefusal {
         MigrationStartupRefusal {
             original: Arc::clone(self),
@@ -208,6 +334,38 @@ impl Drop for TaskLoan {
     }
 }
 
+/// Opaque same-owner SQLx cleanup receipt, not a serialized/native authority.
+pub struct OriginalMigrationPoolClosed {
+    original: Arc<OriginalMigrationStartup>,
+}
+impl OriginalMigrationPoolClosed {
+    pub fn original(&self) -> &Arc<OriginalMigrationStartup> {
+        &self.original
+    }
+}
+#[derive(Default)]
+struct SdkCloseState {
+    task: Option<JoinHandle<()>>,
+    started: bool,
+    sdk_done: bool,
+    joined: bool,
+    failure: Option<tokio::task::JoinError>,
+}
+struct CloseLoan {
+    original: Arc<OriginalMigrationStartup>,
+    task: Option<JoinHandle<()>>,
+}
+impl Drop for CloseLoan {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            self.original
+                .close
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .task = Some(task);
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +409,8 @@ mod tests {
             original_runtime: runtime,
             login: MigrationLogin::new(None),
             join: Semaphore::new(1),
+            close: Mutex::new(SdkCloseState::default()),
+            close_join: Semaphore::new(1),
             state: Mutex::new(State {
                 settings: None,
                 task: None,

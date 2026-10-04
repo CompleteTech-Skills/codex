@@ -26,6 +26,9 @@ impl MigrationLogin {
             },
         }
     }
+    pub(crate) fn retained_cause_count(&self) -> Result<usize, sqlx::Error> {
+        self.causes.retained_count()
+    }
     pub(crate) fn reserve_driver(
         &self,
     ) -> Result<crate::migration_causes::Reservation, sqlx::Error> {

@@ -36,6 +36,7 @@ mod activation_gate;
 mod migration_causes;
 mod migration_startup;
 pub use migration_startup::MigrationStartupRefusal;
+pub use migration_startup::OriginalMigrationPoolClosed;
 pub use migration_startup::OriginalMigrationStartup;
 mod migration_login;
 mod session_binding;
