@@ -42,6 +42,7 @@ struct Failure {
     result: std::result::Result<(), BootstrapError>,
     acquisition: Option<crate::PoolError>,
     task_failure: Option<Arc<tokio::task::JoinError>>,
+    diagnostic_acquisition: Option<crate::PoolError>,
 }
 impl std::fmt::Debug for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,6 +61,7 @@ impl Failure {
             &self.result,
             &self.acquisition,
             &self.task_failure,
+            &self.diagnostic_acquisition,
         );
         let _ = retained;
         f.write_str("bootstrap control refusal [original diagnostics retained]")
@@ -97,6 +99,14 @@ UNION ALL SELECT extnamespace FROM pg_catalog.pg_extension
 }
 
 async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> {
+    selected_bootstrap_with_diagnostic(state, named, fault, false).await
+}
+async fn selected_bootstrap_with_diagnostic(
+    state: &Path,
+    named: bool,
+    fault: u8,
+    recoverable: bool,
+) -> Result<()> {
     let receipt: serde_json::Value =
         serde_json::from_slice(&std::fs::read(state.join("receipt.json"))?)?;
     let role = if named {
@@ -123,6 +133,32 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
             max_connections: if fault == 5 { 2 } else { 1 },
         },
     };
+    // Independently read the same protected genuine Migrator profile BEFORE
+    // either factory future is polled. Original relay port never flows here.
+    let diagnostic_settings = recoverable
+        .then(|| -> Result<ConnectionSettings> {
+            Ok(ConnectionSettings {
+                host: "localhost".into(),
+                port: u16::try_from(
+                    receipt["port"]
+                        .as_u64()
+                        .ok_or("missing diagnostic fixture port")?,
+                )?,
+                database: "codex".into(),
+                username: format!("codex_{role}"),
+                password: std::fs::read_to_string(state.join(format!("secrets/{role}.password")))?
+                    .trim()
+                    .to_owned()
+                    .into(),
+                ca_certificate: state.join("secrets/ca.crt"),
+                limits: PoolLimits {
+                    connect_timeout: Duration::from_secs(5),
+                    acquire_timeout: Duration::from_secs(5),
+                    max_connections: 1,
+                },
+            })
+        })
+        .transpose()?;
     let relay_inputs = if fault == 6 {
         let ready_path = std::env::var("CODEX_TEST_BOOTSTRAP_COMMIT_RELAY_READY")?;
         let ready: serde_json::Value = serde_json::from_slice(&std::fs::read(ready_path)?)?;
@@ -148,16 +184,50 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
     let Some(pool) = captured else {
         return Err("no SDK dispatch captured".into());
     };
-    let owner = BootstrapSessionOwner::new(Arc::clone(&pool));
+    let mut diagnostic_pool = None;
+    let diagnostic_result = if let Some(settings) = diagnostic_settings {
+        Some(
+            crate::PostgresPool::connect_retained_in_namespace(
+                settings,
+                namespace.as_ref(),
+                &mut |actual| {
+                    diagnostic_pool = Some(actual); // SAME latent SDK before any acquisition.
+                    Ok(())
+                },
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let owner = match diagnostic_pool.as_ref() {
+        Some(diagnostic) => {
+            BootstrapSessionOwner::new_recoverable(Arc::clone(&pool), Arc::clone(diagnostic))
+        }
+        None => BootstrapSessionOwner::new(Arc::clone(&pool)),
+    };
     *owner
         .control_hold
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&owner));
     let mut task_failure = None;
     let mut witnessed = fault == 0;
+    let mut native_unknown_witnessed = !recoverable || fault != 3;
+    let mut diagnostic_error = None;
+    let diagnostic_ok = match diagnostic_result {
+        None => !recoverable,
+        Some(Ok(returned)) => diagnostic_pool
+            .as_ref()
+            .is_some_and(|actual| Arc::ptr_eq(actual, &returned) && !Arc::ptr_eq(actual, &pool)),
+        Some(Err(cause)) => {
+            diagnostic_error = Some(cause);
+            false
+        } // Original driver remains in captured SDK ledger.
+    };
     let result = match connected {
         Ok(returned) if Arc::ptr_eq(&returned, &pool) => {
             async {
+                if !diagnostic_ok { return Err(BootstrapError::Unavailable); }
                 require_actual_empty(&owner, namespace.as_ref()).await?;
                 if fault == 0 {
                     match namespace.as_ref() {
@@ -254,6 +324,20 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
                             ));
                         }));
                     }
+                    if recoverable && fault == 3 && witnessed {
+                        // Actual DDL has run and its SAME task is paused before
+                        // COMMIT. Observe its real in-progress xid before abort.
+                        let original_facts = {
+                            let state = owner.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state.native_origin.clone().zip(state.xid.clone())
+                        };
+                        if let (Some(diagnostic), Some((origin, xid))) = (owner.diagnostic.as_ref(), original_facts) {
+                            let observed = diagnostic.observe(&origin, &xid).await;
+                            native_unknown_witnessed = observed.is_err() && diagnostic.original_native_status().is_some_and(|(actual, status)| {
+                                Arc::ptr_eq(&actual, &xid) && status.as_deref() == Some("in progress")
+                            });
+                        }
+                    }
                     if fault != 6 { task.abort(); }
                     probe.release.notify_one();
                     let joined = task.await.map_err(Arc::new);
@@ -315,7 +399,25 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
     }
     recovered_blocker.connection.take();
     // Never infer task/session termination from a bare bootstrap error.
-    let reconciled = owner.reconcile_original().await;
+    let reconciled = if recoverable {
+        let mut result = owner.control_close_original_and_observe().await;
+        for _ in 0..6 {
+            let in_progress = owner.diagnostic.as_ref().is_some_and(|diagnostic| {
+                diagnostic
+                    .original_native_status()
+                    .is_some_and(|(_, status)| status.as_deref() == Some("in progress"))
+            });
+            if result.is_ok() || !in_progress {
+                break;
+            }
+            // Original native status is the retry witness, never a timeout ACK.
+            tokio::task::yield_now().await;
+            result = owner.control_close_original_and_observe().await;
+        }
+        result
+    } else {
+        owner.reconcile_original().await
+    };
     let proof = match reconciled {
         Ok(proof) => proof,
         Err(original) => {
@@ -382,6 +484,22 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.xid.clone().zip(state.outcome)
     };
+    let native_recovery_fact = !recoverable
+        || owner.diagnostic.as_ref().is_some_and(|diagnostic| {
+            let original_xid = owner.state.lock().ok().and_then(|state| state.xid.clone());
+            diagnostic
+                .original_native_status()
+                .zip(original_xid)
+                .is_some_and(|((observed, status), original)| {
+                    Arc::ptr_eq(&observed, &original)
+                        && status.as_deref()
+                            == Some(if fault == 0 || fault == 4 {
+                                "committed"
+                            } else {
+                                "aborted"
+                            })
+                })
+        });
     let covers = proof.covers_pool(&pool);
     let refused = proof.refused();
     if !covers {
@@ -390,6 +508,7 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
             result,
             acquisition: None,
             task_failure: task_failure.clone(),
+            diagnostic_acquisition: diagnostic_error,
         }));
     }
     // Session proof precedes real SDK closure; both finish before diagnostics.
@@ -399,6 +518,25 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
         .is_err();
     if late {
         close.await;
+    }
+    let mut diagnostic_late = false;
+    let mut diagnostic_closed = !recoverable;
+    if let Some(diagnostic) = diagnostic_pool.as_ref() {
+        let mut close = Box::pin(diagnostic.close_original_sdk());
+        diagnostic_late = tokio::time::timeout(Duration::from_secs(10), &mut close)
+            .await
+            .is_err();
+        if diagnostic_late {
+            close.await;
+        }
+        diagnostic_closed = match diagnostic.acquire().await {
+            Err(crate::PoolError::Closed) => true,
+            Ok(connection) => {
+                drop(connection);
+                false
+            }
+            Err(_) => false,
+        };
     }
     let mut acquisition = None;
     let closed = match pool.acquire().await {
@@ -419,15 +557,26 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
     }
-    if fault == 6 || (fault == 0 && result.is_err()) || !witnessed || late || !closed {
+    if fault == 6
+        || (fault == 0 && result.is_err())
+        || !witnessed
+        || late
+        || !closed
+        || diagnostic_late
+        || !diagnostic_closed
+        || !diagnostic_ok
+    {
         return Err(Box::new(Failure {
             original: owner,
             result,
             acquisition,
             task_failure: task_failure.clone(),
+            diagnostic_acquisition: diagnostic_error,
         }));
     }
     if !covers
+        || !native_unknown_witnessed
+        || !native_recovery_fact
         || refused != (fault == 2)
         || !matches!(outcome, Some((_, committed)) if committed == (fault == 0 || fault == 4))
     {
@@ -436,6 +585,7 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
             result,
             acquisition,
             task_failure: task_failure.clone(),
+            diagnostic_acquisition: diagnostic_error,
         }));
     }
     Ok(())
@@ -573,6 +723,59 @@ async fn actual_named_advisory_wait_original_abort() -> Result<()> {
         )?),
         true,
         5,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires fresh admitted default empty schema and genuine pg_control_system privilege; no grants"]
+async fn actual_default_diagnostic_owner_committed_bootstrap() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_DIAGNOSTIC_COMMIT_STATE",
+        )?),
+        false,
+        0,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires fresh admitted named empty schema and genuine pg_control_system privilege; no grants"]
+async fn actual_named_diagnostic_owner_committed_bootstrap() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_DIAGNOSTIC_COMMIT_STATE",
+        )?),
+        true,
+        0,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires separate admitted default empty schema and genuine pg_control_system privilege; no grants"]
+async fn actual_default_diagnostic_owner_actual_ddl_abort() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_DIAGNOSTIC_ABORT_STATE",
+        )?),
+        false,
+        3,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires separate admitted named empty schema and genuine pg_control_system privilege; no grants"]
+async fn actual_named_diagnostic_owner_actual_ddl_abort() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_DIAGNOSTIC_ABORT_STATE",
+        )?),
+        true,
+        3,
+        true,
     )
     .await
 }

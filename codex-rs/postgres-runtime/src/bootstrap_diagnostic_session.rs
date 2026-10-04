@@ -70,6 +70,29 @@ impl DiagnosticSession {
     pub(crate) fn original_pool(&self) -> &Arc<PostgresPool> {
         &self.original_pool
     }
+    #[cfg(test)]
+    pub(crate) fn original_native_status(&self) -> Option<(Arc<String>, Option<String>)> {
+        self.state
+            .lock()
+            .ok()?
+            .causes
+            .iter()
+            .rev()
+            .find_map(|cause| {
+                cause
+                    .native_status
+                    .as_ref()
+                    .map(|status| status.as_ref().clone())
+            })
+    }
+    pub(crate) fn has_original_observation(&self, xid: &Arc<String>) -> bool {
+        self.state.lock().ok().is_some_and(|state| {
+            state
+                .observation
+                .as_ref()
+                .is_some_and(|(observed, _)| Arc::ptr_eq(observed, xid))
+        })
+    }
     pub(crate) async fn observe(
         self: &Arc<Self>,
         original_origin: &NativeOrigin,

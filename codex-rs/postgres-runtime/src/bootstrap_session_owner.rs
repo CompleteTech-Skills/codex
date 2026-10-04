@@ -514,6 +514,36 @@ impl BootstrapSessionOwner {
             refused: refused || self.state.is_poisoned(),
         })
     }
+    #[cfg(test)]
+    async fn control_close_original_and_observe(
+        self: &Arc<Self>,
+    ) -> Result<BootstrapSessionCleanup, BootstrapSessionRefusal> {
+        let refusal = || BootstrapSessionRefusal {
+            original: Arc::clone(self),
+        };
+        let permit = Arc::clone(&self.join)
+            .acquire_owned()
+            .await
+            .map_err(|_| refusal())?;
+        let session = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.sealed = true;
+            state.session.take()
+        };
+        let mut loan = SessionLoan {
+            original: Arc::clone(self),
+            session,
+            _permit: permit,
+        };
+        self.recover_broken(&mut loan).await?;
+        Ok(BootstrapSessionCleanup {
+            original: Arc::clone(self),
+            refused: self.state.is_poisoned(),
+        })
+    }
     async fn recover_broken(
         self: &Arc<Self>,
         loan: &mut SessionLoan,
@@ -556,13 +586,7 @@ impl BootstrapSessionOwner {
         }
         // The server may need actual frontend shutdown to abort an in-progress
         // original transaction. Physical close itself is never an xid outcome.
-        if self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .outcome
-            .is_none()
-        {
+        if !diagnostic.has_original_observation(&xid) {
             let observed = diagnostic
                 .observe(&origin.ok_or_else(refusal)?, &xid)
                 .await
