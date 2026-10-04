@@ -31,8 +31,7 @@ async fn owner_fixture_sql(pool: &PostgresPool, statements: &[&'static str]) {
     transaction.commit().await.expect("commit owner fixture");
 }
 
-/// Applies the metadata and history grants a real bootstrap leaves behind, so hand-built older
-/// formats pass the protected-privilege check the preflight now enforces.
+/// Explicit fixture preparation; production bootstrap never normalizes unsafe legacy ACLs.
 async fn harden_metadata_grants(transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>) {
     for statement in [
         "REVOKE ALL ON codex_storage.codex_schema_meta FROM codex_runtime",
@@ -47,6 +46,61 @@ async fn harden_metadata_grants(transaction: &mut sqlx::Transaction<'_, sqlx::Po
             .await
             .expect("apply bootstrap metadata grants to older fixture");
     }
+}
+
+async fn refuse_then_harden_legacy_fixture(pool: &PostgresPool) {
+    async fn snapshot(pool: &PostgresPool) -> Value {
+        let mut connection = pool.acquire().await.expect("observe legacy fixture");
+        let mut transaction = connection.begin().await.expect("begin fixture observation");
+        for statement in ["SET TRANSACTION READ ONLY", "SET LOCAL ROLE codex_owner"] {
+            sqlx::query(statement)
+                .execute(&mut *transaction)
+                .await
+                .expect("observe as owner without inheriting migrator privileges");
+        }
+        let snapshot = sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+                'namespace', (SELECT to_jsonb(n) FROM pg_catalog.pg_namespace n WHERE n.nspname = 'codex_storage'),
+                'relations', (SELECT jsonb_agg(to_jsonb(c) ORDER BY c.oid) FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'codex_storage'),
+                'metadata', (SELECT jsonb_agg(to_jsonb(m) ORDER BY m.singleton) FROM codex_storage.codex_schema_meta m),
+                'history', (SELECT jsonb_agg(to_jsonb(h) ORDER BY h.version) FROM codex_storage._codex_pg_migrations h)
+            )",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("retain namespace, relation ACLs, metadata and history");
+        transaction
+            .rollback()
+            .await
+            .expect("finish read-only observation");
+        snapshot
+    }
+
+    let before = snapshot(pool).await;
+    assert_eq!(
+        bootstrap_codex_storage(pool).await,
+        Err(BootstrapError::Privilege),
+        "pre-hardening fixtures are refused, not normalized by bootstrap"
+    );
+    assert_eq!(
+        snapshot(pool).await,
+        before,
+        "refusal must preserve the fixture"
+    );
+
+    // This is an explicit test-fixture action after observing production refusal.
+    // It does not turn fixture grant repair into a supported runtime upgrade path.
+    let mut connection = pool.acquire().await.expect("prepare hardened fixture");
+    let mut transaction = connection.begin().await.expect("begin fixture hardening");
+    sqlx::query("SET LOCAL ROLE codex_owner")
+        .execute(&mut *transaction)
+        .await
+        .expect("assume fixture owner");
+    harden_metadata_grants(&mut transaction).await;
+    transaction
+        .commit()
+        .await
+        .expect("commit fixture hardening");
 }
 
 fn settings(state: &Path, role: &str) -> ConnectionSettings {
@@ -107,9 +161,9 @@ async fn real_v1_upgrade_through_graph_and_import_schemas_is_atomic() {
     v1.run_direct(/*target*/ None, &mut *transaction, /*skip*/ false)
         .await
         .expect("materialize exact embedded v1 migration");
-    harden_metadata_grants(&mut transaction).await;
     transaction.commit().await.expect("commit v1 fixture");
     drop(connection);
+    refuse_then_harden_legacy_fixture(&first).await;
 
     let old = ClientCapabilities {
         min_schema_format: 1,
@@ -279,9 +333,9 @@ async fn real_v2_upgrade_to_import_schema_is_atomic_and_role_scoped() {
     v2.run_direct(/*target*/ None, &mut *transaction, /*skip*/ false)
         .await
         .expect("materialize exact v2 migration prefix");
-    harden_metadata_grants(&mut transaction).await;
     transaction.commit().await.expect("commit v2 fixture");
     drop(connection);
+    refuse_then_harden_legacy_fixture(&first).await;
     let old = ClientCapabilities {
         min_schema_format: 2,
         max_schema_format: 2,
@@ -431,9 +485,9 @@ async fn real_v3_upgrade_to_thread_schema_preserves_history_and_origin_paths() {
     v3.run_direct(/*target*/ None, &mut *transaction, /*skip*/ false)
         .await
         .expect("materialize exact v3 migration prefix");
-    harden_metadata_grants(&mut transaction).await;
     transaction.commit().await.expect("commit v3 fixture");
     drop(connection);
+    refuse_then_harden_legacy_fixture(&first).await;
     let old = ClientCapabilities {
         min_schema_format: 3,
         max_schema_format: 3,
@@ -605,9 +659,9 @@ async fn real_v4_upgrade_to_section_catalog_rejects_orphans_and_preserves_join()
     v4.run_direct(/*target*/ None, &mut *transaction, /*skip*/ false)
         .await
         .expect("materialize exact v4 migration prefix");
-    harden_metadata_grants(&mut transaction).await;
     transaction.commit().await.expect("commit v4 fixture");
     drop(connection);
+    refuse_then_harden_legacy_fixture(&first).await;
     let old = ClientCapabilities {
         min_schema_format: 4,
         max_schema_format: 4,
