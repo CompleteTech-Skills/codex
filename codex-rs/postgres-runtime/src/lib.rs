@@ -209,6 +209,7 @@ pub struct PostgresPool {
     acquire_timeout: Duration,
     selected_search_path: Option<String>,
     activation_binding: std::sync::OnceLock<Arc<session_binding::ActivationBinding>>,
+    runtime_causes: Option<Arc<migration_causes::MigrationCauses>>,
 }
 
 enum ConnectedPool {
@@ -252,6 +253,23 @@ impl PostgresPool {
         .await
     }
 
+    /// Retain the actual original runtime SDK pool before first physical acquisition.
+    /// The callback must retain it outside this future. This grants no activation,
+    /// native-home, physical-socket, or mutation authority.
+    pub async fn connect_retained_in_namespace(
+        settings: ConnectionSettings,
+        namespace: Option<&NamedNamespace>,
+        capture: &mut (dyn FnMut(Arc<Self>) -> Result<(), PoolError> + Send),
+    ) -> Result<Arc<Self>, PoolError> {
+        Self::connect_retained_with_search_path(
+            settings,
+            Some(owned_namespace_search_path(namespace)),
+            None,
+            capture,
+        )
+        .await
+    }
+
     async fn connect_with_search_path(
         settings: ConnectionSettings,
         search_path: Option<String>,
@@ -268,7 +286,7 @@ impl PostgresPool {
         settings: ConnectionSettings,
         search_path: Option<String>,
         migration_login: Option<migration_login::MigrationLogin>,
-        capture: &mut (dyn FnMut(Arc<Self>) + Send),
+        capture: &mut (dyn FnMut(Arc<Self>) -> Result<(), PoolError> + Send),
     ) -> Result<Arc<Self>, PoolError> {
         match Self::connect_factory(settings, search_path, migration_login, Some(capture)).await? {
             ConnectedPool::Retained(pool) => Ok(pool),
@@ -280,7 +298,7 @@ impl PostgresPool {
         settings: ConnectionSettings,
         search_path: Option<String>,
         migration_login: Option<migration_login::MigrationLogin>,
-        capture: Option<&mut (dyn FnMut(Arc<Self>) + Send)>,
+        capture: Option<&mut (dyn FnMut(Arc<Self>) -> Result<(), PoolError> + Send)>,
     ) -> Result<ConnectedPool, PoolError> {
         let original_target = Some(ConnectionTarget::from_settings(&settings));
         let selected_search_path = search_path.clone();
@@ -327,6 +345,15 @@ impl PostgresPool {
             .ssl_root_cert(&settings.ca_certificate)
             .disable_statement_logging();
         let rejected_version = Arc::new(AtomicBool::new(false));
+        // Reuse the bounded original-cause storage primitive, not migration-login
+        // credentials/role policy. Captured original pool owns this ledger.
+        let runtime_causes = (capture.is_some() && migration_login.is_none())
+            .then(migration_causes::MigrationCauses::new);
+        let runtime_driver_reservation = runtime_causes
+            .as_ref()
+            .map(|causes| causes.reserve())
+            .transpose()
+            .map_err(|_| PoolError::Unavailable)?;
         let driver_reservation = migration_login
             .as_ref()
             .map(|login| login.reserve_driver())
@@ -339,33 +366,61 @@ impl PostgresPool {
             .acquire_timeout(limits.connect_timeout.max(limits.acquire_timeout))
             .after_connect({
                 let rejected_version = Arc::clone(&rejected_version);
+                let runtime_causes = runtime_causes.clone();
                 move |connection, _| {
                     let rejected_version = Arc::clone(&rejected_version);
                     let search_path = search_path.clone();
                     let migration_login = migration_login.clone();
+                    let runtime_causes = runtime_causes.clone();
                     Box::pin(async move {
-                        if let Some(login) = migration_login {
-                            login.initialize(&mut *connection).await?;
+                        let original_runtime_attempt = runtime_causes
+                            .as_ref()
+                            .map(|causes| causes.reserve())
+                            .transpose()?;
+                        let result = async {
+                            if let Some(login) = migration_login {
+                                login.initialize(&mut *connection).await?;
+                            }
+                            if let Some(search_path) = search_path {
+                                sqlx::query("SELECT set_config('search_path', $1, false)")
+                                    .bind(search_path)
+                                    .execute(&mut *connection)
+                                    .await
+                                    .map_err(|error| {
+                                        if runtime_causes.is_some() {
+                                            error
+                                        } else {
+                                            sqlx::Error::Configuration(Box::new(classify(&error)))
+                                        }
+                                    })?;
+                            }
+                            let version =
+                                sqlx::query_scalar::<_, String>("SHOW server_version_num")
+                                    .fetch_one(connection)
+                                    .await
+                                    .map_err(|error| {
+                                        if runtime_causes.is_some() {
+                                            error
+                                        } else {
+                                            sqlx::Error::Configuration(Box::new(classify(&error)))
+                                        }
+                                    })?;
+                            require_qualified_server_version(&version).map_err(|error| {
+                                rejected_version.store(true, Ordering::Relaxed);
+                                sqlx::Error::Configuration(Box::new(error))
+                            })
                         }
-                        if let Some(search_path) = search_path {
-                            sqlx::query("SELECT set_config('search_path', $1, false)")
-                                .bind(search_path)
-                                .execute(&mut *connection)
-                                .await
-                                .map_err(|error| {
-                                    sqlx::Error::Configuration(Box::new(classify(&error)))
-                                })?;
+                        .await;
+                        match (original_runtime_attempt, result) {
+                            (Some(reservation), Ok(())) => {
+                                reservation.success();
+                                Ok(())
+                            }
+                            (Some(reservation), Err(original)) => {
+                                Err(reservation.failure(original))
+                            }
+                            (None, result) => result,
                         }
-                        let version = sqlx::query_scalar::<_, String>("SHOW server_version_num")
-                            .fetch_one(connection)
-                            .await
-                            .map_err(|error| {
-                                sqlx::Error::Configuration(Box::new(classify(&error)))
-                            })?;
-                        require_qualified_server_version(&version).map_err(|error| {
-                            rejected_version.store(true, Ordering::Relaxed);
-                            sqlx::Error::Configuration(Box::new(error))
-                        })
                     })
                 }
             });
@@ -377,8 +432,9 @@ impl PostgresPool {
                 acquire_timeout: limits.acquire_timeout,
                 selected_search_path: selected_search_path.clone(),
                 activation_binding: std::sync::OnceLock::new(),
+                runtime_causes: runtime_causes.clone(),
             });
-            capture(Arc::clone(&original));
+            capture(Arc::clone(&original))?;
             // Capture is synchronous; the first physical acquire cannot outrun it.
             let result = timeout(limits.connect_timeout, original.pool.acquire())
                 .await
@@ -401,11 +457,16 @@ impl PostgresPool {
                     if let Some(reservation) = driver_reservation {
                         reservation.success();
                     }
+                    if let Some(reservation) = runtime_driver_reservation {
+                        reservation.success();
+                    }
                     Ok(pool)
                 }
                 Err(original) => {
                     let classified = classify(&original);
-                    if let Some(reservation) = driver_reservation {
+                    if let Some(reservation) = runtime_driver_reservation {
+                        let _ = reservation.failure(original);
+                    } else if let Some(reservation) = driver_reservation {
                         let _ = reservation.failure(original);
                     }
                     Err(classified)
@@ -429,8 +490,19 @@ impl PostgresPool {
                 acquire_timeout: limits.acquire_timeout,
                 selected_search_path,
                 activation_binding: std::sync::OnceLock::new(),
+                runtime_causes: runtime_causes.clone(),
             }))
         }
+    }
+
+    /// Original retained Runtime causes only; no socket/transaction outcome authority.
+    pub fn retains_original_runtime_causes(&self) -> Result<bool, PoolError> {
+        self.runtime_causes
+            .as_ref()
+            .map(|causes| causes.retained_count())
+            .transpose()
+            .map(|count| count.is_some_and(|count| count != 0))
+            .map_err(|_| PoolError::Unavailable)
     }
 
     pub async fn health(&self) -> Result<(), PoolError> {

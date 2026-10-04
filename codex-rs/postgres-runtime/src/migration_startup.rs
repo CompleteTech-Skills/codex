@@ -115,11 +115,16 @@ impl OriginalMigrationStartup {
                 }
             }
             let mut capture = |pool| {
-                original
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pool = Some(pool);
+                let (mut state, poisoned) = match original.state.lock() {
+                    Ok(state) => (state, false),
+                    Err(cause) => (cause.into_inner(), true),
+                };
+                state.pool = Some(pool); // Retain latent SDK even before refusal.
+                if poisoned || state.cleanup_sealed {
+                    Err(PoolError::Unavailable)
+                } else {
+                    Ok(())
+                }
             };
             let result = PostgresPool::connect_retained_with_search_path(
                 settings,
@@ -454,6 +459,7 @@ mod tests {
             acquire_timeout: std::time::Duration::from_secs(1),
             selected_search_path: None,
             activation_binding: std::sync::OnceLock::new(),
+            runtime_causes: None,
         });
         let settings = ConnectionSettings {
             host: "localhost".to_string(),
