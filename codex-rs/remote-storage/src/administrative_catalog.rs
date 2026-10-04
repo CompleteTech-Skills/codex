@@ -78,13 +78,17 @@ impl std::fmt::Debug for PayloadRefusal {
 }
 pub(super) const STATEMENTS: [Statement; 6] = [
     Statement {
-        rows: 64,
+        rows: 256,
         sql: r#"
 SELECT relation.oid::bigint AS relation_oid, namespace.oid::bigint AS namespace_oid,
        namespace.nspowner::bigint AS namespace_owner, namespace.nspacl::text AS namespace_acl,
        relation.relname::text, relation.relkind::text, relation.relowner::bigint,
        relation.relacl::text, relation.relispartition, relation.relrowsecurity,
        relation.relforcerowsecurity,
+       EXISTS (SELECT 1 FROM pg_catalog.pg_inherits inherited
+               WHERE inherited.inhrelid=relation.oid OR inherited.inhparent=relation.oid) AS has_inheritance,
+       EXISTS (SELECT 1 FROM pg_catalog.pg_rewrite rewritten
+               WHERE rewritten.ev_class=relation.oid) AS has_rules,
        (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(attribute) ORDER BY attribute.attnum)
         FROM pg_catalog.pg_attribute attribute
         WHERE attribute.attrelid=relation.oid AND attribute.attnum>0) AS attributes,
@@ -99,8 +103,8 @@ SELECT relation.oid::bigint AS relation_oid, namespace.oid::bigint AS namespace_
         FROM pg_catalog.pg_inherits inheritance
         WHERE inheritance.inhrelid=relation.oid OR inheritance.inhparent=relation.oid) AS inheritance
 FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_namespace namespace ON namespace.oid=relation.relnamespace
-WHERE namespace.nspname=$1 AND relation.relkind IN ('r','p','v','m','f','S')
-ORDER BY relation.oid LIMIT 65"#,
+WHERE namespace.nspname=$1
+ORDER BY relation.oid LIMIT 257"#,
     },
     Statement {
         rows: 64,
@@ -169,3 +173,286 @@ WHERE prepared.database=current_database() AND $1::text IS NOT NULL
 ORDER BY prepared.gid LIMIT 4097"#,
     },
 ];
+
+// Fixed current19 canonical names, pinned to the accompanying schema registry.
+const CURRENT_RELATIONS: &[&str] = &[
+    "_codex_pg_migrations",
+    "_codex_pg_migrations_pkey",
+    "codex_schema_meta",
+    "codex_schema_meta_pkey",
+    "thread_spawn_edges",
+    "thread_spawn_edges_pkey",
+    "idx_thread_spawn_edges_parent_status",
+    "external_agent_config_imports",
+    "external_agent_config_imports_pkey",
+    "idx_external_agent_config_imports_history",
+    "threads",
+    "threads_pkey",
+    "idx_threads_recency_id",
+    "idx_threads_section_recency",
+    "idx_threads_section_position",
+    "idx_threads_project_id",
+    "thread_sections",
+    "thread_sections_pkey",
+    "thread_writer_ownership",
+    "thread_writer_ownership_pkey",
+    "thread_goals",
+    "thread_goals_pkey",
+    "thread_goal_continuation_deferrals",
+    "thread_goal_continuation_deferrals_pkey",
+    "queued_items",
+    "queued_items_pkey",
+    "queued_items_thread_order_idx",
+    "queue_change_counter",
+    "queue_change_counter_pkey",
+    "queued_thread_revisions",
+    "queued_thread_revisions_pkey",
+    "queued_thread_revisions_revision_idx",
+    "logs",
+    "logs_pkey",
+    "logs_ts_idx",
+    "logs_thread_id_ts_idx",
+    "logs_threadless_process_ts_idx",
+    "log_id_counter",
+    "log_id_counter_pkey",
+    "memory_stage1_outputs",
+    "memory_stage1_outputs_pkey",
+    "memory_stage1_outputs_source_updated_idx",
+    "memory_jobs",
+    "memory_jobs_pkey",
+    "memory_jobs_kind_status_retry_lease_idx",
+    "memory_consolidation_progress",
+    "memory_consolidation_progress_pkey",
+    "agent_board_deleted",
+    "agent_board_deleted_pkey",
+    "agent_board_channels",
+    "agent_board_channels_pkey",
+    "agent_board_posts",
+    "agent_board_posts_pkey",
+    "agent_board_posts_id_key",
+    "agent_board_posts_request_key",
+    "agent_board_posts_channel_idx",
+    "agent_board_posts_channel_ts_idx",
+    "agent_board_posts_roots_idx",
+    "agent_board_posts_root_idx",
+    "agent_board_posts_root_ts_idx",
+    "agent_board_posts_board_ts_idx",
+    "agent_board_subscriptions",
+    "agent_board_subscriptions_pkey",
+    "agent_board_opt_outs",
+    "agent_board_opt_outs_pkey",
+    "agent_board_post_counter",
+    "agent_board_post_counter_pkey",
+    "thread_timestamp_marks",
+    "thread_timestamp_marks_pkey",
+    "projects",
+    "projects_pkey",
+    "idx_projects_position",
+    "project_roots",
+    "project_roots_pkey",
+    "project_idempotency_keys",
+    "project_idempotency_keys_pkey",
+    "thread_attachments",
+    "thread_attachments_pkey",
+    "thread_attachments_identity_key",
+    "idx_thread_attachments_thread_created_id",
+    "thread_rollout_lines",
+    "thread_rollout_lines_pkey",
+    "idx_thread_rollout_lines_ordinal",
+    "storage_migration_runs",
+    "storage_migration_runs_pkey",
+    "storage_migration_domains",
+    "storage_migration_domains_pkey",
+    "storage_activation",
+    "storage_activation_pkey",
+];
+
+// These names are proposed contracts, not proof that migrations20/21 ran.
+const GENERATION_RELATIONS: &[&str] = &[
+    "storage_generation_principals",
+    "storage_generation_principals_pkey",
+];
+const MEMORY_V2_RELATIONS: &[&str] = &[
+    "memory_v2_stage1_outputs",
+    "memory_v2_stage1_outputs_pkey",
+    "memory_v2_stage1_outputs_source_updated_idx",
+    "memory_v2_jobs",
+    "memory_v2_jobs_pkey",
+    "memory_v2_jobs_kind_status_retry_lease_idx",
+    "memory_v2_consolidation_progress",
+    "memory_v2_consolidation_progress_pkey",
+];
+
+pub(super) enum RelationRefusal {
+    Driver(sqlx::Error),
+    MissingSnapshot,
+    NonCanonical { relation: String },
+    Missing { relation: &'static str },
+    PartialExtension,
+}
+
+pub(super) struct RelationObservation {
+    pub(super) namespace_oid: i64,
+    pub(super) relation_count: usize,
+    pub(super) generation_relations_present: bool,
+    pub(super) memory_v2_relations_present: bool,
+}
+
+// A selected relation-name/kind closure only. This is not history eligibility,
+// column/index/constraint/trigger/routine/ACL validation, a coherent snapshot of
+// the six query groups, or a permission/retirement receipt. V2 relation presence
+// is schema-object presence only, never migrated dataset/file presence or empty
+// data. Final21 presence metadata is a separate required producer; no version
+// selection or source-presence interpretation follows from these names.
+pub(super) fn inspect_relations(
+    rows: &[sqlx::postgres::PgRow],
+) -> Result<RelationObservation, RelationRefusal> {
+    use sqlx::Row;
+    use std::collections::BTreeSet;
+    let mut names = BTreeSet::new();
+    let mut oids = BTreeSet::new();
+    let mut namespace = None;
+    for row in rows {
+        let name: String = row.try_get("relname").map_err(RelationRefusal::Driver)?;
+        let oid: i64 = row
+            .try_get("relation_oid")
+            .map_err(RelationRefusal::Driver)?;
+        let ns: i64 = row
+            .try_get("namespace_oid")
+            .map_err(RelationRefusal::Driver)?;
+        let kind: String = row.try_get("relkind").map_err(RelationRefusal::Driver)?;
+        let partition: bool = row
+            .try_get("relispartition")
+            .map_err(RelationRefusal::Driver)?;
+        let inherited: bool = row
+            .try_get("has_inheritance")
+            .map_err(RelationRefusal::Driver)?;
+        let rules: bool = row.try_get("has_rules").map_err(RelationRefusal::Driver)?;
+        let table = CURRENT_RELATIONS.contains(&name.as_str())
+            || GENERATION_RELATIONS.contains(&name.as_str())
+            || MEMORY_V2_RELATIONS.contains(&name.as_str());
+        let expected_kind = if CURRENT_TABLES.contains(&name.as_str())
+            || name == "storage_generation_principals"
+            || matches!(
+                name.as_str(),
+                "memory_v2_stage1_outputs" | "memory_v2_jobs" | "memory_v2_consolidation_progress"
+            ) {
+            "r"
+        } else {
+            "i"
+        };
+        if !table
+            || kind != expected_kind
+            || partition
+            || inherited
+            || rules
+            || oid <= 0
+            || ns <= 0
+            || !oids.insert(oid)
+            || namespace.is_some_and(|known| known != ns)
+            || !names.insert(name.clone())
+        {
+            return Err(RelationRefusal::NonCanonical { relation: name });
+        }
+        namespace = Some(ns);
+    }
+    for expected in CURRENT_RELATIONS {
+        if !names.contains(*expected) {
+            return Err(RelationRefusal::Missing { relation: expected });
+        }
+    }
+    let generation_count = GENERATION_RELATIONS
+        .iter()
+        .filter(|name| names.contains(**name))
+        .count();
+    let memory_count = MEMORY_V2_RELATIONS
+        .iter()
+        .filter(|name| names.contains(**name))
+        .count();
+    if (generation_count != 0 && generation_count != GENERATION_RELATIONS.len())
+        || (memory_count != 0 && memory_count != MEMORY_V2_RELATIONS.len())
+    {
+        return Err(RelationRefusal::PartialExtension);
+    }
+    Ok(RelationObservation {
+        namespace_oid: namespace.ok_or(RelationRefusal::MissingSnapshot)?,
+        relation_count: names.len(),
+        generation_relations_present: generation_count != 0,
+        memory_v2_relations_present: memory_count != 0,
+    })
+}
+
+impl std::fmt::Debug for RelationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Driver(raw) => {
+                let _ = raw;
+            }
+            Self::NonCanonical { relation } => {
+                let _ = relation;
+            }
+            Self::Missing { relation } => {
+                let _ = relation;
+            }
+            Self::MissingSnapshot | Self::PartialExtension => {}
+        }
+        formatter.write_str("CatalogRelationRefused([original catalog retained])")
+    }
+}
+const CURRENT_TABLES: &[&str] = &[
+    "_codex_pg_migrations",
+    "codex_schema_meta",
+    "thread_spawn_edges",
+    "external_agent_config_imports",
+    "threads",
+    "thread_sections",
+    "thread_writer_ownership",
+    "thread_goals",
+    "thread_goal_continuation_deferrals",
+    "queued_items",
+    "queue_change_counter",
+    "queued_thread_revisions",
+    "logs",
+    "log_id_counter",
+    "memory_stage1_outputs",
+    "memory_jobs",
+    "memory_consolidation_progress",
+    "agent_board_deleted",
+    "agent_board_channels",
+    "agent_board_posts",
+    "agent_board_subscriptions",
+    "agent_board_opt_outs",
+    "agent_board_post_counter",
+    "thread_timestamp_marks",
+    "projects",
+    "project_roots",
+    "project_idempotency_keys",
+    "thread_attachments",
+    "thread_rollout_lines",
+    "storage_migration_runs",
+    "storage_migration_domains",
+    "storage_activation",
+];
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) enum NativePayloadProbe {
+    Exact,
+    Overflow,
+}
+
+#[cfg(test)]
+impl NativePayloadProbe {
+    pub(super) fn sql(self, index: usize) -> Option<&'static str> {
+        match index {
+            0 => Some(
+                "SELECT NULL::text AS absent, repeat('x',4194304)::text AS text_value, decode('000102','hex') AS binary_value WHERE $1::text IS NOT NULL",
+            ),
+            1 => Some("SELECT repeat('y',4194301)::text AS text_value WHERE $1::text IS NOT NULL"),
+            2 if matches!(self, Self::Overflow) => {
+                Some("SELECT 'z'::text AS text_value WHERE $1::text IS NOT NULL")
+            }
+            _ => None,
+        }
+    }
+}

@@ -9,6 +9,8 @@ enum Mode {
     Idle,
     Begin,
     Aborted,
+    BudgetExact,
+    BudgetOverflow,
 }
 struct Failure {
     runtime: Option<Arc<OriginalRuntimeOrigin>>,
@@ -24,6 +26,7 @@ struct Failure {
     query: Option<AdministrativeCommandRefusal>,
     cleanup: Option<AdministrativeCommandRefusal>,
     archive: Option<AdministrativeCommandArchive>,
+    payload_decode: [Option<Arc<sqlx::Error>>; 5],
 }
 impl std::fmt::Debug for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -41,8 +44,22 @@ impl std::fmt::Debug for Failure {
             &self.query,
             &self.cleanup,
             &self.archive,
+            &self.payload_decode,
         );
         f.write_str("AdministrativeBaselineControlFailure([originals retained])")
+    }
+}
+fn remember_decode<T>(
+    result: Result<T, sqlx::Error>,
+    failure: &mut Failure,
+    index: usize,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(raw) => {
+            failure.payload_decode[index] = Some(Arc::new(raw));
+            None
+        }
     }
 }
 async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
@@ -60,6 +77,7 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
         query: None,
         cleanup: None,
         archive: None,
+        payload_decode: std::array::from_fn(|_| None),
     };
     let input = match crate::administration_startup::tests::input(named) {
         Ok(input) => input,
@@ -106,7 +124,7 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
     // Genuine raw SQL on the actual scoped session, not a helper task/session.
     // After setup begins, all verdicts are postponed until original command close.
     if let Some(connection) = frame.session.as_mut() {
-        if !matches!(mode, Mode::Idle) {
+        if matches!(mode, Mode::Begin | Mode::Aborted) {
             failure.setup[0] = Some(
                 sqlx::query("BEGIN")
                     .execute(&mut **connection)
@@ -124,6 +142,14 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
         }
     }
     let original = OriginalAdministrativeCommand::prepare(frame);
+    {
+        let mut state = original.state.lock().unwrap_or_else(|raw| raw.into_inner());
+        state.catalog_probe = match mode {
+            Mode::BudgetExact => Some(catalog::NativePayloadProbe::Exact),
+            Mode::BudgetOverflow => Some(catalog::NativePayloadProbe::Overflow),
+            _ => None,
+        };
+    }
     failure.command = Some(Arc::clone(&original));
     let dispatched = original.start_preflight();
     failure.dispatch = dispatched.err();
@@ -158,6 +184,78 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
             Mode::Aborted => {
                 code.as_deref() == Some("25P02") && !query_good && no_unowned_transaction
             }
+            Mode::BudgetExact | Mode::BudgetOverflow => {
+                let first = state.raw_catalog[0].as_ref().and_then(|rows| rows.first());
+                let actual_values = first.is_some_and(|row| {
+                    remember_decode(row.try_get::<Option<String>, _>("absent"), &mut failure, 0)
+                        .is_some_and(|value| value.is_none())
+                        && remember_decode(row.try_get::<String, _>("text_value"), &mut failure, 1)
+                            .is_some_and(|value| {
+                                value.len() == 4194304 && value.bytes().all(|byte| byte == b'x')
+                            })
+                        && remember_decode(
+                            row.try_get::<Vec<u8>, _>("binary_value"),
+                            &mut failure,
+                            2,
+                        )
+                        .is_some_and(|value| value == [0, 1, 2])
+                });
+                let second = state.raw_catalog[1]
+                    .as_ref()
+                    .and_then(|rows| rows.first())
+                    .is_some_and(|row| {
+                        remember_decode(row.try_get::<String, _>("text_value"), &mut failure, 3)
+                            .is_some_and(|value| {
+                                value.len() == 4194301 && value.bytes().all(|byte| byte == b'y')
+                            })
+                    });
+                let expected_cause = match mode {
+                    Mode::BudgetExact => {
+                        query_good
+                            && state.causes.iter().all(Option::is_none)
+                            && state.raw_catalog[2].is_none()
+                    }
+                    Mode::BudgetOverflow => {
+                        !query_good
+                            && state.causes.iter().flatten().count() == 1
+                            && state.causes.iter().flatten().any(|cause| {
+                                matches!(
+                                    cause.as_ref(),
+                                    CommandCause::Catalog(catalog::PayloadRefusal::Budget {
+                                        retained_before: catalog::PAYLOAD_BUDGET,
+                                        next_value_bytes: 1
+                                    })
+                                )
+                            })
+                            && state.raw_catalog[2]
+                                .as_ref()
+                                .and_then(|rows| rows.first())
+                                .is_some_and(|row| {
+                                    remember_decode(
+                                        row.try_get::<String, _>("text_value"),
+                                        &mut failure,
+                                        4,
+                                    )
+                                    .is_some_and(|value| value == "z")
+                                })
+                    }
+                    _ => false,
+                };
+                code.as_deref() == Some("25P01")
+                    && actual_values
+                    && second
+                    && expected_cause
+                    && state.catalog_payload_bytes == catalog::PAYLOAD_BUDGET
+                    && state.catalog_relations.is_none()
+                    && state.rollback_attempted
+                    && !state.commit_attempted
+                    && state.xid.is_some()
+                    && state
+                        .observed_status
+                        .as_ref()
+                        .and_then(|status| status.as_deref())
+                        == Some("aborted")
+            }
         };
         raw_expected
             && state.terminal
@@ -166,7 +264,9 @@ async fn control(named: bool, mode: Mode) -> Result<(), Failure> {
             && !original.state.is_poisoned()
     };
     let setup_good = match mode {
-        Mode::Idle => failure.setup.iter().all(Option::is_none),
+        Mode::Idle | Mode::BudgetExact | Mode::BudgetOverflow => {
+            failure.setup.iter().all(Option::is_none)
+        }
         Mode::Begin => failure.setup[0].as_ref().is_some_and(Result::is_ok),
         Mode::Aborted => {
             failure.setup[0].as_ref().is_some_and(Result::is_ok)
@@ -216,4 +316,18 @@ async fn named_native_baseline() -> Result<(), Failure> {
         control(true, mode).await?;
     }
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires admitted default same-target native origin/admin privileges; actual SQLx rows"]
+async fn default_native_catalog_payload_budget() -> Result<(), Failure> {
+    control(false, Mode::BudgetExact).await?;
+    control(false, Mode::BudgetOverflow).await
+}
+
+#[tokio::test]
+#[ignore = "requires admitted named same-target native origin/admin privileges; actual SQLx rows"]
+async fn named_native_catalog_payload_budget() -> Result<(), Failure> {
+    control(true, Mode::BudgetExact).await?;
+    control(true, Mode::BudgetOverflow).await
 }

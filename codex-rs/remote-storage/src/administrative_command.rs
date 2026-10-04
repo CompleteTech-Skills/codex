@@ -39,6 +39,7 @@ pub(super) enum CommandCause {
     UnknownStatus,
     Wait(tokio::sync::AcquireError),
     Catalog(catalog::PayloadRefusal),
+    Relations(catalog::RelationRefusal),
 }
 
 struct State {
@@ -53,6 +54,9 @@ struct State {
     raw_rows: Option<Vec<PgRow>>,
     raw_catalog: [Option<Vec<PgRow>>; 6],
     catalog_payload_bytes: usize,
+    catalog_relations: Option<catalog::RelationObservation>,
+    #[cfg(test)]
+    catalog_probe: Option<catalog::NativePayloadProbe>,
     observed_status: Option<Option<String>>,
     commit_attempted: bool,
     rollback_attempted: bool,
@@ -99,6 +103,9 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
                 CommandCause::Catalog(raw) => {
                     let _ = raw;
                 }
+                CommandCause::Relations(raw) => {
+                    let _ = raw;
+                }
                 CommandCause::MissingSession | CommandCause::UnknownStatus => {}
             }
         }
@@ -119,6 +126,14 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
             &state.origin,
             &state.startup,
         );
+        if let Some(observed) = &state.catalog_relations {
+            let _ = (
+                observed.namespace_oid,
+                observed.relation_count,
+                observed.generation_relations_present,
+                observed.memory_v2_relations_present,
+            );
+        }
         formatter.write_str("AdministrativeCommandRefused([original retained])")
     }
 }
@@ -222,6 +237,9 @@ impl OriginalAdministrativeCommand {
                 raw_rows: None,
                 raw_catalog: std::array::from_fn(|_| None),
                 catalog_payload_bytes: 0,
+                catalog_relations: None,
+                #[cfg(test)]
+                catalog_probe: None,
                 observed_status: None,
                 commit_attempted: false,
                 rollback_attempted: false,
@@ -406,6 +424,19 @@ impl OriginalAdministrativeCommand {
                 .to_owned()
         };
         for (index, statement) in catalog::STATEMENTS.iter().enumerate() {
+            #[cfg(not(test))]
+            let (statement_sql, payload_probe) = (statement.sql, false);
+            #[cfg(test)]
+            let (statement_sql, payload_probe) = {
+                let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                match state.catalog_probe {
+                    Some(probe) => match probe.sql(index) {
+                        Some(sql) => (sql, true),
+                        None => break,
+                    },
+                    None => (statement.sql, false),
+                }
+            };
             let admitted = {
                 let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
                 !state.refused && !self.state.is_poisoned()
@@ -413,7 +444,7 @@ impl OriginalAdministrativeCommand {
             if !admitted {
                 break;
             }
-            match sqlx::query(statement.sql)
+            match sqlx::query(statement_sql)
                 .bind(&namespace)
                 .fetch_all(&mut **connection)
                 .await
@@ -440,7 +471,21 @@ impl OriginalAdministrativeCommand {
                                 break;
                             }
                         }
-                        if index == 1 {
+                        if index == 0 && !payload_probe {
+                            let observation = match state.raw_catalog[0].as_ref() {
+                                Some(rows) => catalog::inspect_relations(rows),
+                                None => Err(catalog::RelationRefusal::MissingSnapshot),
+                            };
+                            match observation {
+                                Ok(observed) => state.catalog_relations = Some(observed),
+                                Err(raw) => {
+                                    drop(state);
+                                    self.cause(CommandCause::Relations(raw));
+                                    break;
+                                }
+                            }
+                        }
+                        if index == 1 && !payload_probe {
                             state.raw_catalog[index].as_ref().map(|rows| {
                                 rows.iter()
                                     .map(|row| row.try_get::<bool, _>("oversized"))
