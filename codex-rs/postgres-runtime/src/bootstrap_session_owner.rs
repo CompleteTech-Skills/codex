@@ -435,3 +435,7 @@ impl DdlReservation {
             .reserved = false;
     }
 }
+
+#[cfg(test)]
+#[path = "bootstrap_session_owner_tests.rs"]
+mod tests;
