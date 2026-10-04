@@ -396,6 +396,25 @@ async fn selected_sdk_task_faults(
             }));
         }
         probe.sdk_release.notify_one(); // Always release original body before diagnostics.
+        // No subsequent RPC/finish drives this cleanup: the registered reaper must
+        // join the original task and close its SDK resources automatically.
+        let automatic = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let joined = {
+                    original
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .failure
+                        .is_some()
+                };
+                if joined && original.resources.cleanup_completed() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
         let mut finish = Box::pin(service.original_operations.finish(Arc::clone(&original)));
         let timed = tokio::time::timeout(Duration::from_secs(20), &mut finish).await;
         let (late, result) = match timed {
@@ -441,7 +460,14 @@ async fn selected_sdk_task_faults(
             .lock()
             .map(|history| history.iter().any(|saved| Arc::ptr_eq(saved, &original)))
             .unwrap_or(false);
+        let retained = service
+            .original_operations
+            .originals
+            .lock()
+            .map(|entries| entries.iter().any(|saved| Arc::ptr_eq(saved, &original)))
+            .unwrap_or(false);
         if ready.is_err()
+            || automatic.is_err()
             || late
             || task_id.is_none()
             || !same_failure
@@ -449,7 +475,11 @@ async fn selected_sdk_task_faults(
             || snapshot.is_err()
             || count != 1
             || !closed
-            || !archived
+            || if poison {
+                !retained || archived
+            } else {
+                !archived
+            }
             || !original.resources.cleanup_completed()
             || result.is_ok()
         {
@@ -474,4 +504,69 @@ async fn real_named_original_sdk_task_panic_abort_poison_cleanup() -> ControlRes
         "isolation_",
     )
     .await
+}
+
+#[tokio::test]
+async fn missing_original_reaper_handle_never_mints_terminal_ack() -> ControlResult<()> {
+    let home = tempfile::tempdir()?.keep();
+    let service = service(&home);
+    let id = active(&service)?;
+    let probe = Arc::new(Probe::default());
+    *service
+        .original_operations
+        .probe
+        .lock()
+        .map_err(|_| "probe poisoned")? = Some(Arc::clone(&probe));
+    let original = service.original_operations.capture(
+        service.operation_context(),
+        Kind::Activate,
+        Some(id),
+        None,
+    )?;
+    let (handle, task_id) = {
+        let mut state = original
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = state.reaper.take();
+        let task_id = handle.as_ref().map(JoinHandle::id);
+        (handle, task_id)
+    };
+    probe.release.notify_one();
+    let refused = service
+        .original_operations
+        .finish(Arc::clone(&original))
+        .await
+        .is_err();
+    // Retain and physically join the SAME temporarily removed original handle,
+    // then cache its actual outcome before diagnostics or final registry cleanup.
+    let actual = if let Some(handle) = handle {
+        Some(handle.await)
+    } else {
+        None
+    };
+    {
+        let mut state = original
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(actual) = actual {
+            state.reaper_terminal = true;
+            if let Err(cause) = actual {
+                state.reaper_failure = Some(cause);
+            }
+        }
+    }
+    let reconciled = service
+        .original_operations
+        .finish(Arc::clone(&original))
+        .await;
+    if !refused
+        || task_id.is_none()
+        || reconciled.is_err()
+        || !original.resources.cleanup_completed()
+    {
+        return Err("missing original reaper handle accepted without physical proof".into());
+    }
+    Ok(())
 }
