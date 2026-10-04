@@ -15,6 +15,8 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 pub struct RuntimeNativeOrigin {
+    original_profile: Arc<RemotePostgresProfile>,
+    original_pool: Arc<PostgresPool>,
     pub(crate) system_identifier: String,
     pub(crate) database_oid: i64,
     pub(crate) login_oid: i64,
@@ -528,6 +530,8 @@ impl OriginalRuntimeOrigin {
         let row = state.row.as_ref().ok_or_else(refuse)?;
         let decoded = (|| -> Result<RuntimeNativeOrigin, sqlx::Error> {
             Ok(RuntimeNativeOrigin {
+                original_profile: Arc::clone(&self.profile),
+                original_pool: Arc::clone(&pool),
                 system_identifier: row.try_get("system_identifier")?,
                 database_oid: row.try_get("database_oid")?,
                 login_oid: row.try_get("login_oid")?,
@@ -585,6 +589,15 @@ impl Drop for RuntimeQueryLoan {
 }
 
 impl RuntimeNativeOrigin {
+    /// Exact original factory inputs only; no endpoint equality, historical
+    /// enrollment or exclusive permission follows from this association.
+    pub fn belongs_to_target(&self, profile: &Arc<RemotePostgresProfile>) -> bool {
+        Arc::ptr_eq(&self.original_profile, profile)
+    }
+    pub fn belongs_to_pool(&self, pool: &Arc<PostgresPool>) -> bool {
+        Arc::ptr_eq(&self.original_pool, pool)
+    }
+
     pub fn system_identifier(&self) -> &str {
         &self.system_identifier
     }
