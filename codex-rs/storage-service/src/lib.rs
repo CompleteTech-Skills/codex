@@ -6,6 +6,8 @@
 //! referenced, never carried: results contain codes and counts, not secrets or row contents.
 
 mod administration_binding;
+pub use administration_binding::AdministrativeOperationPlanRefusal;
+pub use administration_binding::OriginalAdministrativeOperationPlan;
 pub use administration_binding::OriginalServiceAdministration;
 pub use administration_binding::ServiceAdministrationPreparationRefusal;
 pub use administration_binding::ServiceRuntimeOriginRefusal;

@@ -20,6 +20,7 @@ pub(crate) struct Resources {
     administrative_observers: Arc<Slots<codex_remote_storage::RemoteAdministrativeObserver>>,
     administrative_attempts: Arc<Slots<codex_remote_storage::OriginalAdministrativeSessionAttempt>>,
     administrative_commands: Arc<Slots<codex_remote_storage::OriginalAdministrativeCommand>>,
+    administrative_operations: Arc<Slots<crate::administration_binding::OperationPlanFacts>>,
     administrative_archives:
         Mutex<[Option<Arc<codex_remote_storage::AdministrativeCommandArchive>>; CAPACITY]>,
     administrative_refused: Mutex<bool>,
@@ -57,6 +58,7 @@ impl Resources {
             administrative_observers: Arc::default(),
             administrative_attempts: Arc::default(),
             administrative_commands: Arc::default(),
+            administrative_operations: Arc::default(),
             administrative_archives: Mutex::new(std::array::from_fn(|_| None)),
             administrative_refused: Mutex::new(false),
             administrative_cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
@@ -159,6 +161,19 @@ impl Resources {
     ) -> Result<Creation<codex_remote_storage::OriginalAdministrativeCommand>, Refusal> {
         self.administrative_commands.reserve()
     }
+    pub(crate) fn retain_administrative_operation(
+        &self,
+        original: Arc<crate::administration_binding::OperationPlanFacts>,
+        service: &crate::StorageService,
+    ) -> Result<(), Refusal> {
+        let slot = self.administrative_operations.reserve()?;
+        slot.capture_original_arc(Arc::clone(&original))?;
+        if let Err(raw) = original.revalidate_journal(service) {
+            slot.record_retained_failure(Arc::new(raw));
+            return Err(Refusal);
+        }
+        Ok(())
+    }
     pub(crate) fn reserve_runtime(&self) -> Result<Creation<RemoteStorage>, Refusal> {
         self.runtimes.reserve()
     }
@@ -199,6 +214,19 @@ impl Resources {
             && archives[actual[0].0].is_some()
     }
     pub(crate) fn retains_original_causes(&self) -> bool {
+        if self
+            .administrative_operations
+            .state
+            .lock()
+            .map_or(true, |state| {
+                state
+                    .entries
+                    .iter()
+                    .any(|entry| entry.returned_failure.is_some())
+            })
+        {
+            return true;
+        }
         if self
             .administrative_cleanup_causes
             .lock()
@@ -535,6 +563,8 @@ impl Resources {
                     self.administrative_attempts.seal_cleanup_snapshot();
                 let (admin_commands, command_unresolved, command_poison) =
                     self.administrative_commands.seal_cleanup_snapshot();
+                let (_admin_operations, operation_unresolved, operation_poison) =
+                    self.administrative_operations.seal_cleanup_snapshot();
                 let original = Arc::clone(self);
                 let startups = Arc::clone(startups);
                 state.task = Some(tokio::spawn(async move {
@@ -550,6 +580,8 @@ impl Resources {
                         || attempt_poison
                         || command_unresolved
                         || command_poison
+                        || operation_unresolved
+                        || operation_poison
                         || cleanup_poison
                         || body_poison
                         || runtime_poison

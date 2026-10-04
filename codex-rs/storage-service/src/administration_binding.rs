@@ -7,6 +7,12 @@ use codex_storage_authority::RemoteAdministrationInput;
 use std::fmt;
 use std::sync::Arc;
 
+#[path = "administrative_operation_plan.rs"]
+mod operation_plan;
+pub use operation_plan::AdministrativeOperationPlanRefusal;
+pub(crate) use operation_plan::OperationPlanFacts;
+pub use operation_plan::OriginalAdministrativeOperationPlan;
+
 /// Prepared synchronously before credential lookup or administrative dispatch.
 /// The host must retain this beside its genuine original host owner and validate
 /// that owner before polling the observer. This binding supplies no host proof.
@@ -139,10 +145,16 @@ impl OriginalServiceAdministration {
         self: &Arc<Self>,
         origin: Arc<codex_remote_storage::RuntimeNativeOrigin>,
     ) -> Result<(), ServiceRuntimeOriginRefusal> {
+        self.preflight_associated(origin, None).await
+    }
+    fn retain_original_origin(
+        self: &Arc<Self>,
+        origin: &Arc<codex_remote_storage::RuntimeNativeOrigin>,
+    ) -> Result<(), ServiceRuntimeOriginRefusal> {
         let refused = || ServiceRuntimeOriginRefusal {
             original: Arc::clone(self),
             cause: crate::StorageError(crate::BlockerCode::Internal),
-            native_origin: Some(Arc::clone(&origin)),
+            native_origin: Some(Arc::clone(origin)),
         };
         if !origin.belongs_to_target(self.observer.original_input().target()) {
             return Err(refused());
@@ -150,23 +162,42 @@ impl OriginalServiceAdministration {
         {
             let mut original = self.native_origin.lock().map_err(|_| refused())?;
             if let Some(captured) = original.as_ref() {
-                if !Arc::ptr_eq(captured, &origin) {
+                if !Arc::ptr_eq(captured, origin) {
                     return Err(refused());
                 }
             } else {
-                *original = Some(Arc::clone(&origin));
+                *original = Some(Arc::clone(origin));
             }
         }
+        Ok(())
+    }
+    async fn preflight_associated(
+        self: &Arc<Self>,
+        origin: Arc<codex_remote_storage::RuntimeNativeOrigin>,
+        operation: Option<Arc<OperationPlanFacts>>,
+    ) -> Result<(), ServiceRuntimeOriginRefusal> {
+        self.retain_original_origin(&origin)?;
+        let dispatch_id = operation
+            .as_ref()
+            .map_or(self.preflight_id, |facts| facts.dispatch_id);
         let retained_origin = Arc::clone(&origin);
         let observer = Arc::clone(&self.observer);
         let result = self
             .service
             .original_observation(
                 crate::service_operations::Kind::AdministrativePreflight,
-                Some(self.preflight_id),
+                Some(dispatch_id),
                 move |service| async move {
                     let refused = || crate::StorageError(crate::BlockerCode::Internal);
                     let resources = service.operation_resources.as_ref().ok_or_else(refused)?;
+                    if let Some(operation) = operation {
+                        if !operation.matches_original(&service.inputs, &observer, &origin) {
+                            return Err(refused());
+                        }
+                        resources
+                            .retain_administrative_operation(operation, &service)
+                            .map_err(|_| refused())?;
+                    }
                     let observer_slot = resources
                         .reserve_administrative_observer()
                         .map_err(|_| refused())?;
