@@ -138,6 +138,14 @@ impl BootstrapSessionOwner {
             state.causes[index].reserved = true; // Before actual SQL future first poll.
             index
         };
+        let reservation = DdlReservation {
+            original: Arc::clone(self),
+            index,
+            interrupted: Arc::new(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "original bootstrap SQL future interrupted; outcome unresolved",
+            )),
+        };
         match future.await {
             Ok(value) => {
                 self.state
@@ -145,6 +153,7 @@ impl BootstrapSessionOwner {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .causes[index]
                     .reserved = false;
+                reservation.success();
                 Ok(value)
             }
             Err(original) => {
@@ -169,6 +178,10 @@ impl BootstrapSessionOwner {
         Ok(DdlReservation {
             original: Arc::clone(self),
             index,
+            interrupted: Arc::new(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "original bootstrap DDL future interrupted; outcome unresolved",
+            )),
         })
     }
     pub(crate) async fn stamp(
@@ -386,6 +399,21 @@ impl std::error::Error for BootstrapSessionRefusal {}
 pub(crate) struct DdlReservation {
     original: Arc<BootstrapSessionOwner>,
     index: usize,
+    interrupted: Arc<std::io::Error>,
+}
+impl Drop for DdlReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .original
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cause = &mut state.causes[self.index];
+        if cause.reserved && cause.original.is_none() {
+            cause.original =
+                Some(Arc::clone(&self.interrupted) as Arc<dyn std::error::Error + Send + Sync>);
+        }
+    }
 }
 impl DdlReservation {
     pub(crate) fn failure<E: std::error::Error + Send + Sync + 'static>(&self, original: E) {
