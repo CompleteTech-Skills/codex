@@ -555,10 +555,28 @@ impl PostgresPool {
     }
 
     pub async fn acquire(&self) -> Result<PoolConnection<Postgres>, PoolError> {
-        timeout(self.acquire_timeout, self.pool.acquire())
-            .await
-            .map_err(|_| PoolError::Timeout)?
-            .map_err(|error| classify(&error))
+        let reservation = self
+            .runtime_causes
+            .as_ref()
+            .map(|owner| owner.reserve())
+            .transpose()
+            .map_err(|_| PoolError::Unavailable)?;
+        match timeout(self.acquire_timeout, self.pool.acquire()).await {
+            Ok(Ok(connection)) => {
+                if let Some(reservation) = reservation {
+                    reservation.success();
+                }
+                Ok(connection)
+            }
+            Ok(Err(original)) => {
+                let projected = classify(&original);
+                if let Some(reservation) = reservation {
+                    let _ = reservation.failure(original);
+                }
+                Err(projected)
+            }
+            Err(_) => Err(PoolError::Timeout), // Reservation Drop keeps interrupted evidence.
+        }
     }
 }
 
