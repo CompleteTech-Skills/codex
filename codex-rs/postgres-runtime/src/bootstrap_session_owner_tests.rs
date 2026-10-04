@@ -11,6 +11,7 @@ struct Failure {
     original: Arc<BootstrapSessionOwner>,
     result: std::result::Result<(), BootstrapError>,
     acquisition: Option<crate::PoolError>,
+    task_failure: Option<Arc<tokio::task::JoinError>>,
 }
 impl std::fmt::Debug for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -24,7 +25,12 @@ impl std::fmt::Display for Failure {
 }
 impl Failure {
     fn fmt_safe(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let retained = (&self.original, &self.result, &self.acquisition);
+        let retained = (
+            &self.original,
+            &self.result,
+            &self.acquisition,
+            &self.task_failure,
+        );
         let _ = retained;
         f.write_str("bootstrap control refusal [original diagnostics retained]")
     }
@@ -60,7 +66,7 @@ UNION ALL SELECT extnamespace FROM pg_catalog.pg_extension
     }
 }
 
-async fn selected_bootstrap(state: &Path, named: bool) -> Result<()> {
+async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> {
     let receipt: serde_json::Value =
         serde_json::from_slice(&std::fs::read(state.join("receipt.json"))?)?;
     let role = if named {
@@ -102,15 +108,70 @@ async fn selected_bootstrap(state: &Path, named: bool) -> Result<()> {
         return Err("no SDK dispatch captured".into());
     };
     let owner = BootstrapSessionOwner::new(Arc::clone(&pool));
+    let mut task_failure = None;
+    let mut witnessed = fault == 0;
     let result = match connected {
         Ok(returned) if Arc::ptr_eq(&returned, &pool) => {
             async {
                 require_actual_empty(&owner, namespace.as_ref()).await?;
-                match namespace.as_ref() {
-                    Some(namespace) => {
-                        crate::bootstrap_named_namespace_retained(&owner, namespace).await
+                if fault == 0 {
+                    match namespace.as_ref() {
+                        Some(namespace) => {
+                            crate::bootstrap_named_namespace_retained(&owner, namespace).await
+                        }
+                        None => crate::bootstrap_codex_storage_retained(&owner).await,
                     }
-                    None => crate::bootstrap_codex_storage_retained(&owner).await,
+                } else {
+                    let probe = Arc::new(StampProbe::default());
+                    *owner
+                        .stamp_probe
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(Arc::clone(&probe));
+                    let actual = Arc::clone(&owner);
+                    let selected = namespace.clone();
+                    let start = Arc::new(tokio::sync::Notify::new());
+                    let entry = Arc::clone(&start);
+                    let task = tokio::spawn(async move {
+                        entry.notified().await;
+                        match selected.as_ref() {
+                            Some(namespace) => {
+                                crate::bootstrap_named_namespace_retained(&actual, namespace).await
+                            }
+                            None => crate::bootstrap_codex_storage_retained(&actual).await,
+                        }
+                    });
+                    let original_id = task.id();
+                    start.notify_one(); // Original handle captured before first SQL poll.
+                    witnessed =
+                        tokio::time::timeout(Duration::from_secs(10), probe.entered.notified())
+                            .await
+                            .is_ok();
+                    if fault == 2 && witnessed {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _guard = owner
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            std::panic::resume_unwind(Box::new(
+                                "actual owner state poison control",
+                            ));
+                        }));
+                    }
+                    task.abort();
+                    probe.release.notify_one();
+                    match task.await {
+                        // SAME original physical join before reconciliation/verdict.
+                        Err(original) => {
+                            witnessed &= original.is_cancelled() && original.id() == original_id;
+                            task_failure = Some(Arc::new(original));
+                            Err(BootstrapError::Migration)
+                        }
+                        Ok(result) => {
+                            witnessed = false;
+                            result
+                        }
+                    }
                 }
             }
             .await
@@ -129,7 +190,13 @@ async fn selected_bootstrap(state: &Path, named: bool) -> Result<()> {
             return terminal;
         }
     };
-    let outcome = owner.observed_original_outcome();
+    let outcome = {
+        let state = owner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.xid.clone().zip(state.outcome)
+    };
     let covers = proof.covers_pool(&pool);
     let refused = proof.refused();
     if !covers {
@@ -137,6 +204,7 @@ async fn selected_bootstrap(state: &Path, named: bool) -> Result<()> {
             original: owner,
             result,
             acquisition: None,
+            task_failure: task_failure.clone(),
         }));
     }
     // Session proof precedes real SDK closure; both finish before diagnostics.
@@ -159,18 +227,23 @@ async fn selected_bootstrap(state: &Path, named: bool) -> Result<()> {
             false
         }
     };
-    if result.is_err() || late || !closed {
+    if (fault == 0 && result.is_err()) || !witnessed || late || !closed {
         return Err(Box::new(Failure {
             original: owner,
             result,
             acquisition,
+            task_failure: task_failure.clone(),
         }));
     }
-    if !covers || refused || !matches!(outcome, Some((_, true))) {
+    if !covers
+        || refused != (fault == 2)
+        || !matches!(outcome, Some((_, committed)) if committed == (fault == 0))
+    {
         return Err(Box::new(Failure {
             original: owner,
             result,
             acquisition,
+            task_failure: task_failure.clone(),
         }));
     }
     Ok(())
@@ -183,6 +256,7 @@ async fn actual_default_bootstrap_original_committed_session() -> Result<()> {
             "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_STATE",
         )?),
         false,
+        0,
     )
     .await
 }
@@ -192,6 +266,22 @@ async fn actual_named_bootstrap_original_committed_session() -> Result<()> {
     selected_bootstrap(
         Path::new(&std::env::var("CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_STATE")?),
         true,
+        0,
     )
     .await
+}
+
+#[tokio::test]
+#[ignore = "requires an admitted fresh empty default bootstrap fixture"]
+async fn actual_default_xid_abort_and_poison_reconcile_original() -> Result<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_STATE")?;
+    selected_bootstrap(Path::new(&state), false, 1).await?;
+    selected_bootstrap(Path::new(&state), false, 2).await
+}
+#[tokio::test]
+#[ignore = "requires an admitted fresh empty named bootstrap fixture"]
+async fn actual_named_xid_abort_and_poison_reconcile_original() -> Result<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_STATE")?;
+    selected_bootstrap(Path::new(&state), true, 1).await?;
+    selected_bootstrap(Path::new(&state), true, 2).await
 }

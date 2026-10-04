@@ -16,6 +16,8 @@ pub struct BootstrapSessionOwner {
     pool: Arc<PostgresPool>,
     state: Mutex<State>,
     join: Arc<Semaphore>,
+    #[cfg(test)]
+    stamp_probe: Mutex<Option<Arc<StampProbe>>>,
 }
 struct State {
     sealed: bool,
@@ -37,6 +39,8 @@ impl BootstrapSessionOwner {
         Arc::new(Self {
             pool,
             join: Arc::new(Semaphore::new(1)),
+            #[cfg(test)]
+            stamp_probe: Mutex::new(None),
             state: Mutex::new(State {
                 sealed: false,
                 cleanup_complete: false,
@@ -195,16 +199,26 @@ impl BootstrapSessionOwner {
                 false,
             )
             .await?;
-        let (mut state, poison) = match self.state.lock() {
-            Ok(state) => (state, false),
-            Err(cause) => (cause.into_inner(), true),
-        };
-        if state.xid.is_some() {
-            return Err(BootstrapError::Migration);
+        {
+            let (mut state, poison) = match self.state.lock() {
+                Ok(state) => (state, false),
+                Err(cause) => (cause.into_inner(), true),
+            };
+            if state.xid.is_some() {
+                return Err(BootstrapError::Migration);
+            }
+            state.xid = Some(Arc::new(stamp)); // Capture returned native fact BEFORE poison refusal.
+            if poison {
+                return Err(BootstrapError::Migration);
+            }
         }
-        state.xid = Some(Arc::new(stamp)); // Capture returned native fact BEFORE poison refusal.
-        if poison {
-            return Err(BootstrapError::Migration);
+        #[cfg(test)]
+        {
+            let probe = self.stamp_probe.lock().ok().and_then(|probe| probe.clone());
+            if let Some(probe) = probe {
+                probe.entered.notify_one();
+                probe.release.notified().await;
+            }
         }
         Ok(())
     }
@@ -436,6 +450,12 @@ impl DdlReservation {
     }
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct StampProbe {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
 #[cfg(test)]
 #[path = "bootstrap_session_owner_tests.rs"]
 mod tests;
