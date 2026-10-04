@@ -55,6 +55,63 @@ pub struct AdministrativeObservationBorrow {
     slot: usize,
 }
 impl AdministrativeObservationBorrow {
+    /// Final registry observation and scoped-frame construction share the same
+    /// admission mutex. No asynchronous work is dispatched by this closure.
+    pub(super) fn finish_scoped<T>(
+        self,
+        origin: &Arc<crate::runtime_origin::RuntimeNativeOrigin>,
+        session_present: bool,
+        finish: impl FnOnce(Self) -> T,
+    ) -> Result<T, (Self, AdministrativeRegistryRefusal)> {
+        let registry = Arc::clone(&self.registry);
+        let state = match registry.state.lock() {
+            Ok(state) => state,
+            Err(error) => {
+                drop(error.into_inner());
+                let refused =
+                    registry.refusal(Some(Arc::clone(&self.original)), None, "registry_poisoned");
+                return Err((self, refused));
+            }
+        };
+        let admitted = matches!(&state.slots[self.slot], Slot::Active {
+            original, borrowers, sealed: false, ..
+        } if Arc::ptr_eq(original, &self.original) && *borrowers > 0);
+        if !admitted {
+            drop(state);
+            let refused = registry.refusal(
+                Some(Arc::clone(&self.original)),
+                None,
+                "scoped_borrower_refused",
+            );
+            return Err((self, refused));
+        }
+        let original = Arc::clone(&self.original);
+        let original_state = match original.final_runtime_session_state(origin, session_present) {
+            Ok(guard) => guard,
+            Err(returned) => {
+                drop(state);
+                let refused = registry.refusal(
+                    Some(Arc::clone(&original)),
+                    Some(returned),
+                    "scoped_original_refused",
+                );
+                return Err((self, refused));
+            }
+        };
+        let completed = finish(self);
+        drop(original_state);
+        drop(state);
+        Ok(completed)
+    }
+    pub(super) async fn original_runtime_session(
+        &self,
+        origin: Arc<crate::runtime_origin::RuntimeNativeOrigin>,
+    ) -> Result<
+        tokio::sync::OwnedMutexGuard<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
+        AdministrativeStartupRefusal,
+    > {
+        self.original.original_runtime_session(origin).await
+    }
     pub async fn observe_original(
         &self,
     ) -> Result<Arc<AdministrativeNativeObservation>, AdministrativeStartupRefusal> {
@@ -128,6 +185,22 @@ impl OriginalAdministrativeRegistry {
         input: Arc<RemoteAdministrationInput>,
         resolver: &HostCredentialResolver<'_>,
     ) -> Result<AdministrativeObservationBorrow, AdministrativeRegistryRefusal> {
+        self.capture_associated(input, None, resolver)
+    }
+    pub(super) fn capture_runtime_origin(
+        self: &Arc<Self>,
+        input: Arc<RemoteAdministrationInput>,
+        origin: Arc<crate::runtime_origin::RuntimeNativeOrigin>,
+        resolver: &HostCredentialResolver<'_>,
+    ) -> Result<AdministrativeObservationBorrow, AdministrativeRegistryRefusal> {
+        self.capture_associated(input, Some(origin), resolver)
+    }
+    fn capture_associated(
+        self: &Arc<Self>,
+        input: Arc<RemoteAdministrationInput>,
+        origin: Option<Arc<crate::runtime_origin::RuntimeNativeOrigin>>,
+        resolver: &HostCredentialResolver<'_>,
+    ) -> Result<AdministrativeObservationBorrow, AdministrativeRegistryRefusal> {
         let mut state = self
             .state
             .lock()
@@ -167,6 +240,17 @@ impl OriginalAdministrativeRegistry {
                         (None, actual) => *pool = actual,
                         _ => {}
                     }
+                    if let Some(origin) = origin.as_ref() {
+                        original
+                            .bind_runtime_origin(Arc::clone(origin))
+                            .map_err(|returned| {
+                                self.refusal(
+                                    Some(Arc::clone(original)),
+                                    Some(returned),
+                                    "runtime_origin_refused",
+                                )
+                            })?;
+                    }
                     *borrowers = borrowers.checked_add(1).ok_or_else(|| {
                         self.refusal(Some(Arc::clone(original)), None, "borrower_budget")
                     })?;
@@ -191,6 +275,14 @@ impl OriginalAdministrativeRegistry {
             sealed: false,
         };
         state.hold = Some(Arc::clone(self));
+        if let Some(origin) = origin {
+            if let Err(returned) = original.bind_runtime_origin(origin) {
+                if let Slot::Active { borrowers, .. } = &mut state.slots[slot] {
+                    *borrowers = 0;
+                }
+                return Err(self.refusal(Some(original), Some(returned), "runtime_origin_refused"));
+            }
+        }
         // Registry owns actual frame before first factory/credential dispatch.
         if let Err(returned) = original.dispatch_original(resolver) {
             if let Slot::Active { borrowers, .. } = &mut state.slots[slot] {

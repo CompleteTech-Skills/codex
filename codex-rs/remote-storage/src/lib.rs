@@ -19,6 +19,7 @@ pub use runtime_origin::RuntimeNativeOrigin;
 pub use runtime_origin::RuntimeOriginRefusal;
 
 pub use administration::AdministrativeObservationRefusal;
+pub use administration::OriginalAdministrativeRuntimeSession;
 pub use administration::RemoteAdministrativeObserver;
 pub use administration_registry::AdministrativeFailureArchive;
 pub use administration_registry::AdministrativeRegistryRefusal;

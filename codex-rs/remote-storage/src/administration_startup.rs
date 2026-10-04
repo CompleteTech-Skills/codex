@@ -5,6 +5,7 @@ use crate::administration_close::OriginalAdministrativeClose;
 use crate::administration_settings::AdministrativeFactoryError;
 use crate::administration_settings::administrative_settings;
 use crate::administration_settings::connect_administration_prepared;
+use crate::runtime_origin::RuntimeNativeOrigin;
 use codex_postgres_runtime::NamedNamespace;
 use codex_postgres_runtime::PoolError;
 use codex_postgres_runtime::PostgresPool;
@@ -51,7 +52,13 @@ struct State {
     raw_role_row: Option<PgRow>,
     raw_identity_row: Option<PgRow>,
     poison_seen: bool,
+    runtime_origin: Option<Arc<RuntimeNativeOrigin>>,
+    refused_runtime_origin: Option<Arc<RuntimeNativeOrigin>>,
     hold: Option<Arc<OriginalAdministrativeStartup>>,
+}
+
+pub(super) struct AdministrativeSessionStateGuard<'a> {
+    _original_state: std::sync::MutexGuard<'a, State>,
 }
 
 pub struct OriginalAdministrativeStartup {
@@ -76,6 +83,9 @@ impl AdministrativeStartupRefusal {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if state.refused_runtime_origin.is_some() {
+            return "administrative_runtime_origin_refused";
+        }
         if state.join_failure.is_some() {
             return "administrative_task_join_failed";
         }
@@ -183,6 +193,8 @@ impl OriginalAdministrativeStartup {
                 raw_role_row: None,
                 raw_identity_row: None,
                 poison_seen: false,
+                runtime_origin: None,
+                refused_runtime_origin: None,
                 hold: None,
             }),
             session: Arc::new(AsyncMutex::new(None)),
@@ -414,6 +426,108 @@ impl OriginalAdministrativeStartup {
             return Err(Arc::new(Cause::RefusedNativeFacts));
         }
         Ok(Arc::new(observation))
+    }
+
+    /// Own the actual runtime association before any asynchronous startup join.
+    /// This checks identity observations only; it is never an exclusive permit.
+    pub(super) fn final_runtime_session_state(
+        self: &Arc<Self>,
+        origin: &Arc<RuntimeNativeOrigin>,
+        session_present: bool,
+    ) -> Result<AdministrativeSessionStateGuard<'_>, AdministrativeStartupRefusal> {
+        let refused = || AdministrativeStartupRefusal {
+            original: Arc::clone(self),
+        };
+        let state = self.state.lock().map_err(|_| refused())?;
+        let Some(Ok(observed)) = state.returned.as_ref() else {
+            return Err(refused());
+        };
+        if state.poison_seen
+            || self.state.is_poisoned()
+            || state.task.is_some()
+            || state.join_failure.is_some()
+            || !session_present
+            || !state
+                .runtime_origin
+                .as_ref()
+                .is_some_and(|saved| Arc::ptr_eq(saved, origin))
+            || observed.system_identifier != origin.system_identifier()
+            || observed.database_oid != origin.database_oid()
+        {
+            return Err(refused());
+        }
+        Ok(AdministrativeSessionStateGuard {
+            _original_state: state,
+        })
+    }
+
+    pub(super) fn bind_runtime_origin(
+        self: &Arc<Self>,
+        origin: Arc<RuntimeNativeOrigin>,
+    ) -> Result<(), AdministrativeStartupRefusal> {
+        let refused = || AdministrativeStartupRefusal {
+            original: Arc::clone(self),
+        };
+        {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(error) => {
+                    let mut state = error.into_inner();
+                    state.poison_seen = true;
+                    state
+                }
+            };
+            let compatible = origin.belongs_to_target(self.input.target())
+                && state
+                    .runtime_origin
+                    .as_ref()
+                    .is_none_or(|existing| Arc::ptr_eq(existing, &origin));
+            if !compatible {
+                if state.refused_runtime_origin.is_none() {
+                    state.refused_runtime_origin = Some(origin);
+                }
+                state.poison_seen = true;
+                return Err(refused());
+            }
+            state.runtime_origin.get_or_insert(origin);
+            if state.poison_seen || self.state.is_poisoned() {
+                return Err(refused());
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn original_runtime_session(
+        self: &Arc<Self>,
+        origin: Arc<RuntimeNativeOrigin>,
+    ) -> Result<
+        tokio::sync::OwnedMutexGuard<Option<PoolConnection<Postgres>>>,
+        AdministrativeStartupRefusal,
+    > {
+        let refused = || AdministrativeStartupRefusal {
+            original: Arc::clone(self),
+        };
+        self.bind_runtime_origin(origin)?;
+        self.finish_original().await?;
+        let session = Arc::clone(&self.session).lock_owned().await;
+        {
+            let state = self.state.lock().map_err(|_| refused())?;
+            let Some(Ok(observed)) = state.returned.as_ref() else {
+                return Err(refused());
+            };
+            let original = state.runtime_origin.as_ref().ok_or_else(refused)?;
+            if state.poison_seen
+                || self.state.is_poisoned()
+                || state.task.is_some()
+                || state.join_failure.is_some()
+                || session.is_none()
+                || observed.system_identifier != original.system_identifier()
+                || observed.database_oid != original.database_oid()
+            {
+                return Err(refused());
+            }
+        }
+        Ok(session)
     }
 
     pub async fn finish_original(

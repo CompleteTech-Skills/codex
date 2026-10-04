@@ -1,9 +1,11 @@
 //! Explicit host-owned administrative observations, never an exclusive permit.
 use crate::administration_registry::AdministrativeFailureArchive;
+use crate::administration_registry::AdministrativeObservationBorrow;
 use crate::administration_registry::AdministrativeRegistryRefusal;
 use crate::administration_registry::OriginalAdministrativeRegistry;
 use crate::administration_startup::AdministrativeNativeObservation;
 use crate::administration_startup::AdministrativeStartupRefusal;
+use crate::runtime_origin::RuntimeNativeOrigin;
 use codex_keyring_store::KeyringStore;
 use codex_storage_authority::HostCredentialResolver;
 use codex_storage_authority::RemoteAdministrationInput;
@@ -18,12 +20,41 @@ pub struct RemoteAdministrativeObserver {
     registry: Arc<OriginalAdministrativeRegistry>,
 }
 
+/// Retains the original administrative physical session and its registry borrower.
+/// Native identity agreement is observational, not administrative permission.
+pub struct OriginalAdministrativeRuntimeSession {
+    original: Arc<RemoteAdministrativeObserver>,
+    origin: Arc<RuntimeNativeOrigin>,
+    borrowed: AdministrativeObservationBorrow,
+    session: tokio::sync::OwnedMutexGuard<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
+}
+impl OriginalAdministrativeRuntimeSession {
+    pub fn runtime_origin(&self) -> &Arc<RuntimeNativeOrigin> {
+        &self.origin
+    }
+    /// Release this exact scoped borrower before reconciling the original close.
+    /// Cancellation leaves the close task and actual pool in the same registry.
+    pub async fn close_original(self) -> Result<(), AdministrativeRegistryRefusal> {
+        let Self {
+            original,
+            origin,
+            borrowed,
+            session,
+        } = self;
+        drop(session);
+        drop(borrowed);
+        drop(origin);
+        original.close_original().await
+    }
+}
+
 /// Outward-only original owner; never cached into the registry it retains.
 pub struct AdministrativeObservationRefusal {
     original: Arc<RemoteAdministrativeObserver>,
     capture: Option<AdministrativeRegistryRefusal>,
     observation: Option<AdministrativeStartupRefusal>,
     cleanup: Option<AdministrativeRegistryRefusal>,
+    runtime_origin: Option<Arc<RuntimeNativeOrigin>>,
 }
 impl fmt::Debug for AdministrativeObservationRefusal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -32,6 +63,7 @@ impl fmt::Debug for AdministrativeObservationRefusal {
             &self.capture,
             &self.observation,
             &self.cleanup,
+            &self.runtime_origin,
         );
         let _original_diagnostic = self
             .observation
@@ -58,6 +90,66 @@ impl RemoteAdministrativeObserver {
         &self.input
     }
 
+    /// Retain the actual startup/session; unlike observe_original this does not
+    /// close the session before returning. No mutation or exclusive API is given.
+    pub async fn retain_runtime_session(
+        self: &Arc<Self>,
+        origin: Arc<RuntimeNativeOrigin>,
+    ) -> Result<OriginalAdministrativeRuntimeSession, AdministrativeObservationRefusal> {
+        if !origin.belongs_to_target(self.input.target()) {
+            return Err(AdministrativeObservationRefusal {
+                original: Arc::clone(self),
+                capture: None,
+                observation: None,
+                cleanup: None,
+                runtime_origin: Some(origin),
+            });
+        }
+        let resolver = HostCredentialResolver::new(self.keyring.as_ref());
+        let borrowed = self
+            .registry
+            .capture_runtime_origin(Arc::clone(&self.input), Arc::clone(&origin), &resolver)
+            .map_err(|capture| AdministrativeObservationRefusal {
+                original: Arc::clone(self),
+                capture: Some(capture),
+                observation: None,
+                cleanup: None,
+                runtime_origin: Some(Arc::clone(&origin)),
+            })?;
+        let session = match borrowed.original_runtime_session(Arc::clone(&origin)).await {
+            Ok(session) => session,
+            Err(observation) => {
+                return Err(AdministrativeObservationRefusal {
+                    original: Arc::clone(self),
+                    capture: None,
+                    observation: Some(observation),
+                    cleanup: None,
+                    runtime_origin: Some(Arc::clone(&origin)),
+                });
+            }
+        };
+        let retained_origin = Arc::clone(&origin);
+        borrowed
+            .finish_scoped(&retained_origin, session.is_some(), |borrowed| {
+                OriginalAdministrativeRuntimeSession {
+                    original: Arc::clone(self),
+                    origin,
+                    borrowed,
+                    session,
+                }
+            })
+            .map_err(|(borrowed, capture)| {
+                drop(borrowed);
+                AdministrativeObservationRefusal {
+                    original: Arc::clone(self),
+                    capture: Some(capture),
+                    observation: None,
+                    cleanup: None,
+                    runtime_origin: Some(retained_origin),
+                }
+            })
+    }
+
     /// Actual selected login/native rows only. A successful observation is
     /// returned AFTER the same native session and SDK pool cleanup completes.
     /// It is not historical server identity, exclusive access or role authority.
@@ -76,6 +168,7 @@ impl RemoteAdministrativeObserver {
                     capture: Some(capture),
                     observation: None,
                     cleanup,
+                    runtime_origin: None,
                 });
             }
         };
@@ -89,6 +182,7 @@ impl RemoteAdministrativeObserver {
                 capture: None,
                 observation: observed.err(),
                 cleanup: cleanup.err(),
+                runtime_origin: None,
             }),
         }
     }
