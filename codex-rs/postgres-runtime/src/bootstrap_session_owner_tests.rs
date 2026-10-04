@@ -47,8 +47,15 @@ struct FactoryOwner {
     join: Arc<tokio::sync::Semaphore>,
 }
 #[derive(Default)]
+struct FactoryProbe {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[derive(Default)]
 struct FactoryState {
     registered: bool,
+    first_result: Option<std::result::Result<Arc<crate::PostgresPool>, crate::PoolError>>,
+    probe: Option<Arc<FactoryProbe>>,
     original: Option<Arc<crate::PostgresPool>>,
     diagnostic: Option<Arc<crate::PostgresPool>>,
     task: Option<tokio::task::JoinHandle<FactoryResults>>,
@@ -100,6 +107,7 @@ impl FactoryOwner {
         namespace: Option<NamedNamespace>,
         diagnostic_settings: Option<ConnectionSettings>,
         diagnostic_namespace: Option<NamedNamespace>,
+        probe: Option<Arc<FactoryProbe>>,
     ) -> Arc<Self> {
         let original = Arc::new(Self {
             state: Mutex::new(FactoryState::default()),
@@ -110,6 +118,7 @@ impl FactoryOwner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.hold = Some(Arc::clone(&original)); // BEFORE dispatch; body terminal cannot erase owner.
+        state.probe = probe.clone();
         let actual = Arc::clone(&original);
         state.task = Some(tokio::spawn(async move {
             // Same lock gates first factory poll until the actual JH is stored.
@@ -137,6 +146,17 @@ impl FactoryOwner {
                 },
             )
             .await;
+            actual
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .first_result = Some(result.clone());
+            if let Some(probe) = probe {
+                // Actual first factory/role/acquire future returned; its exact
+                // pool/result is externally retained BEFORE this pause.
+                probe.entered.notify_one();
+                probe.release.notified().await;
+            }
             let diagnostic = if let Some(settings) = diagnostic_settings {
                 Some(
                     crate::PostgresPool::connect_retained_in_namespace(
@@ -422,13 +442,43 @@ async fn selected_bootstrap_with_diagnostic(
         None
     };
     // Actual factory task and latent SDK slots are exterior BEFORE first poll.
+    let factory_probe = (fault == 10).then(|| Arc::new(FactoryProbe::default()));
     let factories = FactoryOwner::capture(
         settings,
         namespace.clone(),
         diagnostic_settings,
         diagnostic_namespace,
+        factory_probe.clone(),
     );
     let factory_weak = Arc::downgrade(&factories);
+    let mut factory_cancel_witness = true;
+    if let Some(probe) = factory_probe {
+        let original_id = {
+            let state = factories.state.lock();
+            state
+                .ok()
+                .and_then(|state| state.task.as_ref().map(tokio::task::JoinHandle::id))
+        };
+        let mut first = Box::pin(factories.finish());
+        let entered = tokio::select! {
+            biased;
+            _ = &mut first => false,
+            entered = tokio::time::timeout(Duration::from_secs(10), probe.entered.notified()) => entered.is_ok(),
+        };
+        drop(first); // Cancel caller ONLY; same stored task continues to own both factories.
+        let restored = {
+            let state = factories.state.lock();
+            state.ok().is_some_and(|state| {
+                state.task.as_ref().map(tokio::task::JoinHandle::id) == original_id
+                    && original_id.is_some() && state.terminal.is_none()
+                    && state.first_result.as_ref().zip(state.original.as_ref())
+                        .is_some_and(|(result, captured)| matches!(result, Ok(returned) if Arc::ptr_eq(returned, captured)))
+                    && state.probe.as_ref().is_some_and(|original| Arc::ptr_eq(original, &probe))
+            })
+        };
+        factory_cancel_witness = entered && restored;
+        probe.release.notify_one(); // Unconditional release BEFORE same finish and ANY verdict.
+    }
     let factory_results = factories.finish().await?;
     let (pool, diagnostic_pool) = {
         let state = factories
@@ -459,7 +509,7 @@ async fn selected_bootstrap_with_diagnostic(
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(namespace.clone());
     }
     let mut task_failure = None;
-    let mut witnessed = fault == 0;
+    let mut witnessed = fault == 0 || fault == 10;
     let mut native_unknown_witnessed = !recoverable || fault != 3;
     let mut diagnostic_error = None;
     let diagnostic_ok = match diagnostic_result {
@@ -592,7 +642,7 @@ async fn selected_bootstrap_with_diagnostic(
             async {
                 if !diagnostic_ok { return Err(BootstrapError::Unavailable); }
                 require_actual_empty(&owner, namespace.as_ref()).await?;
-                if fault == 0 {
+                if fault == 0 || fault == 10 {
                     match namespace.as_ref() {
                         Some(namespace) => {
                             crate::bootstrap_named_namespace_retained(&owner, namespace).await
@@ -883,11 +933,17 @@ async fn selected_bootstrap_with_diagnostic(
                 .is_some_and(|((observed, status), original)| {
                     Arc::ptr_eq(&observed, &original)
                         && status.as_deref()
-                            == Some(if fault == 0 || fault == 4 || recoverable && fault == 6 {
-                                "committed"
-                            } else {
-                                "aborted"
-                            })
+                            == Some(
+                                if fault == 0
+                                    || fault == 4
+                                    || fault == 10
+                                    || recoverable && fault == 6
+                                {
+                                    "committed"
+                                } else {
+                                    "aborted"
+                                },
+                            )
                 })
         });
     let mut relay_error = None;
@@ -1017,6 +1073,7 @@ async fn selected_bootstrap_with_diagnostic(
         || !lost_reply_witness
         || !foreign_origin_witness
         || !factory_released
+        || !factory_cancel_witness
     {
         return Err(Box::new(Failure {
             original: owner,
@@ -1034,7 +1091,7 @@ async fn selected_bootstrap_with_diagnostic(
         || !native_unknown_witnessed
         || !native_recovery_fact
         || refused != (fault == 2)
-        || !matches!(outcome, Some((_, committed)) if committed == (fault == 0 || fault == 4 || fault == 8 || fault == 9 || recoverable && fault == 6))
+        || !matches!(outcome, Some((_, committed)) if committed == (fault == 0 || fault == 4 || fault == 8 || fault == 9 || fault == 10 || recoverable && fault == 6))
     {
         return Err(Box::new(Failure {
             original: owner,
@@ -1346,6 +1403,33 @@ async fn named_bootstrap_rejects_foreign_database_diagnostic() -> Result<()> {
         )?),
         true,
         9,
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOT-admitted actual empty default namespace and migrator control-function capability"]
+async fn default_factory_caller_cancel_retains_same_native_task() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_FACTORY_CANCEL_STATE",
+        )?),
+        false,
+        10,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires ROOT-admitted actual empty named namespace and migrator control-function capability"]
+async fn named_factory_caller_cancel_retains_same_native_task() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_FACTORY_CANCEL_STATE",
+        )?),
+        true,
+        10,
         true,
     )
     .await
