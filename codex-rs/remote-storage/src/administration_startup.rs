@@ -4,6 +4,7 @@
 use crate::administration_close::OriginalAdministrativeClose;
 use crate::administration_settings::AdministrativeFactoryError;
 use crate::administration_settings::administrative_settings;
+use crate::administration_settings::connect_administration_prepared;
 use codex_postgres_runtime::NamedNamespace;
 use codex_postgres_runtime::PoolError;
 use codex_postgres_runtime::PostgresPool;
@@ -262,13 +263,9 @@ impl OriginalAdministrativeStartup {
                     Ok(())
                 }
             };
-            let pool = PostgresPool::connect_retained_in_namespace(
-                settings,
-                namespace.as_ref(),
-                &mut capture,
-            )
-            .await
-            .map_err(|error| Arc::new(Cause::Acquisition(error)))?;
+            let pool = connect_administration_prepared(settings, namespace.clone(), &mut capture)
+                .await
+                .map_err(|error| Arc::new(Cause::Factory(error)))?;
             let mut session = Arc::clone(&body_original.session).lock_owned().await;
             let connection = pool
                 .acquire()

@@ -22,7 +22,7 @@ pub enum AdministrativeFactoryError {
     Driver(PoolError),
 }
 
-pub fn administrative_settings(
+pub(super) fn administrative_settings(
     original: &Arc<RemoteAdministrationInput>,
     resolver: &HostCredentialResolver<'_>,
 ) -> Result<(ConnectionSettings, Option<NamedNamespace>), AdministrativeFactoryError> {
@@ -63,15 +63,14 @@ pub fn administrative_settings(
     ))
 }
 
-/// The caller must retain the original input/task and incoming SAME SDK Arc in
-/// its external frame BEFORE returning from capture, including on capture Err.
-/// This source-only prerequisite does not provide that consumer or task lifetime.
-pub async fn connect_administration_retained(
-    original: Arc<RemoteAdministrationInput>,
-    resolver: &HostCredentialResolver<'_>,
+/// Only the pre-registered original startup task consumes these already
+/// explicitly resolved settings. Its exterior frame captures SAME SDK before
+/// any acquire, including callback refusal. There is no parallel public connector.
+pub(super) async fn connect_administration_prepared(
+    settings: ConnectionSettings,
+    namespace: Option<NamedNamespace>,
     capture: &mut (dyn FnMut(Arc<PostgresPool>) -> Result<(), PoolError> + Send),
 ) -> Result<Arc<PostgresPool>, AdministrativeFactoryError> {
-    let (settings, namespace) = administrative_settings(&original, resolver)?;
     // Central factory enforces verify_full, exact version and original namespace;
     // no migration_login initialization or owner SET ROLE is requested here.
     PostgresPool::connect_retained_in_namespace(settings, namespace.as_ref(), capture)
