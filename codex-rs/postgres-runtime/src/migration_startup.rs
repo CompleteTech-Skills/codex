@@ -21,6 +21,7 @@ struct State {
     settings: Option<ConnectionSettings>,
     task: Option<JoinHandle<()>>,
     started: bool,
+    cleanup_sealed: bool,
     pool: Option<Arc<PostgresPool>>,
     refusal: Option<PoolError>,
     activation_refusal: Option<crate::ActivationGateError>,
@@ -63,6 +64,7 @@ impl OriginalMigrationStartup {
                 settings: Some(settings),
                 task: None,
                 started: false,
+                cleanup_sealed: false,
                 pool: None,
                 refusal: if refused {
                     Some(PoolError::InvalidSettings)
@@ -88,7 +90,11 @@ impl OriginalMigrationStartup {
     }
     pub fn start_original(self: &Arc<Self>) -> Result<(), MigrationStartupRefusal> {
         let mut state = self.state.lock().map_err(|_| self.refused())?;
-        if state.started || state.refusal.is_some() || state.activation_refusal.is_some() {
+        if state.started
+            || state.cleanup_sealed
+            || state.refusal.is_some()
+            || state.activation_refusal.is_some()
+        {
             return Err(self.refused());
         }
         let settings = state.settings.take().ok_or_else(|| self.refused())?;
@@ -317,12 +323,57 @@ impl OriginalMigrationStartup {
             original: Arc::clone(self),
         })
     }
+    /// Cleanup-only receipt; never grants successful startup, role, or Native/Home authority.
+    /// Captured SDK pools are closed even after Role/acquisition/admission refusal.
+    pub async fn cleanup_original(
+        self: &Arc<Self>,
+    ) -> Result<OriginalMigrationCleanupCompleted, MigrationStartupRefusal> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.cleanup_sealed = true; // No later native creation after an empty SDK receipt.
+        }
+        let _admission = self.close_original().await;
+        let state = self.state.lock().map_err(|_| self.refused())?;
+        if (state.started && !state.terminal)
+            || state.task.is_some()
+            || state.join_failure.is_some()
+        {
+            return Err(self.refused());
+        }
+        if state.pool.is_some() {
+            let close = self.close.lock().map_err(|_| self.refused())?;
+            if !close.sdk_done || !close.joined || close.task.is_some() || close.failure.is_some() {
+                return Err(self.refused());
+            }
+        }
+        // Retained factory captures the SDK pool before its first acquire. None here
+        // means never constructed, not an inference that an unowned socket was closed.
+        Ok(OriginalMigrationCleanupCompleted {
+            original: Arc::clone(self),
+        })
+    }
+
     /// Diagnostic for preserving original retry/interruption causes on archive.
     pub fn retains_original_causes(self: &Arc<Self>) -> Result<bool, MigrationStartupRefusal> {
-        self.login
+        let startup_failure = {
+            let state = self.state.lock().map_err(|_| self.refused())?;
+            state.refusal.is_some()
+                || state.activation_refusal.is_some()
+                || state.join_failure.is_some()
+        };
+        let close_failure = {
+            let close = self.close.lock().map_err(|_| self.refused())?;
+            close.failure.is_some()
+        };
+        let login_failure = self
+            .login
             .retained_cause_count()
-            .map(|count| count != 0)
-            .map_err(|_| self.refused())
+            .map_err(|_| self.refused())?
+            != 0;
+        Ok(startup_failure || close_failure || login_failure)
     }
     fn refused(self: &Arc<Self>) -> MigrationStartupRefusal {
         MigrationStartupRefusal {
@@ -343,6 +394,16 @@ impl Drop for TaskLoan {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .task = Some(task);
         }
+    }
+}
+
+/// Actual original startup task and captured SDK cleanup; admission causes remain owned.
+pub struct OriginalMigrationCleanupCompleted {
+    original: Arc<OriginalMigrationStartup>,
+}
+impl OriginalMigrationCleanupCompleted {
+    pub fn original(&self) -> &Arc<OriginalMigrationStartup> {
+        &self.original
     }
 }
 
@@ -429,6 +490,7 @@ mod tests {
                 settings: None,
                 task: None,
                 started: true,
+                cleanup_sealed: false,
                 pool: None,
                 refusal: None,
                 activation_refusal: None,

@@ -36,6 +36,7 @@ mod activation_gate;
 mod migration_causes;
 mod migration_startup;
 pub use migration_startup::MigrationStartupRefusal;
+pub use migration_startup::OriginalMigrationCleanupCompleted;
 pub use migration_startup::OriginalMigrationPoolClosed;
 pub use migration_startup::OriginalMigrationStartup;
 mod migration_login;
@@ -442,6 +443,12 @@ impl PostgresPool {
         .map_err(|_| PoolError::Timeout)?
         .map_err(|error| classify(&error))?;
         Ok(())
+    }
+
+    /// Caller externally retains exact pool/task before polling this actual SDK close.
+    /// Completion is not Native/Home/all-writer authority.
+    pub async fn close_original_sdk(&self) {
+        self.pool.close().await;
     }
 
     pub async fn close(&self) -> Result<(), PoolError> {
