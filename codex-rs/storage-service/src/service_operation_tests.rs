@@ -7,7 +7,7 @@ use codex_keyring_store::tests::MockKeyringStore;
 use codex_state::SqliteConfig;
 use codex_utils_absolute_path::test_support::PathExt;
 use std::time::Duration;
-type ControlResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub(super) type ControlResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 fn service(home: &std::path::Path) -> StorageService {
     StorageService::new(StorageServiceInputs {
         codex_home: home.to_path_buf(),
@@ -208,7 +208,7 @@ async fn actual_failed_command_is_archived_before_same_key_fresh_success() -> Co
     Ok(())
 }
 
-fn sdk_service(
+pub(super) fn sdk_service(
     home: &std::path::Path,
     state: &std::path::Path,
     namespace: &str,

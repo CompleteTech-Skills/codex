@@ -60,6 +60,8 @@ struct Original {
 #[derive(Default)]
 struct State {
     task: Option<JoinHandle<Result<Output, StorageError>>>,
+    #[cfg(test)]
+    operation_task_id: Option<tokio::task::Id>,
     reaper: Option<JoinHandle<()>>,
     reaper_failure: Option<tokio::task::JoinError>,
     reaper_terminal: bool,
@@ -110,6 +112,12 @@ impl Operations {
         let resources = crate::operation_resources::Resources::new(
             Arc::clone(&service.inputs),
             Arc::clone(&service.migration_startups),
+        );
+        #[cfg(test)]
+        resources.expect_empty_bootstrap(
+            probe
+                .as_ref()
+                .is_some_and(|probe| probe.require_empty_bootstrap),
         );
         service.operation_resources = Some(Arc::clone(&resources));
         let original = Arc::new(Original {
@@ -217,11 +225,17 @@ impl Operations {
             }
             result
         });
-        original
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .task = Some(task);
+        {
+            let mut state = original
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(test)]
+            {
+                state.operation_task_id = Some(task.id());
+            }
+            state.task = Some(task);
+        }
         let retained = Arc::clone(&original);
         // Store the cleanup task before operation entry release. Disposal is merely
         // a wake; finish_core must physically join the SAME original operation JH.
@@ -517,6 +531,7 @@ impl StorageService {
 #[derive(Default)]
 struct Probe {
     exercise_sdk: bool,
+    require_empty_bootstrap: bool,
     fail_after_sdk: bool,
     hold_after_sdk: bool,
     hold_connection: bool,
@@ -530,3 +545,7 @@ struct Probe {
 #[cfg(test)]
 #[path = "service_operation_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "service_public_route_tests.rs"]
+mod public_route_tests;

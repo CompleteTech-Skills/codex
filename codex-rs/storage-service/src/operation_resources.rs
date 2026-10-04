@@ -19,6 +19,8 @@ pub(crate) struct Resources {
     body_result: Mutex<Option<Result<crate::service_operations::Output, crate::StorageError>>>,
     body_returned: Mutex<bool>,
     body_done: tokio::sync::Notify,
+    #[cfg(test)]
+    bootstrap_expected_empty: std::sync::atomic::AtomicBool,
     cleanup: Mutex<Cleanup>,
     cleanup_join: tokio::sync::Semaphore,
 }
@@ -39,9 +41,21 @@ impl Resources {
             admission_failure: Mutex::new(None),
             body_returned: Mutex::new(false),
             body_done: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            bootstrap_expected_empty: std::sync::atomic::AtomicBool::new(false),
             cleanup: Mutex::new(Cleanup::default()),
             cleanup_join: tokio::sync::Semaphore::new(1),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn expect_empty_bootstrap(&self, expected: bool) {
+        self.bootstrap_expected_empty
+            .store(expected, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    pub(crate) fn bootstrap_expected_empty(&self) -> bool {
+        self.bootstrap_expected_empty
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     pub(crate) fn original_startups(&self) -> Arc<crate::MigrationStartupRegistry> {
         Arc::clone(&self._original_startups)

@@ -347,6 +347,49 @@ impl StorageService {
                 return Err(StorageError(RemoteStorageError::Connection(error).into()));
             }
         };
+        #[cfg(test)]
+        if resources.bootstrap_expected_empty() {
+            // Actual SAME original schema-login SDK, before any bootstrap DDL.
+            // This probe never grants authority; it refuses a misbound/nonempty fixture.
+            let mut connection = match pool.acquire().await {
+                Ok(connection) => connection,
+                Err(original) => {
+                    slot.record_returned_failure(Arc::new(original));
+                    return Err(StorageError(
+                        RemoteStorageError::Connection(original).into(),
+                    ));
+                }
+            };
+            let empty = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=$1) AND NOT EXISTS (
+SELECT 1 FROM (
+SELECT relnamespace AS namespace FROM pg_catalog.pg_class
+UNION ALL SELECT pronamespace FROM pg_catalog.pg_proc
+UNION ALL SELECT typnamespace FROM pg_catalog.pg_type
+UNION ALL SELECT collnamespace FROM pg_catalog.pg_collation
+UNION ALL SELECT connamespace FROM pg_catalog.pg_constraint
+UNION ALL SELECT connamespace FROM pg_catalog.pg_conversion
+UNION ALL SELECT oprnamespace FROM pg_catalog.pg_operator
+UNION ALL SELECT opcnamespace FROM pg_catalog.pg_opclass
+UNION ALL SELECT opfnamespace FROM pg_catalog.pg_opfamily
+UNION ALL SELECT cfgnamespace FROM pg_catalog.pg_ts_config
+UNION ALL SELECT dictnamespace FROM pg_catalog.pg_ts_dict
+UNION ALL SELECT prsnamespace FROM pg_catalog.pg_ts_parser
+UNION ALL SELECT tmplnamespace FROM pg_catalog.pg_ts_template
+UNION ALL SELECT stxnamespace FROM pg_catalog.pg_statistic_ext
+UNION ALL SELECT extnamespace FROM pg_catalog.pg_extension
+) objects JOIN pg_catalog.pg_namespace n ON n.oid=objects.namespace WHERE n.nspname=$1)",
+            ).bind(namespace.as_ref().map_or("codex_storage", codex_postgres_runtime::NamedNamespace::schema))
+                .fetch_one(&mut *connection).await;
+            match empty {
+                Ok(true) => {}
+                Ok(false) => return Err(StorageError(BlockerCode::SchemaInvalid)),
+                Err(original) => {
+                    slot.record_returned_failure(Arc::new(original));
+                    return Err(StorageError(BlockerCode::SchemaInvalid));
+                }
+            }
+        }
         let result = match &namespace {
             Some(namespace) => bootstrap_named_namespace(&pool, namespace).await,
             None => bootstrap_codex_storage(&pool).await,
