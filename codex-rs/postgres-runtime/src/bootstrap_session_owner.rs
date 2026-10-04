@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+#[cfg(test)]
+type ControlTerminal = Result<Result<(), BootstrapError>, Arc<tokio::task::JoinError>>;
 
 pub struct BootstrapSessionOwner {
     pool: Arc<PostgresPool>,
@@ -26,6 +28,10 @@ pub struct BootstrapSessionOwner {
     control_task: Mutex<Option<tokio::task::JoinHandle<Result<(), BootstrapError>>>>,
     #[cfg(test)]
     control_hold: Mutex<Option<Arc<BootstrapSessionOwner>>>,
+    #[cfg(test)]
+    control_blocker: Mutex<Option<sqlx::pool::PoolConnection<Postgres>>>,
+    #[cfg(test)]
+    control_terminal: Mutex<Option<ControlTerminal>>,
 }
 struct State {
     sealed: bool,
@@ -57,6 +63,10 @@ impl BootstrapSessionOwner {
             control_task: Mutex::new(None),
             #[cfg(test)]
             control_hold: Mutex::new(None),
+            #[cfg(test)]
+            control_blocker: Mutex::new(None),
+            #[cfg(test)]
+            control_terminal: Mutex::new(None),
             state: Mutex::new(State {
                 sealed: false,
                 cleanup_complete: false,
@@ -232,6 +242,17 @@ impl BootstrapSessionOwner {
         {
             let probe = self.stamp_probe.lock().ok().and_then(|probe| probe.clone());
             if let Some(probe) = probe {
+                let backend = self
+                    .query(
+                        sqlx::query_scalar::<_, i32>("SELECT pg_catalog.pg_backend_pid()")
+                            .fetch_one(&mut **transaction),
+                        false,
+                    )
+                    .await?;
+                *probe
+                    .backend
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(backend);
                 probe.entered.notify_one();
                 probe.release.notified().await;
             }
@@ -481,6 +502,7 @@ impl DdlReservation {
 #[cfg(test)]
 #[derive(Default)]
 struct StampProbe {
+    backend: Mutex<Option<i32>>,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }

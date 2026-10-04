@@ -21,6 +21,21 @@ impl Drop for TaskLoan {
         }
     }
 }
+struct BlockerLoan {
+    original: Arc<BootstrapSessionOwner>,
+    connection: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+}
+impl Drop for BlockerLoan {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            *self
+                .original
+                .control_blocker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(connection);
+        }
+    }
+}
 
 struct Failure {
     original: Arc<BootstrapSessionOwner>,
@@ -105,7 +120,7 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
         limits: PoolLimits {
             connect_timeout: Duration::from_secs(5),
             acquire_timeout: Duration::from_secs(5),
-            max_connections: 1,
+            max_connections: 2,
         },
     };
     // Capture the SAME latent SDK pool before the factory's first SQL poll.
@@ -123,6 +138,10 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
         return Err("no SDK dispatch captured".into());
     };
     let owner = BootstrapSessionOwner::new(Arc::clone(&pool));
+    *owner
+        .control_hold
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&owner));
     let mut task_failure = None;
     let mut witnessed = fault == 0;
     let result = match connected {
@@ -137,6 +156,17 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
                         None => crate::bootstrap_codex_storage_retained(&owner).await,
                     }
                 } else {
+                    let mut blocker = BlockerLoan { original: Arc::clone(&owner), connection: None };
+                    if fault == 5 {
+                        let connection = pool.acquire().await.map_err(BootstrapError::Connection)?;
+                        *owner.control_blocker.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(connection);
+                        blocker.connection = owner.control_blocker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+                        if let Some(connection) = blocker.connection.as_mut() {
+                            owner.query(sqlx::query("SELECT pg_catalog.pg_advisory_lock($1,$2)")
+                                .bind(crate::bootstrap::LOCK_CLASS).bind(crate::bootstrap::LOCK_RESOURCE)
+                                .fetch_one(&mut **connection), false).await?;
+                        }
+                    }
                     let probe = Arc::new(StampProbe::default());
                     *match fault {
                         3 => &owner.commit_probe,
@@ -184,6 +214,24 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
                         tokio::time::timeout(Duration::from_secs(10), probe.entered.notified())
                             .await
                             .is_ok();
+                    if fault == 5 && witnessed {
+                        let backend = *probe.backend.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        probe.release.notify_one(); // Now actual production advisory SQL can block.
+                        witnessed = false;
+                        if let (Some(backend), Some(connection)) = (backend, blocker.connection.as_mut()) {
+                            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                            while tokio::time::Instant::now() < deadline {
+                                let waiting = owner.query(sqlx::query_scalar::<_, bool>(
+                                    "SELECT pg_catalog.pg_backend_pid() = ANY(pg_catalog.pg_blocking_pids($1)) AND EXISTS (SELECT 1 FROM pg_catalog.pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted)")
+                                    .bind(backend).fetch_one(&mut **connection), false).await;
+                                match waiting {
+                                    Ok(true) => { witnessed = true; break; }
+                                    Ok(false) => tokio::task::yield_now().await,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
                     if fault == 2 && witnessed {
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let _guard = owner
@@ -197,18 +245,24 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
                     }
                     task.abort();
                     probe.release.notify_one();
-                    let joined = task.await;
+                    let joined = task.await.map_err(Arc::new);
+                    *owner.control_terminal.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(joined.clone());
                     loan.task = None; // Only actual SAME JoinHandle await can clear ownership.
-                    owner
-                        .control_hold
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take();
+
+                    if let Some(connection) = blocker.connection.as_mut() {
+                        if owner.query(sqlx::query("SELECT pg_catalog.pg_advisory_unlock_all()")
+                            .execute(&mut **connection), true).await.is_err() {
+                            // Original blocker and task owner remain pinned, no false SDK close.
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                    blocker.connection.take(); // Only after checked original unlock.
                     match joined {
                         // SAME original physical join before reconciliation/verdict.
                         Err(original) => {
                             witnessed &= original.is_cancelled() && original.id() == original_id;
-                            task_failure = Some(Arc::new(original));
+                            task_failure = Some(original);
                             Err(BootstrapError::Migration)
                         }
                         Ok(result) => {
@@ -223,6 +277,30 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
         Ok(_) => Err(BootstrapError::Migration),
         Err(error) => Err(BootstrapError::Connection(error)),
     };
+    // Setup refusal/cancellation can restore the SAME blocker before task dispatch.
+    let recovered_blocker = owner
+        .control_blocker
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let mut recovered_blocker = BlockerLoan {
+        original: Arc::clone(&owner),
+        connection: recovered_blocker,
+    };
+    if let Some(connection) = recovered_blocker.connection.as_mut() {
+        if owner
+            .query(
+                sqlx::query("SELECT pg_catalog.pg_advisory_unlock_all()")
+                    .execute(&mut **connection),
+                true,
+            )
+            .await
+            .is_err()
+        {
+            std::future::pending::<()>().await;
+        }
+    }
+    recovered_blocker.connection.take();
     // Never infer task/session termination from a bare bootstrap error.
     let reconciled = owner.reconcile_original().await;
     let proof = match reconciled {
@@ -271,6 +349,13 @@ async fn selected_bootstrap(state: &Path, named: bool, fault: u8) -> Result<()> 
             false
         }
     };
+    if closed {
+        owner
+            .control_hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
     if (fault == 0 && result.is_err()) || !witnessed || late || !closed {
         return Err(Box::new(Failure {
             original: owner,
@@ -375,6 +460,31 @@ async fn actual_named_committed_status_before_return_abort() -> Result<()> {
         )?),
         true,
         4,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires a separate admitted empty default advisory-wait fixture"]
+async fn actual_default_advisory_wait_original_abort() -> Result<()> {
+    selected_bootstrap(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_WAIT_STATE",
+        )?),
+        false,
+        5,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires a separate admitted empty named advisory-wait fixture"]
+async fn actual_named_advisory_wait_original_abort() -> Result<()> {
+    selected_bootstrap(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_WAIT_STATE",
+        )?),
+        true,
+        5,
     )
     .await
 }
