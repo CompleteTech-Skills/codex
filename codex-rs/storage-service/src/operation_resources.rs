@@ -207,6 +207,16 @@ impl Resources {
             state.entries[index].installed.as_ref().map(Arc::clone)
         }))
     }
+    #[cfg(test)]
+    pub(crate) fn actual_bootstrap_sessions_snapshot(
+        &self,
+    ) -> Result<[Option<Arc<codex_postgres_runtime::BootstrapSessionOwner>>; CAPACITY], Refusal>
+    {
+        let state = self.bootstrap_sessions.state.lock().map_err(|_| Refusal)?;
+        Ok(std::array::from_fn(|index| {
+            state.entries[index].installed.as_ref().map(Arc::clone)
+        }))
+    }
     pub(crate) fn retain_bootstrap_session(
         &self,
         pool: Arc<codex_postgres_runtime::PostgresPool>,

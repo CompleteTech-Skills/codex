@@ -93,6 +93,34 @@ async fn selected_public_canceled_caller(
             };
         }
     }
+    let native_binding = if bootstrap {
+        original
+            .resources
+            .actual_bootstrap_sessions_snapshot()
+            .is_ok_and(|owners| {
+                let actual = owners.iter().flatten().collect::<Vec<_>>();
+                actual.len() == 1
+                    && actual[0].original_control_privilege() == Some(true)
+                    && actual[0]
+                        .original_native_status()
+                        .is_some_and(|(_, status)| status.as_deref() == Some("committed"))
+                    && actual[0].diagnostic_pool().is_some_and(|diagnostic| {
+                        !Arc::ptr_eq(actual[0].original_pool(), diagnostic)
+                            && pools.as_ref().is_ok_and(|pools| {
+                                pools
+                                    .iter()
+                                    .flatten()
+                                    .any(|pool| Arc::ptr_eq(pool, actual[0].original_pool()))
+                                    && pools
+                                        .iter()
+                                        .flatten()
+                                        .any(|pool| Arc::ptr_eq(pool, diagnostic))
+                            })
+                    })
+            })
+    } else {
+        true
+    };
     // Actual result projection is read only AFTER original task+SDK cleanup.
     let value = match outcome {
         Ok(Output::Observed(value)) if bootstrap => value
@@ -121,7 +149,8 @@ async fn selected_public_canceled_caller(
         || original_id.is_none()
         || original_id != restored_id
         || pools.is_err()
-        || count != 1
+        || count != if bootstrap { 2 } else { 1 }
+        || !native_binding
         || !closed
         || !original.resources.cleanup_completed()
         || !valid
