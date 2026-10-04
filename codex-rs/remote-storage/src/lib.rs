@@ -12,7 +12,11 @@ mod administration_registry;
 mod administration_settings;
 mod administration_startup;
 mod error;
+mod runtime_origin;
 mod storage;
+pub use runtime_origin::OriginalRuntimeOrigin;
+pub use runtime_origin::RuntimeNativeOrigin;
+pub use runtime_origin::RuntimeOriginRefusal;
 
 pub use administration::AdministrativeObservationRefusal;
 pub use administration::RemoteAdministrativeObserver;

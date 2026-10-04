@@ -18,6 +18,7 @@ pub(crate) enum Kind {
     Recover,
     Cancel,
     Probe,
+    AuthorityOrigin,
     Schema,
     Plan(crate::PlanAction),
     Progress,

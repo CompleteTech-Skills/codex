@@ -16,6 +16,9 @@ pub(crate) struct Resources {
     staged_configs: Arc<Slots<SqliteConfig>>,
     read_sources: Arc<Slots<codex_storage_migration::RetainedSqliteSource>>,
     bootstrap_sessions: Arc<Slots<codex_postgres_runtime::BootstrapSessionOwner>>,
+    runtime_origins: Arc<Slots<codex_remote_storage::OriginalRuntimeOrigin>>,
+    runtime_origin_cleanup_causes:
+        Mutex<[Option<Arc<codex_remote_storage::RuntimeOriginRefusal>>; CAPACITY]>,
     bootstrap_cleanup_causes:
         Mutex<[Option<Arc<codex_postgres_runtime::BootstrapSessionRefusal>>; CAPACITY]>,
     cleanup_causes: Mutex<[Option<Arc<std::io::Error>>; CAPACITY]>,
@@ -42,6 +45,8 @@ impl Resources {
             staged_configs: Arc::default(),
             read_sources: Arc::default(),
             bootstrap_sessions: Arc::default(),
+            runtime_origins: Arc::default(),
+            runtime_origin_cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
             bootstrap_cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
             cleanup_causes: Mutex::new(std::array::from_fn(|_| None)),
             body_result: Mutex::new(None),
@@ -116,6 +121,14 @@ impl Resources {
         if saved.is_none() {
             *saved = Some(original);
         }
+    }
+    pub(crate) fn retain_runtime_origin(
+        &self,
+        origin: Arc<codex_remote_storage::OriginalRuntimeOrigin>,
+    ) -> Result<Arc<codex_remote_storage::OriginalRuntimeOrigin>, Refusal> {
+        let slot = self.runtime_origins.reserve()?;
+        slot.capture_original_arc(Arc::clone(&origin))?;
+        Ok(origin)
     }
     pub(crate) fn reserve_runtime(&self) -> Result<Creation<RemoteStorage>, Refusal> {
         self.runtimes.reserve()
@@ -324,6 +337,9 @@ impl<T> Creation<T> {
     // Called only when the actual creation future returned this original failure.
     // Unwind/Drop still leaves unresolved, and captures no fabricated completion.
     pub(crate) fn record_returned_failure(self, cause: Arc<dyn std::error::Error + Send + Sync>) {
+        self.record_retained_failure(cause);
+    }
+    pub(crate) fn record_retained_failure(&self, cause: Arc<dyn std::error::Error + Send + Sync>) {
         let mut state = self
             .original
             .state
@@ -436,6 +452,8 @@ impl Resources {
                     self.read_sources.seal_cleanup_snapshot();
                 let (bootstrap_sessions, bootstrap_unresolved, bootstrap_poison) =
                     self.bootstrap_sessions.seal_cleanup_snapshot();
+                let (runtime_origins, origin_unresolved, origin_poison) =
+                    self.runtime_origins.seal_cleanup_snapshot();
                 let original = Arc::clone(self);
                 let startups = Arc::clone(startups);
                 state.task = Some(tokio::spawn(async move {
@@ -458,7 +476,26 @@ impl Resources {
                         || read_unresolved
                         || read_poison
                         || bootstrap_unresolved
-                        || bootstrap_poison);
+                        || bootstrap_poison
+                        || origin_unresolved
+                        || origin_poison);
+                    let mut blocked_origin_pools = std::array::from_fn::<_, CAPACITY, _>(|_| None);
+                    for (index, owner) in runtime_origins.into_iter().enumerate() {
+                        if let Some(owner) = owner {
+                            if let Err(cause) = owner.close_original().await {
+                                original
+                                    .runtime_origin_cleanup_causes
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)[index] =
+                                    Some(Arc::new(cause));
+                                complete = false;
+                            }
+                            if !owner.known_original_closed() {
+                                blocked_origin_pools[index] = owner.captured_original_pool();
+                                complete = false;
+                            }
+                        }
+                    }
                     let mut blocked_bootstrap_pools =
                         std::array::from_fn::<_, CAPACITY, _>(|_| None);
                     let mut blocked_diagnostic_pools =
@@ -522,6 +559,7 @@ impl Resources {
                         if blocked_bootstrap_pools
                             .iter()
                             .chain(blocked_diagnostic_pools.iter())
+                            .chain(blocked_origin_pools.iter())
                             .flatten()
                             .any(|blocked| Arc::ptr_eq(blocked, &pool))
                         {

@@ -175,6 +175,84 @@ impl RemoteStorage {
         })
     }
 
+    /// Explicit authority-origin path; ordinary Runtime constructors retain their
+    /// existing privilege requirements. Caller must reserve this SAME origin frame
+    /// in its original operation resources BEFORE polling this constructor.
+    pub async fn connect_with_original_runtime_origin(
+        origin: &Arc<crate::runtime_origin::OriginalRuntimeOrigin>,
+        keyring: Arc<dyn codex_keyring_store::KeyringStore>,
+        capture: Arc<
+            dyn Fn(Arc<PostgresPool>) -> Result<(), codex_postgres_runtime::PoolError>
+                + Send
+                + Sync,
+        >,
+    ) -> Result<Arc<Self>, RemoteStorageError> {
+        let original = Arc::clone(origin);
+        origin
+            .run_constructor(async move {
+                let origin = original;
+                let resolver = HostCredentialResolver::new(keyring.as_ref());
+                let result = async {
+                    let (settings, namespace) = connection_settings(
+                        origin.original_profile(),
+                        &resolver,
+                        LoginRole::Runtime,
+                    )?;
+                    origin
+                        .bind_expected_login(settings.username.clone())
+                        .map_err(RemoteStorageError::Connection)?;
+                    let mut original_capture = |pool: Arc<PostgresPool>| {
+                        // Exterior operation slot receives even a refused original pool.
+                        let external = capture(Arc::clone(&pool));
+                        let retained = origin.capture_pool(pool);
+                        external.and(retained)
+                    };
+                    let pool = PostgresPool::connect_retained_in_namespace(
+                        settings,
+                        namespace.as_ref(),
+                        &mut original_capture,
+                    )
+                    .await
+                    .map_err(RemoteStorageError::Connection)?;
+                    origin.observe_before_schema().await.map_err(|_| {
+                        RemoteStorageError::Connection(
+                            codex_postgres_runtime::PoolError::Unavailable,
+                        )
+                    })?;
+                    // SAME original native session is physically closed before any new
+                    // schema acquisition. A max-one pool cannot deadlock on that session.
+                    origin.reconcile_native_before_schema().await.map_err(|_| {
+                        RemoteStorageError::Connection(
+                            codex_postgres_runtime::PoolError::Unavailable,
+                        )
+                    })?;
+                    check_runtime_schema(&pool)
+                        .await
+                        .map_err(RemoteStorageError::Schema)?;
+                    pool.bind_current_activation()
+                        .await
+                        .map_err(activation_error)?;
+                    let connected_generation =
+                        pool.bound_activation_generation().ok_or_else(|| {
+                            RemoteStorageError::Schema(
+                                codex_postgres_runtime::RuntimeSchemaError::Unavailable,
+                            )
+                        })?;
+                    Ok(Arc::new(Self {
+                        pool,
+                        namespace,
+                        connected_generation,
+                    }))
+                }
+                .await;
+                if let Err(original) = result.as_ref() {
+                    origin.record_constructor_failure(*original);
+                }
+                result
+            })
+            .await
+    }
+
     /// The activation state as the dataset reports it right now.
     pub async fn activation(&self) -> Result<StorageActivation, RemoteStorageError> {
         let mut connection = self

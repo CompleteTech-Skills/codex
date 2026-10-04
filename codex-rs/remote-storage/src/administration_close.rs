@@ -110,6 +110,13 @@ impl OriginalAdministrativeClose {
     /// the future and refuses SDK cleanup; known close ACK can progress cleanup
     /// while the original panic/poison still forbids a clean outward receipt.
     pub(super) async fn finish(self: &Arc<Self>) -> bool {
+        self.finish_physical(true).await
+    }
+    /// Same actual native task only. Does not close or certify the SDK pool.
+    pub(super) async fn finish_native_original(self: &Arc<Self>) -> bool {
+        self.finish_physical(false).await
+    }
+    async fn finish_physical(self: &Arc<Self>, close_sdk: bool) -> bool {
         let Ok(permit) = Arc::clone(&self.serial).acquire_owned().await else {
             return false;
         };
@@ -176,6 +183,9 @@ impl OriginalAdministrativeClose {
                 || (state.native_joined && matches!(state.native_result, Some(Ok(()))));
             if !native_ack {
                 return false;
+            }
+            if !close_sdk {
+                return state.native_failure.is_none();
             }
             if state.sdk_task.is_none() && !state.sdk_joined && state.sdk_failure.is_none() {
                 if let Some(pool) = state.pool.clone() {

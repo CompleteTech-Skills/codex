@@ -43,6 +43,59 @@ impl OriginalServiceAdministration {
         &self.observer
     }
 }
+/// Outward-only failure retains binding and existing operation/resource history.
+pub struct ServiceRuntimeOriginRefusal {
+    original: Arc<OriginalServiceAdministration>,
+    cause: crate::StorageError,
+}
+impl std::fmt::Debug for ServiceRuntimeOriginRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _retained = (&self.original, &self.cause);
+        formatter.write_str("ServiceRuntimeOriginRefused([original retained])")
+    }
+}
+impl ServiceRuntimeOriginRefusal {
+    pub fn original_binding(&self) -> &Arc<OriginalServiceAdministration> {
+        &self.original
+    }
+}
+impl OriginalServiceAdministration {
+    /// Host must validate its genuine owner before first polling this explicit
+    /// privileged-origin route. Result is native observation, never exclusivity.
+    pub async fn observe_runtime_origin(
+        self: &Arc<Self>,
+    ) -> Result<Arc<codex_remote_storage::RuntimeNativeOrigin>, ServiceRuntimeOriginRefusal> {
+        let result = self.service.original_observation(
+            crate::service_operations::Kind::AuthorityOrigin, None, |service| async move {
+                let resources = service.operation_resources.as_ref().ok_or(crate::StorageError(crate::BlockerCode::Internal))?;
+                let profile = service.original_candidate.as_ref().ok_or(crate::StorageError(crate::BlockerCode::NoCandidateProfile))?;
+                let origin = resources.retain_runtime_origin(codex_remote_storage::OriginalRuntimeOrigin::prepare(Arc::clone(profile))).map_err(|_| crate::StorageError(crate::BlockerCode::Internal))?;
+                let pool_slot = Arc::new(resources.reserve_runtime_pool().map_err(|_| crate::StorageError(crate::BlockerCode::Internal))?);
+                let runtime_slot = resources.reserve_runtime().map_err(|_| crate::StorageError(crate::BlockerCode::Internal))?;
+                let captured_pool_slot = Arc::clone(&pool_slot);
+                let capture: Arc<dyn Fn(Arc<codex_postgres_runtime::PostgresPool>) -> Result<(), codex_postgres_runtime::PoolError> + Send + Sync> = Arc::new(move |pool| {
+                    captured_pool_slot.capture_original_arc(pool).map_err(|_| codex_postgres_runtime::PoolError::Unavailable)
+                });
+                let storage = match codex_remote_storage::RemoteStorage::connect_with_original_runtime_origin(
+                    &origin, Arc::clone(&service.inputs.keyring), capture,
+                ).await {
+                    Ok(storage) => storage,
+                    Err(error) => {
+                        pool_slot.record_retained_failure(Arc::new(error));
+                        runtime_slot.record_returned_failure(Arc::new(error));
+                        return Err(crate::StorageError(error.into()));
+                    }
+                };
+                runtime_slot.capture_original_arc(storage).map_err(|_| crate::StorageError(crate::BlockerCode::Internal))?;
+                origin.original_native_origin().ok_or(crate::StorageError(crate::BlockerCode::Internal))
+            },
+        ).await;
+        result.map_err(|cause| ServiceRuntimeOriginRefusal {
+            original: Arc::clone(self),
+            cause,
+        })
+    }
+}
 impl StorageService {
     /// No resolver, factory, task or SQL is polled by preparation. The selected
     /// candidate is the private Arc captured once by this service constructor.
