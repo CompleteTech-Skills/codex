@@ -42,6 +42,7 @@ enum Cause {
 type Outcome = Result<Arc<AdministrativeNativeObservation>, Arc<Cause>>;
 
 struct State {
+    dispatched: bool,
     pool: Option<Arc<PostgresPool>>,
     task: Option<JoinHandle<Outcome>>,
     returned: Option<Outcome>,
@@ -133,15 +134,46 @@ impl Drop for TaskLoan {
 }
 
 impl OriginalAdministrativeStartup {
+    pub(super) fn input_is(&self, input: &Arc<RemoteAdministrationInput>) -> bool {
+        Arc::ptr_eq(&self.input, input)
+    }
+
+    pub(super) fn captured_pool(&self) -> Option<Arc<PostgresPool>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pool
+            .clone()
+    }
+
+    pub(super) fn archive_closed_original(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.task.is_some()
+            || (state.returned.is_none() && state.join_failure.is_none())
+            || !self.close.physical_terminal()
+        {
+            return false;
+        }
+        // Caller already stored SAME Arc in its reserved owning archive slot.
+        state.hold = None;
+        true
+    }
     /// Resolve explicit credential settings synchronously, own the original
     /// frame and latent SDK before any factory/role query can be polled.
     pub fn start(
         input: Arc<RemoteAdministrationInput>,
         resolver: &HostCredentialResolver<'_>,
     ) -> Result<Arc<Self>, AdministrativeStartupRefusal> {
-        let original = Arc::new(Self {
+        let original = Self::reserved(input);
+        original.dispatch_original(resolver)?;
+        Ok(original)
+    }
+
+    pub(super) fn reserved(input: Arc<RemoteAdministrationInput>) -> Arc<Self> {
+        Arc::new(Self {
             input,
             state: Mutex::new(State {
+                dispatched: false,
                 pool: None,
                 task: None,
                 returned: None,
@@ -154,7 +186,28 @@ impl OriginalAdministrativeStartup {
             session: Arc::new(AsyncMutex::new(None)),
             join: Arc::new(Semaphore::new(1)),
             close: OriginalAdministrativeClose::new(),
-        });
+        })
+    }
+
+    pub(super) fn dispatch_original(
+        self: &Arc<Self>,
+        resolver: &HostCredentialResolver<'_>,
+    ) -> Result<(), AdministrativeStartupRefusal> {
+        let original = Arc::clone(self);
+        {
+            let mut state = original
+                .state
+                .lock()
+                .map_err(|_| AdministrativeStartupRefusal {
+                    original: Arc::clone(&original),
+                })?;
+            if state.dispatched {
+                return Err(AdministrativeStartupRefusal {
+                    original: Arc::clone(&original),
+                });
+            }
+            state.dispatched = true;
+        }
         let prepared = administrative_settings(&original.input, resolver);
         let (settings, namespace) = match prepared {
             Ok(prepared) => prepared,
@@ -230,7 +283,7 @@ impl OriginalAdministrativeStartup {
                 .await
         }));
         drop(state);
-        Ok(original)
+        Ok(())
     }
 
     async fn observe_native(

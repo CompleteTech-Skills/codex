@@ -49,6 +49,20 @@ pub(super) struct OriginalAdministrativeClose {
 }
 
 impl OriginalAdministrativeClose {
+    /// Physical local completion only, including known never-created resources.
+    /// Poison remains a diagnostic refusal; this does not grant admission.
+    pub(super) fn physical_terminal(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let native = matches!(state.source, Source::Absent)
+            || (state.native_joined && matches!(state.native_result, Some(Ok(()))));
+        native
+            && state.native_task.is_none()
+            && state.sdk_task.is_none()
+            && state.sdk_joined
+            && (state.pool.is_none() || state.sdk_ack)
+            && state.native_failure.is_none()
+            && state.sdk_failure.is_none()
+    }
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
