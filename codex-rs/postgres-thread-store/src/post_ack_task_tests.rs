@@ -5,13 +5,33 @@
 async fn actual_post_ack_panic_and_abort_preserve_xid_bytes_and_join_cause() -> ThreadStoreResult<()>
 {
     let state = std::env::var("CODEX_TEST_POSTGRES_THREAD_STORE_STATE").map_err(internal)?;
-    let state = Path::new(&state);
+    actual_post_ack_original_control(Path::new(&state), "runtime", None).await
+}
+#[tokio::test]
+#[ignore = "requires admitted current named PostgreSQL fixture and retained host"]
+async fn actual_named_post_ack_panic_and_abort_preserve_xid_bytes_and_join_cause() -> ThreadStoreResult<()>
+{
+    let state = std::env::var("CODEX_TEST_POSTGRES_ISOLATION_STATE").map_err(internal)?;
+    let namespace = codex_postgres_runtime::NamedNamespace::new("codex_storage_isolation")
+        .map_err(|_| internal("named post-ACK fixture namespace refused"))?;
+    actual_post_ack_original_control(Path::new(&state), "isolation_runtime", Some(namespace)).await
+}
+async fn actual_post_ack_original_control(
+    state: &Path,
+    role: &str,
+    namespace: Option<codex_postgres_runtime::NamedNamespace>,
+) -> ThreadStoreResult<()> {
     let cwd = tempfile::tempdir().map_err(internal)?.keep();
-    let observer = connect(state, "runtime").await;
-    let mut limits = settings(state, "runtime");
+    let observer = Arc::new(
+        PostgresPool::connect_in_namespace(settings(state, role), namespace.as_ref())
+            .await
+            .map_err(internal)?,
+    );
+    observer.bind_current_activation().await.map_err(internal)?;
+    let mut limits = settings(state, role);
     limits.limits.max_connections = 1;
     let pool = Arc::new(
-        PostgresPool::connect_in_namespace(limits, None)
+        PostgresPool::connect_in_namespace(limits, namespace.as_ref())
             .await
             .map_err(internal)?,
     );
@@ -31,7 +51,7 @@ async fn actual_post_ack_panic_and_abort_preserve_xid_bytes_and_join_cause() -> 
                 .await
                 .held()
                 .await;
-            let before = original_task_snapshot(&observer, id).await.held().await;
+            let before = post_ack_snapshot(&observer, id).await.held().await;
             let before_lines = post_ack_lines(&observer, id).await.held().await;
             let expected_pid: i32 = {
                 let mut connection = pool.acquire().await.held().await;
@@ -81,7 +101,7 @@ async fn actual_post_ack_panic_and_abort_preserve_xid_bytes_and_join_cause() -> 
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }
             }
-            let after = original_task_snapshot(&observer, id).await.held().await;
+            let after = post_ack_snapshot(&observer, id).await.held().await;
             let after_lines = post_ack_lines(&observer, id).await.held().await;
             let (same_cause, remaining) = {
                 let original = original.lock().await;
@@ -116,7 +136,7 @@ async fn actual_post_ack_panic_and_abort_preserve_xid_bytes_and_join_cause() -> 
             };
             let (returned_pid, released): (i32, bool) = {
                 let mut connection = pool.acquire().await.held().await;
-                sqlx::query_as("SELECT pg_catalog.pg_backend_pid(),owner_id IS NULL AND lease_until IS NULL FROM codex_storage.thread_writer_ownership WHERE thread_id=$1::uuid").bind(id.to_string()).fetch_one(&mut *connection).await.held().await
+                sqlx::query_as("SELECT pg_catalog.pg_backend_pid(),owner_id IS NULL AND lease_until IS NULL FROM thread_writer_ownership WHERE thread_id=$1::uuid").bind(id.to_string()).fetch_one(&mut *connection).await.held().await
             };
             let mut expected_lines = before_lines.clone();
             if !rollback {
@@ -153,7 +173,7 @@ async fn post_ack_lines(
     id: ThreadId,
 ) -> ThreadStoreResult<Vec<(Option<u64>, String)>> {
     let mut connection = pool.acquire().await.map_err(internal)?;
-    let rows: Vec<(Option<i64>, String)> = sqlx::query_as("SELECT ordinal,line FROM codex_storage.thread_rollout_lines WHERE thread_id=$1::uuid ORDER BY position").bind(id.to_string()).fetch_all(&mut *connection).await.map_err(internal)?;
+    let rows: Vec<(Option<i64>, String)> = sqlx::query_as("SELECT ordinal,line FROM thread_rollout_lines WHERE thread_id=$1::uuid ORDER BY position").bind(id.to_string()).fetch_all(&mut *connection).await.map_err(internal)?;
     rows.into_iter()
         .map(|(ordinal, line)| {
             Ok((
@@ -162,4 +182,15 @@ async fn post_ack_lines(
             ))
         })
         .collect()
+}
+
+// Both connections were genuinely connected and bound in the selected namespace.
+// Keep readbacks in that same original namespace, including the named fixture.
+async fn post_ack_snapshot(pool: &PostgresPool, id: ThreadId) -> ThreadStoreResult<Value> {
+    let mut connection = pool.acquire().await.map_err(internal)?;
+    let snapshot: String = sqlx::query_scalar(
+        "SELECT json_build_object('catalog',(SELECT to_jsonb(t) FROM threads t WHERE id=$1::uuid), \
+         'rollout',(SELECT json_agg(to_jsonb(r) ORDER BY position) FROM thread_rollout_lines r WHERE thread_id=$1::uuid))::text")
+        .bind(id.to_string()).fetch_one(&mut *connection).await.map_err(internal)?;
+    serde_json::from_str(&snapshot).map_err(internal)
 }
