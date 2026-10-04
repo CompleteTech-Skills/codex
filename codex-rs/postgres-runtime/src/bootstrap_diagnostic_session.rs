@@ -104,6 +104,25 @@ impl DiagnosticSession {
             requested.database_oid != observed.database_oid,
         ))
     }
+    #[cfg(test)]
+    pub(crate) fn control_in_progress_fact_count(&self, xid: &Arc<String>) -> Option<usize> {
+        let state = self.state.lock().ok()?;
+        let (_, requested) = state.original_request.as_ref()?;
+        if !Arc::ptr_eq(requested, xid) {
+            return None;
+        }
+        Some(
+            state
+                .causes
+                .iter()
+                .filter(|cause| {
+                    cause.native_status.as_ref().is_some_and(|status| {
+                        Arc::ptr_eq(&status.0, xid) && status.1.as_deref() == Some("in progress")
+                    })
+                })
+                .count(),
+        )
+    }
     pub(crate) fn has_original_observation(&self, xid: &Arc<String>) -> bool {
         self.state.lock().ok().is_some_and(|state| {
             state

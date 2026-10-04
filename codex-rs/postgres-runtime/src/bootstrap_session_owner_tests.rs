@@ -510,7 +510,7 @@ async fn selected_bootstrap_with_diagnostic(
     }
     let mut task_failure = None;
     let mut witnessed = fault == 0 || fault == 10;
-    let mut native_unknown_witnessed = !recoverable || fault != 3;
+    let mut native_unknown_witnessed = !recoverable || (fault != 3 && fault != 13);
     let mut diagnostic_error = None;
     let diagnostic_ok = match diagnostic_result {
         None => !recoverable,
@@ -663,7 +663,7 @@ async fn selected_bootstrap_with_diagnostic(
                     }
                     let probe = Arc::new(StampProbe::default());
                     *match fault {
-                        3 => &owner.commit_probe,
+                        3 | 13 => &owner.commit_probe,
                         4 | 8 | 9 => &owner.outcome_probe,
                         _ => &owner.stamp_probe,
                     }
@@ -737,7 +737,7 @@ async fn selected_bootstrap_with_diagnostic(
                             ));
                         }));
                     }
-                    if recoverable && fault == 3 && witnessed {
+                    if recoverable && (fault == 3 || fault == 13) && witnessed {
                         // Actual DDL has run and its SAME task is paused before
                         // COMMIT. Observe its real in-progress xid before abort.
                         let original_facts = {
@@ -745,10 +745,27 @@ async fn selected_bootstrap_with_diagnostic(
                             state.native_origin.clone().zip(state.xid.clone())
                         };
                         if let (Some(diagnostic), Some((origin, xid))) = (owner.diagnostic.as_ref(), original_facts) {
-                            let observed = diagnostic.observe(&origin, &xid).await;
-                            native_unknown_witnessed = observed.is_err() && diagnostic.original_native_status().is_some_and(|(actual, status)| {
-                                Arc::ptr_eq(&actual, &xid) && status.as_deref() == Some("in progress")
-                            });
+                            if fault == 13 {
+                                let mut all_actual_in_progress = true;
+                                for _ in 0..8 {
+                                    let refused = diagnostic.observe(&origin, &xid).await.is_err();
+                                    all_actual_in_progress &= refused && diagnostic.original_native_status().is_some_and(|(actual, status)| {
+                                        Arc::ptr_eq(&actual, &xid) && status.as_deref() == Some("in progress")
+                                    });
+                                }
+                                let before = diagnostic.control_in_progress_fact_count(&xid);
+                                let ninth_refused = diagnostic.observe(&origin, &xid).await.is_err();
+                                let after = diagnostic.control_in_progress_fact_count(&xid);
+                                native_unknown_witnessed = all_actual_in_progress && before == Some(8)
+                                    && ninth_refused && after == before && !diagnostic.has_original_observation(&xid);
+                                // The eighth genuine fact remains. Exhaustion
+                                // grants NO outcome/diagnostic recovery token.
+                            } else {
+                                let observed = diagnostic.observe(&origin, &xid).await;
+                                native_unknown_witnessed = observed.is_err() && diagnostic.original_native_status().is_some_and(|(actual, status)| {
+                                    Arc::ptr_eq(&actual, &xid) && status.as_deref() == Some("in progress")
+                                });
+                            }
                         }
                     }
                     if fault != 6 && fault != 8 && fault != 9 && fault != 12 { task.abort(); }
@@ -837,49 +854,54 @@ async fn selected_bootstrap_with_diagnostic(
         true
     };
     // Never infer task/session termination from a bare bootstrap error.
-    let reconciled = if recoverable && fault != 6 && fault != 8 && fault != 9 && fault != 12 {
-        let mut result = owner.control_close_original_and_observe().await;
-        for _ in 0..6 {
-            let in_progress = owner.diagnostic.as_ref().is_some_and(|diagnostic| {
-                diagnostic
-                    .original_native_status()
-                    .is_some_and(|(_, status)| status.as_deref() == Some("in progress"))
-            });
-            if result.is_ok() || !in_progress {
-                break;
-            }
-            // Original native status is the retry witness, never a timeout ACK.
-            tokio::task::yield_now().await;
-            result = owner.control_close_original_and_observe().await;
-        }
-        result
-    } else {
-        let mut result = owner.reconcile_original().await;
-        if fault == 12 {
+    // Fault13 is a finite-admission NEGATIVE: after same-task abort/join,
+    // its original session is still usable and proves native rollback itself.
+    // This is NOT a recovery fallback for a broken original: exhausted
+    // diagnostics there remain owning uncertainty with no cleanup receipt.
+    let reconciled =
+        if recoverable && fault != 6 && fault != 8 && fault != 9 && fault != 12 && fault != 13 {
+            let mut result = owner.control_close_original_and_observe().await;
             for _ in 0..6 {
-                let original_xid = owner.state.lock().ok().and_then(|state| state.xid.clone());
-                let same_original_in_progress =
-                    owner.diagnostic.as_ref().is_some_and(|diagnostic| {
-                        diagnostic
-                            .original_native_status()
-                            .zip(original_xid)
-                            .is_some_and(|((observed, status), original)| {
-                                Arc::ptr_eq(&observed, &original)
-                                    && status.as_deref() == Some("in progress")
-                            })
-                    });
-                if result.is_ok() || !same_original_in_progress {
+                let in_progress = owner.diagnostic.as_ref().is_some_and(|diagnostic| {
+                    diagnostic
+                        .original_native_status()
+                        .is_some_and(|(_, status)| status.as_deref() == Some("in progress"))
+                });
+                if result.is_ok() || !in_progress {
                     break;
                 }
-                // Closing upstream can precede server abort. Retry only actual
-                // same-xid in-progress evidence, with SAME cached hardclose and
-                // diagnostic physical session; never a timeout or new factory.
+                // Original native status is the retry witness, never a timeout ACK.
                 tokio::task::yield_now().await;
-                result = owner.reconcile_original().await;
+                result = owner.control_close_original_and_observe().await;
             }
-        }
-        result
-    };
+            result
+        } else {
+            let mut result = owner.reconcile_original().await;
+            if fault == 12 {
+                for _ in 0..6 {
+                    let original_xid = owner.state.lock().ok().and_then(|state| state.xid.clone());
+                    let same_original_in_progress =
+                        owner.diagnostic.as_ref().is_some_and(|diagnostic| {
+                            diagnostic
+                                .original_native_status()
+                                .zip(original_xid)
+                                .is_some_and(|((observed, status), original)| {
+                                    Arc::ptr_eq(&observed, &original)
+                                        && status.as_deref() == Some("in progress")
+                                })
+                        });
+                    if result.is_ok() || !same_original_in_progress {
+                        break;
+                    }
+                    // Closing upstream can precede server abort. Retry only actual
+                    // same-xid in-progress evidence, with SAME cached hardclose and
+                    // diagnostic physical session; never a timeout or new factory.
+                    tokio::task::yield_now().await;
+                    result = owner.reconcile_original().await;
+                }
+            }
+            result
+        };
     let proof = match reconciled {
         Ok(proof) => proof,
         Err(original) => {
@@ -949,6 +971,7 @@ async fn selected_bootstrap_with_diagnostic(
     let native_recovery_fact = !recoverable
         || fault == 8
         || fault == 9
+        || fault == 13 // Only this negative control uses its STILL-USABLE original native session.
         || owner.diagnostic.as_ref().is_some_and(|diagnostic| {
             let original_xid = owner.state.lock().ok().and_then(|state| state.xid.clone());
             diagnostic
@@ -1506,6 +1529,33 @@ async fn named_commit_request_loss_recovers_actual_aborted_xid_and_empty_namespa
         )?),
         true,
         12,
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires ROOT-admitted actual empty default namespace and genuine login control-function privilege"]
+async fn default_native_fact_budget_refuses_without_recovery_promotion() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_NATIVE_FACT_BUDGET_STATE",
+        )?),
+        false,
+        13,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires ROOT-admitted actual empty named namespace and genuine login control-function privilege"]
+async fn named_native_fact_budget_refuses_without_recovery_promotion() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_NATIVE_FACT_BUDGET_STATE",
+        )?),
+        true,
+        13,
         true,
     )
     .await
