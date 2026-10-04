@@ -741,6 +741,7 @@ async fn selected_bootstrap_with_diagnostic(
         close.await;
     }
     let mut diagnostic_late = false;
+    let mut diagnostic_cleanup_acquisition = None;
     let mut diagnostic_closed = !recoverable;
     if let Some(diagnostic) = diagnostic_pool.as_ref() {
         let mut close = Box::pin(diagnostic.close_original_sdk());
@@ -756,7 +757,10 @@ async fn selected_bootstrap_with_diagnostic(
                 drop(connection);
                 false
             }
-            Err(_) => false,
+            Err(cause) => {
+                diagnostic_cleanup_acquisition = Some(cause);
+                false
+            }
         };
     }
     let mut acquisition = None;
@@ -794,7 +798,7 @@ async fn selected_bootstrap_with_diagnostic(
             acquisition,
             task_failure: task_failure.clone(),
             diagnostic_acquisition: diagnostic_error,
-            diagnostic_cleanup_acquisition: None,
+            diagnostic_cleanup_acquisition,
             relay_report: relay_report.clone(),
             relay_error: relay_error.clone(),
         }));
@@ -811,7 +815,7 @@ async fn selected_bootstrap_with_diagnostic(
             acquisition,
             task_failure: task_failure.clone(),
             diagnostic_acquisition: diagnostic_error,
-            diagnostic_cleanup_acquisition: None,
+            diagnostic_cleanup_acquisition,
             relay_report: relay_report.clone(),
             relay_error: relay_error.clone(),
         }));
