@@ -1,0 +1,345 @@
+//! Actual service Activate(Active) dispatch, no SQL/network or replacement task.
+use super::*;
+use crate::{OperationState, PlanAction, StorageServiceInputs};
+use codex_keyring_store::tests::MockKeyringStore;
+use codex_state::SqliteConfig;
+use codex_utils_absolute_path::test_support::PathExt;
+use std::time::Duration;
+type ControlResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+fn service(home: &std::path::Path) -> StorageService {
+    StorageService::new(StorageServiceInputs {
+        codex_home: home.to_path_buf(),
+        sqlite: SqliteConfig::new_for_testing(home.abs()),
+        candidate: None,
+        default_model_provider_id: "original-operation-control".into(),
+        host_label: "control".into(),
+        keyring: Arc::new(MockKeyringStore::default()),
+    })
+}
+fn active(service: &StorageService) -> ControlResult<Uuid> {
+    let id = Uuid::new_v4();
+    service.journal.create(&OperationRecord {
+        operation_id: id,
+        action: PlanAction::Migrate,
+        plan_digest: "control".into(),
+        state: OperationState::Active,
+        run_id: None,
+        return_source: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        blocker: None,
+        copied: Vec::new(),
+    })?;
+    Ok(id)
+}
+#[tokio::test]
+async fn thirty_two_canceled_waiters_reap_actual_successful_service_tasks() -> ControlResult<()> {
+    let home = tempfile::tempdir()?;
+    let service = service(home.path());
+    for _ in 0..32 {
+        let id = active(&service)?;
+        let probe = Arc::new(Probe::default());
+        *service
+            .original_operations
+            .probe
+            .lock()
+            .map_err(|_| "probe poisoned")? = Some(Arc::clone(&probe));
+        let original = service.original_operations.capture(
+            service.operation_context(),
+            Kind::Activate,
+            Some(id),
+            None,
+        )?;
+        let entered = tokio::time::timeout(Duration::from_secs(5), probe.entered.notified()).await;
+        let task_id = original
+            .state
+            .lock()
+            .map(|state| state.task.as_ref().map(JoinHandle::id))
+            .map_err(|_| "task observation poisoned");
+        let mut waiter = Box::pin(service.original_operations.finish(Arc::clone(&original)));
+        let early = tokio::select! { biased;
+            result = &mut waiter => { let _ = result; true },
+            _ = tokio::task::yield_now() => false,
+        };
+        drop(waiter);
+        let restored = original
+            .state
+            .lock()
+            .map(|state| state.task.as_ref().map(JoinHandle::id))
+            .map_err(|_| "restored observation poisoned");
+        probe.release.notify_one(); // Always release same real production body.
+        let returned =
+            tokio::time::timeout(Duration::from_secs(5), probe.returned.notified()).await;
+        let reaped = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let done = {
+                    let mut entries = service
+                        .original_operations
+                        .originals
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut history = service
+                        .original_operations
+                        .history
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    Operations::reap_ready(&mut entries, &mut history); // SAME admission producer.
+                    !entries.iter().any(|entry| Arc::ptr_eq(entry, &original))
+                };
+                if done {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        // Even regression branches join the same original before diagnostics.
+        let result = service
+            .original_operations
+            .finish(Arc::clone(&original))
+            .await;
+        if entered.is_err()
+            || returned.is_err()
+            || reaped.is_err()
+            || early
+            || task_id? != restored?
+            || !matches!(result, Ok(Output::Record(record)) if record.operation_id == id)
+        {
+            return Err("actual canceled-success service ownership failed".into());
+        }
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn last_external_service_drop_preserves_pending_until_actual_join() -> ControlResult<()> {
+    let home = tempfile::tempdir()?;
+    let service = service(home.path());
+    let id = active(&service)?;
+    let probe = Arc::new(Probe::default());
+    *service
+        .original_operations
+        .probe
+        .lock()
+        .map_err(|_| "probe poisoned")? = Some(Arc::clone(&probe));
+    let registry = Arc::clone(&service.original_operations);
+    let weak = Arc::downgrade(&registry);
+    let original = registry.capture(service.operation_context(), Kind::Activate, Some(id), None)?;
+    let entered = tokio::time::timeout(Duration::from_secs(5), probe.entered.notified()).await;
+    drop(service);
+    drop(registry);
+    probe.release.notify_one();
+    let returned = tokio::time::timeout(Duration::from_secs(5), probe.returned.notified()).await;
+    // Actual body explicitly dropped its service context BEFORE returned notification.
+    let retained = weak.upgrade();
+    let witnessed = retained.is_some();
+    // Diagnostic fallback still joins SAME original if pending hold regressed.
+    let cleanup_registry = retained.unwrap_or_else(|| Arc::new(Operations::default()));
+    let result = cleanup_registry.finish(Arc::clone(&original)).await;
+    drop(cleanup_registry);
+    let released = weak.upgrade().is_none();
+    if entered.is_err()
+        || returned.is_err()
+        || !witnessed
+        || !released
+        || !matches!(result, Ok(Output::Record(record)) if record.operation_id == id)
+    {
+        return Err("last-owner original operation retention failed".into());
+    }
+    Ok(())
+}
+
+// Filesystem/actual command-dispatch archive proof, not SDK/SQL reuse qualification.
+#[tokio::test]
+async fn actual_failed_command_is_archived_before_same_key_fresh_success() -> ControlResult<()> {
+    let home = tempfile::tempdir()?;
+    let service = service(home.path());
+    let id = active(&service)?;
+    let mut record = service.operation(id)?;
+    record.state = OperationState::Planned;
+    service.journal.update(&record)?;
+    let first = service.original_operations.capture(
+        service.operation_context(),
+        Kind::Activate,
+        Some(id),
+        None,
+    )?;
+    let first_result = service.original_operations.finish(Arc::clone(&first)).await;
+    // Original body and cleanup are already physically joined before diagnostics.
+    let archived = {
+        let history = service
+            .original_operations
+            .history
+            .lock()
+            .map_err(|_| "history poisoned")?;
+        history.iter().any(|original| Arc::ptr_eq(original, &first))
+    };
+    record.state = OperationState::Active;
+    service.journal.update(&record)?;
+    let second = service.original_operations.capture(
+        service.operation_context(),
+        Kind::Activate,
+        Some(id),
+        None,
+    )?;
+    let distinct = !Arc::ptr_eq(&first, &second);
+    let second_result = service
+        .original_operations
+        .finish(Arc::clone(&second))
+        .await;
+    let original_failure_retained = {
+        let state = first.state.lock().map_err(|_| "original result poisoned")?;
+        matches!(
+            state.result,
+            Some(Err(StorageError(BlockerCode::OperationConflict)))
+        )
+    };
+    if !matches!(
+        first_result,
+        Err(StorageError(BlockerCode::OperationConflict))
+    ) || !archived
+        || !distinct
+        || !original_failure_retained
+        || !matches!(second_result, Ok(Output::Record(record)) if record.operation_id == id)
+    {
+        return Err("original failure archive or fresh same-key retry failed".into());
+    }
+    Ok(())
+}
+
+fn sdk_service(
+    home: &std::path::Path,
+    state: &std::path::Path,
+    namespace: &str,
+    prefix: &str,
+) -> ControlResult<StorageService> {
+    use codex_keyring_store::KeyringStore;
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state.join("receipt.json"))?)?;
+    let port = receipt["port"]
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or("fixture port unavailable")?;
+    let keyring = MockKeyringStore::default();
+    for (id, role) in [("sdk-runtime", "runtime"), ("sdk-migrator", "migrator")] {
+        let password =
+            std::fs::read_to_string(state.join(format!("secrets/{prefix}{role}.password")))?;
+        keyring.save("codex-postgres-storage", id, password.trim())?;
+    }
+    let candidate = serde_json::from_value(serde_json::json!({
+        "endpoint":"localhost", "port":port, "database":"codex", "namespace":namespace,
+        "credential":{"source":"keyring","id":"sdk-runtime"},
+        "migrator_credential":{"source":"keyring","id":"sdk-migrator"},
+        "tls":{"verification":"verify_full","ca_certificate":state.join("secrets/ca.crt")},
+        "connect_timeout_seconds":5,"pool_acquire_timeout_seconds":5,"max_connections":1
+    }))?;
+    Ok(StorageService::new(StorageServiceInputs {
+        codex_home: home.to_path_buf(),
+        sqlite: SqliteConfig::new_for_testing(home.abs()),
+        candidate: Some(candidate),
+        default_model_provider_id: "sdk-lifetime-control".into(),
+        host_label: "control".into(),
+        keyring: Arc::new(keyring),
+    }))
+}
+// SDK factories/lifetime only: actual copy/cutover and all-eight journal workflows
+// still require separate qualification. ROOT must hold admitted protected fixtures.
+async fn selected_thirty_two_sdk_cycles(
+    state: &std::path::Path,
+    namespace: &str,
+    prefix: &str,
+) -> ControlResult<()> {
+    let home = tempfile::tempdir()?.keep(); // Never delete failed original evidence.
+    let service = sdk_service(&home, state, namespace, prefix)?; // SAME service for all cycles.
+    for _ in 0..32 {
+        let id = active(&service)?;
+        let probe = Arc::new(Probe {
+            exercise_sdk: true,
+            ..Probe::default()
+        });
+        *service
+            .original_operations
+            .probe
+            .lock()
+            .map_err(|_| "probe poisoned")? = Some(Arc::clone(&probe));
+        let original = service.original_operations.capture(
+            service.operation_context(),
+            Kind::Activate,
+            Some(id),
+            None,
+        )?;
+        let entered = tokio::time::timeout(Duration::from_secs(5), probe.entered.notified()).await;
+        let original_id = original
+            .state
+            .lock()
+            .map(|state| state.task.as_ref().map(JoinHandle::id))
+            .map_err(|_| "original task observation poisoned");
+        let mut waiter = Box::pin(service.original_operations.finish(Arc::clone(&original)));
+        let early = tokio::select! { biased; result = &mut waiter => { let _ = result; true }, _ = tokio::task::yield_now() => false };
+        drop(waiter); // Cancel caller, never the actual SQL/cleanup production task.
+        let restored = original
+            .state
+            .lock()
+            .map(|state| state.task.as_ref().map(JoinHandle::id))
+            .map_err(|_| "restored observation poisoned");
+        probe.release.notify_one();
+        let returned =
+            tokio::time::timeout(Duration::from_secs(20), probe.returned.notified()).await;
+        // Timeout is an observation: reconcile SAME original task before verdict.
+        let result = service
+            .original_operations
+            .finish(Arc::clone(&original))
+            .await;
+        let snapshot = original
+            .resources
+            .actual_runtime_sdk_snapshot()
+            .map_err(|_| "original SDK snapshot poisoned");
+        let mut pool_count = 0;
+        let mut every_pool_closed = true;
+        if let Ok(snapshot) = snapshot.as_ref() {
+            for pool in snapshot.iter().flatten() {
+                pool_count += 1;
+                // Release an unexpectedly returned connection before any diagnostics.
+                every_pool_closed &= match pool.acquire().await {
+                    Err(codex_postgres_runtime::PoolError::Closed) => true,
+                    Ok(connection) => {
+                        drop(connection);
+                        false
+                    }
+                    Err(_) => false,
+                };
+            }
+        }
+        let startups = service.migration_startups.original_startups();
+        if entered.is_err()
+            || returned.is_err()
+            || early
+            || original_id? != restored?
+            || snapshot.is_err()
+            || pool_count != 1
+            || !every_pool_closed
+            || !original.resources.cleanup_completed()
+            || !startups?.is_empty()
+            || !matches!(result, Ok(Output::Record(record)) if record.operation_id == id)
+        {
+            return Err("same-service actual SDK lifetime/reuse/canceled caller failed".into());
+        }
+    }
+    Ok(())
+}
+#[tokio::test]
+#[ignore = "requires ROOT retained execution host, fresh admitted default SQL fixture and clock/resources"]
+async fn real_default_same_service_thirty_two_sdk_canceled_success_cycles() -> ControlResult<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_OWNERSHIP_STATE")?;
+    selected_thirty_two_sdk_cycles(std::path::Path::new(&state), "codex_storage", "").await
+}
+#[tokio::test]
+#[ignore = "requires ROOT retained execution host, fresh admitted named SQL fixture and clock/resources"]
+async fn real_named_same_service_thirty_two_sdk_canceled_success_cycles() -> ControlResult<()> {
+    let state = std::env::var("CODEX_TEST_POSTGRES_ISOLATION_STATE")?;
+    selected_thirty_two_sdk_cycles(
+        std::path::Path::new(&state),
+        "codex_storage_isolation",
+        "isolation_",
+    )
+    .await
+}
