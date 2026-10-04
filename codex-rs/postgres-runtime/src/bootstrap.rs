@@ -99,7 +99,7 @@ impl fmt::Display for BootstrapError {
 
 impl std::error::Error for BootstrapError {}
 
-fn classify_sqlx(error: &sqlx::Error) -> BootstrapError {
+pub(crate) fn classify_sqlx(error: &sqlx::Error) -> BootstrapError {
     match error {
         sqlx::Error::Database(error) if error.code().as_deref() == Some("42501") => {
             BootstrapError::Privilege

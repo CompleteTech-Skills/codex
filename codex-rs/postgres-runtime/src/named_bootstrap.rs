@@ -19,12 +19,7 @@ use std::borrow::Cow;
 use tokio::time::timeout;
 
 fn classify(error: &sqlx::Error) -> BootstrapError {
-    match error {
-        sqlx::Error::Database(error) if error.code().as_deref() == Some("42501") => {
-            BootstrapError::Privilege
-        }
-        _ => BootstrapError::Migration,
-    }
+    crate::bootstrap::classify_sqlx(error)
 }
 
 pub(crate) fn namespaced_migrations(
