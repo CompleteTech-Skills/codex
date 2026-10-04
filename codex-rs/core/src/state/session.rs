@@ -35,6 +35,9 @@ pub(crate) struct PreparedContextWindow {
     successor: AutoCompactWindow,
 }
 impl PreparedContextWindow {
+    pub(crate) fn window_number(&self) -> u64 {
+        self.successor.window_number()
+    }
     pub(crate) fn ids(&self) -> AutoCompactWindowIds {
         self.successor.ids()
     }

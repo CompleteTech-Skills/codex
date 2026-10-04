@@ -13464,6 +13464,7 @@ async fn late_checked_context_failure_preserves_history_window_and_request() {
             &[user_message("retain prior history")],
         )
         .await;
+    let session = Arc::new(session);
     let step = session
         .capture_step_context(Arc::new(turn_context), &CancellationToken::new())
         .await
@@ -13527,6 +13528,7 @@ async fn prepared_context_window_commits_exact_rendered_ids_and_rejects_stale_pr
         .features
         .enable(Feature::TokenBudget)
         .unwrap();
+    let session = Arc::new(session);
     let step = session
         .capture_step_context(Arc::new(turn_context), &CancellationToken::new())
         .await
@@ -13550,5 +13552,97 @@ async fn prepared_context_window_commits_exact_rendered_ids_and_rejects_stale_pr
     session.request_new_context_window().await;
     assert!(session.commit_context_window(stale, true).await.is_err());
     assert_eq!(session.state.lock().await.auto_compact_window_ids(), ids);
+    assert!(session.new_context_window_requested().await);
+}
+
+#[tokio::test]
+async fn prepared_history_install_cancellation_and_stale_window_preserve_live_state() {
+    let (session, turn_context) = make_session_and_context().await;
+    session
+        .record_conversation_items(
+            &turn_context,
+            turn_context.model_info(),
+            &[user_message(
+                "preserve existing conversation on cancelled installation",
+            )],
+        )
+        .await;
+    let before = session.clone_history().await;
+    let initial_ids = session.state.lock().await.auto_compact_window_ids();
+    session.request_new_context_window().await;
+    let metadata = |prepared: &crate::state::PreparedContextWindow| CompactedHistoryMetadata {
+        input_goal_ids: Default::default(),
+        message: String::new(),
+        window_number: prepared.window_number(),
+        window_ids: prepared.ids(),
+        compaction_response_id: None,
+        compaction_model_hash: None,
+        reviewer_compaction_hash: None,
+    };
+    let prepared = session.prepare_context_window().await;
+    let settings_guard = thread_settings::acquire_persistence_lock(&session).await;
+    let mut install = Box::pin(session.replace_compacted_history_for_window(
+        Vec::new(),
+        None,
+        None,
+        metadata(&prepared),
+        prepared,
+        true,
+    ));
+    // Poll the actual replacement, blocked on its actual settings persistence permit.
+    let pending = futures::poll!(install.as_mut()).is_pending();
+    drop(install); // cancellation before the permit can be acquired
+    drop(settings_guard);
+    assert!(pending);
+    assert_eq!(
+        session.state.lock().await.auto_compact_window_ids(),
+        initial_ids
+    );
+    assert_eq!(
+        session.clone_history().await.annotated_items(),
+        before.annotated_items()
+    );
+    assert!(session.new_context_window_requested().await);
+
+    let prepared = session.prepare_context_window().await;
+    let stale = session.prepare_context_window().await;
+    let installed_ids = prepared.ids();
+    let replacement = vec![ResponseItemEnvelope::new(user_message(
+        "atomic replacement",
+    ))];
+    session
+        .replace_compacted_history_for_window(
+            replacement.clone(),
+            None,
+            None,
+            metadata(&prepared),
+            prepared,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session.state.lock().await.auto_compact_window_ids(),
+        installed_ids
+    );
+    let installed_history = session.clone_history().await;
+    let actual_items = installed_history.raw_items().cloned().collect::<Vec<_>>();
+    assert_eq!(
+        strip_response_item_ids(&actual_items),
+        strip_response_item_ids(std::slice::from_ref(&replacement[0].item))
+    );
+    session.request_new_context_window().await;
+    let refusal = session
+        .replace_compacted_history_for_window(Vec::new(), None, None, metadata(&stale), stale, true)
+        .await;
+    assert!(refusal.is_err());
+    assert_eq!(
+        session.state.lock().await.auto_compact_window_ids(),
+        installed_ids
+    );
+    assert_eq!(
+        session.clone_history().await.annotated_items(),
+        installed_history.annotated_items()
+    );
     assert!(session.new_context_window_requested().await);
 }

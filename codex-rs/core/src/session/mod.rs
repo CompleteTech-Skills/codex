@@ -3987,13 +3987,52 @@ impl Session {
         state.replace_history(items, reference_context_item);
     }
 
+    #[cfg(test)]
     pub(crate) async fn replace_compacted_history(
         &self,
-        mut items: Vec<ResponseItemEnvelope>,
+        items: Vec<ResponseItemEnvelope>,
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<WorldStateSnapshot>,
         metadata: CompactedHistoryMetadata,
     ) {
+        self.replace_compacted_history_inner(
+            items,
+            reference_context_item,
+            world_state_baseline,
+            metadata,
+            None,
+        )
+        .await
+        .expect("legacy test history replacement");
+    }
+
+    pub(crate) async fn replace_compacted_history_for_window(
+        &self,
+        items: Vec<ResponseItemEnvelope>,
+        reference_context_item: Option<TurnContextItem>,
+        world_state_baseline: Option<WorldStateSnapshot>,
+        metadata: CompactedHistoryMetadata,
+        prepared: crate::state::PreparedContextWindow,
+        clear_prefill: bool,
+    ) -> CodexResult<u64> {
+        self.replace_compacted_history_inner(
+            items,
+            reference_context_item,
+            world_state_baseline,
+            metadata,
+            Some((prepared, clear_prefill)),
+        )
+        .await
+    }
+
+    async fn replace_compacted_history_inner(
+        &self,
+        mut items: Vec<ResponseItemEnvelope>,
+        reference_context_item: Option<TurnContextItem>,
+        world_state_baseline: Option<WorldStateSnapshot>,
+        mut metadata: CompactedHistoryMetadata,
+        prepared: Option<(crate::state::PreparedContextWindow, bool)>,
+    ) -> CodexResult<u64> {
         for envelope in &mut items {
             Self::assign_missing_response_item_id(&mut envelope.item);
         }
@@ -4055,6 +4094,12 @@ impl Session {
                     .cloned(),
             );
             let replacement_history = items.clone();
+            // No await separates successor validation/commit from history installation.
+            if let Some((prepared, clear_prefill)) = prepared {
+                let (number, ids) = prepared.commit(&mut state, clear_prefill)?;
+                metadata.window_number = number;
+                metadata.window_ids = ids;
+            }
             state.replace_annotated_history(
                 items,
                 reference_context_item.clone(),
@@ -4090,6 +4135,9 @@ impl Session {
             }
         };
 
+        let installed_window_number = compacted_item
+            .window_number
+            .expect("compacted window number");
         let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
         // Persist the baseline after the replacement history that established it.
         if let Some(world_state_item) = world_state_item {
@@ -4113,6 +4161,7 @@ impl Session {
             let mut state = self.state.lock().await;
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
         }
+        Ok(installed_window_number)
     }
 
     pub fn enabled(&self, feature: Feature) -> bool {
@@ -4502,6 +4551,7 @@ impl Session {
     pub(crate) async fn prepare_context_window(&self) -> crate::state::PreparedContextWindow {
         self.state.lock().await.prepare_context_window()
     }
+    #[cfg(test)]
     pub(crate) async fn commit_context_window(
         &self,
         prepared: crate::state::PreparedContextWindow,
@@ -4558,15 +4608,15 @@ impl Session {
                 Some(prepared.ids()),
             )
             .await?;
-        let window = self.commit_context_window(prepared, true).await?;
-        let (window_number, window_ids) = window;
+        let window_number = prepared.window_number();
+        let window_ids = prepared.ids();
         let context_items = context_items
             .into_iter()
             .map(ResponseItemEnvelope::new)
             .chain(retained_client_developer_messages)
             .collect();
         let turn_context_item = step_context.to_turn_context_item();
-        self.replace_compacted_history(
+        self.replace_compacted_history_for_window(
             context_items,
             Some(turn_context_item),
             Some(world_state_snapshot),
@@ -4579,8 +4629,10 @@ impl Session {
                 compaction_model_hash: None,
                 reviewer_compaction_hash: None,
             },
+            prepared,
+            true,
         )
-        .await;
+        .await?;
         self.recompute_token_usage(turn_context).await;
         Ok(window_number)
     }

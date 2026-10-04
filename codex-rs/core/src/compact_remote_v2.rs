@@ -328,7 +328,8 @@ async fn run_remote_compact_task_inner_impl(
             Some(prepared.ids()),
         )
         .await?;
-    let (new_window_number, new_window_ids) = sess.commit_context_window(prepared, false).await?;
+    let new_window_number = prepared.window_number();
+    let new_window_ids = prepared.ids();
     let new_history =
         insert_initial_context_before_last_real_user_or_summary(compacted_history, initial_context);
 
@@ -362,7 +363,7 @@ async fn run_remote_compact_task_inner_impl(
     } else {
         None
     };
-    sess.replace_compacted_history(
+    sess.replace_compacted_history_for_window(
         new_history,
         reference_context_item,
         world_state_baseline,
@@ -375,8 +376,10 @@ async fn run_remote_compact_task_inner_impl(
             compaction_model_hash: compaction_turn_context.model_info().comp_hash.clone(),
             reviewer_compaction_hash,
         },
+        prepared,
+        false,
     )
-    .await;
+    .await?;
     sess.recompute_token_usage(compaction_turn_context).await;
 
     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)
