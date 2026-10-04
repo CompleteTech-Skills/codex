@@ -144,6 +144,37 @@ impl RemoteStorage {
         })
     }
 
+    /// Actual original Runtime SDK is captured before any acquisition/after-connect
+    /// SQL. Caller retains the capture outside this constructor future.
+    pub async fn connect_with_retained_sdk(
+        profile: &RemotePostgresProfile,
+        resolver: &HostCredentialResolver<'_>,
+        capture: &mut (
+                 dyn FnMut(Arc<PostgresPool>) -> Result<(), codex_postgres_runtime::PoolError>
+                     + Send
+             ),
+    ) -> Result<Self, RemoteStorageError> {
+        let (settings, namespace) = connection_settings(profile, resolver, LoginRole::Runtime)?;
+        let pool =
+            PostgresPool::connect_retained_in_namespace(settings, namespace.as_ref(), capture)
+                .await
+                .map_err(RemoteStorageError::Connection)?;
+        check_runtime_schema(&pool)
+            .await
+            .map_err(RemoteStorageError::Schema)?;
+        pool.bind_current_activation()
+            .await
+            .map_err(activation_error)?;
+        let connected_generation = pool.bound_activation_generation().ok_or_else(|| {
+            RemoteStorageError::Schema(codex_postgres_runtime::RuntimeSchemaError::Unavailable)
+        })?;
+        Ok(Self {
+            pool,
+            namespace,
+            connected_generation,
+        })
+    }
+
     /// The activation state as the dataset reports it right now.
     pub async fn activation(&self) -> Result<StorageActivation, RemoteStorageError> {
         let mut connection = self
