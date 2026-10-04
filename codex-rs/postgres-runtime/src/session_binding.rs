@@ -81,25 +81,32 @@ impl BoundWrite<'_> {
 }
 
 async fn observe(
+    pool: &PostgresPool,
     connection: &mut PgConnection,
 ) -> Result<(String, ActivationBinding), ActivationGateError> {
     // One shared lock protects both the state decision and the retained identity.
-    let row = sqlx::query(
-        "SELECT state, dataset_id::uuid::text AS dataset_id, generation \
+    let row = pool
+        .retain_runtime_query(
+            sqlx::query(
+                "SELECT state, dataset_id::uuid::text AS dataset_id, generation \
          FROM storage_activation WHERE singleton FOR SHARE",
-    )
-    .fetch_one(connection)
-    .await
-    .map_err(|_| ActivationGateError::Unavailable)?;
-    let state: String = row
-        .try_get("state")
+            )
+            .fetch_one(connection),
+        )
+        .await
+        .map_err(|_| ActivationGateError::Unavailable)?;
+    let state: String = pool
+        .retain_runtime_query(async { row.try_get("state") })
+        .await
         .map_err(|_| ActivationGateError::Unavailable)?;
     let binding = ActivationBinding {
-        dataset: row
-            .try_get("dataset_id")
+        dataset: pool
+            .retain_runtime_query(async { row.try_get("dataset_id") })
+            .await
             .map_err(|_| ActivationGateError::Unavailable)?,
-        generation: row
-            .try_get("generation")
+        generation: pool
+            .retain_runtime_query(async { row.try_get("generation") })
+            .await
             .map_err(|_| ActivationGateError::Unavailable)?,
     };
     if binding.generation < 0 || !matches!(state.as_str(), "open" | "migrating" | "retired") {
@@ -146,14 +153,14 @@ impl PostgresPool {
             .acquire()
             .await
             .map_err(|_| ActivationGateError::Unavailable)?;
-        let mut tx = connection
-            .begin()
+        let mut tx = self
+            .retain_runtime_query(connection.begin())
             .await
             .map_err(|_| ActivationGateError::Unavailable)?;
         self.prepare_selected_write(&mut tx).await?;
-        let (_, observed) = observe(&mut tx).await?;
+        let (_, observed) = observe(self, &mut tx).await?;
         // Commit first: publication never claims a successful transaction that failed to end.
-        tx.commit()
+        self.retain_runtime_query(tx.commit())
             .await
             .map_err(|_| ActivationGateError::Unavailable)?;
         self.activation_binding
@@ -174,10 +181,11 @@ impl PostgresPool {
         &self,
         connection: &mut PgConnection,
     ) -> Result<(), ActivationGateError> {
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            .execute(&mut *connection)
-            .await
-            .map_err(|_| ActivationGateError::Unavailable)?;
+        self.retain_runtime_query(
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED").execute(&mut *connection),
+        )
+        .await
+        .map_err(|_| ActivationGateError::Unavailable)?;
         self.prepare_selected_namespace(connection).await
     }
 
@@ -189,11 +197,13 @@ impl PostgresPool {
             .selected_search_path
             .as_ref()
             .ok_or(ActivationGateError::Unavailable)?;
-        sqlx::query("SELECT set_config('search_path', $1, true)")
-            .bind(path)
-            .execute(connection)
-            .await
-            .map_err(|_| ActivationGateError::Unavailable)?;
+        self.retain_runtime_query(
+            sqlx::query("SELECT set_config('search_path', $1, true)")
+                .bind(path)
+                .execute(connection),
+        )
+        .await
+        .map_err(|_| ActivationGateError::Unavailable)?;
         Ok(())
     }
 
@@ -208,7 +218,7 @@ impl PostgresPool {
             .activation_binding
             .get()
             .ok_or(ActivationGateError::Unavailable)?;
-        let (state, actual) = observe(connection).await?;
+        let (state, actual) = observe(self, connection).await?;
         match state.as_str() {
             "migrating" => Err(ActivationGateError::Migrating),
             "retired" => Err(ActivationGateError::Retired),
@@ -228,7 +238,7 @@ impl PostgresPool {
             .activation_binding
             .get()
             .ok_or(ActivationGateError::Unavailable)?;
-        let (_, actual) = observe(connection).await?;
+        let (_, actual) = observe(self, connection).await?;
         if actual == **expected {
             Ok(())
         } else {

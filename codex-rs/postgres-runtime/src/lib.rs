@@ -495,6 +495,31 @@ impl PostgresPool {
         }
     }
 
+    /// Reserve before polling the original query; retain its driver cause before redaction.
+    /// Dropping this future preserves interrupted evidence, never a terminal acknowledgment.
+    pub(crate) async fn retain_runtime_query<T>(
+        &self,
+        query: impl std::future::Future<Output = Result<T, sqlx::Error>>,
+    ) -> Result<T, sqlx::Error> {
+        let reservation = self
+            .runtime_causes
+            .as_ref()
+            .map(|owner| owner.reserve())
+            .transpose()?;
+        match query.await {
+            Ok(value) => {
+                if let Some(reservation) = reservation {
+                    reservation.success();
+                }
+                Ok(value)
+            }
+            Err(original) => Err(match reservation {
+                Some(reservation) => reservation.failure(original),
+                None => original,
+            }),
+        }
+    }
+
     /// Original retained Runtime causes only; no socket/transaction outcome authority.
     pub fn retains_original_runtime_causes(&self) -> Result<bool, PoolError> {
         self.runtime_causes
