@@ -103,6 +103,8 @@ pub(crate) fn validate_staged_sqlite_sidecars(staged_home: &Path) -> io::Result<
         let name = name
             .to_str()
             .ok_or_else(|| corrupt("staged filename is not Unicode"))?;
+        // Windows may resolve differently cased names to the same SQLite sidecar.
+        let name = name.to_ascii_lowercase();
         if name.ends_with(".sqlite-wal") || name.ends_with(".sqlite-shm") {
             return Err(corrupt(
                 "staged SQLite sidecars require checkpoint and closure before installation",
@@ -314,7 +316,12 @@ mod staged_sidecar_tests {
 
     #[test]
     fn staged_sidecar_refusal_preserves_files_and_creates_no_plan() {
-        for sidecar in ["memories_v2_1.sqlite-wal", "memories_v2_1.sqlite-shm"] {
+        for sidecar in [
+            "memories_v2_1.sqlite-wal",
+            "memories_v2_1.sqlite-shm",
+            "memories_v2_1.SQLITE-WAL",
+            "memories_v2_1.Sqlite-Shm",
+        ] {
             for staged_database_present in [false, true] {
                 let home = tempfile::tempdir().expect("isolated live home");
                 let stage = tempfile::tempdir().expect("isolated stage");
