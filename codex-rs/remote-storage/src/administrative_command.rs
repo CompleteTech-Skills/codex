@@ -20,6 +20,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+#[path = "administrative_catalog.rs"]
+mod catalog;
+
 type CloseOutcome = Result<(), Arc<dyn std::error::Error + Send + Sync>>;
 const CAUSES: usize = 8;
 const PREFLIGHT: &str = "SELECT role.oid::bigint AS role_oid, role.rolname::text AS role_name,
@@ -47,6 +50,7 @@ struct State {
     raw_stamp: Option<PgRow>,
     xid: Option<String>,
     raw_rows: Option<Vec<PgRow>>,
+    raw_catalog: [Option<Vec<PgRow>>; 6],
     observed_status: Option<Option<String>>,
     commit_attempted: bool,
     rollback_attempted: bool,
@@ -96,6 +100,7 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
         let _retained = (
             &state.joined_failure,
             &state.raw_rows,
+            &state.raw_catalog,
             &state.raw_stamp,
             &state.native_baseline,
             &state.xid,
@@ -209,6 +214,7 @@ impl OriginalAdministrativeCommand {
                 raw_stamp: None,
                 xid: None,
                 raw_rows: None,
+                raw_catalog: std::array::from_fn(|_| None),
                 observed_status: None,
                 commit_attempted: false,
                 rollback_attempted: false,
@@ -379,6 +385,57 @@ impl OriginalAdministrativeCommand {
                     let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
                     state.refused |= self.state.is_poisoned() || rows.len() > 1000;
                     state.raw_rows = Some(rows); // Actual returned rows before classification.
+                }
+                Err(raw) => self.cause(CommandCause::Driver(raw)),
+            }
+        }
+        let namespace = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state
+                .observer
+                .original_input()
+                .target()
+                .namespace()
+                .to_owned()
+        };
+        for (index, statement) in catalog::STATEMENTS.iter().enumerate() {
+            let admitted = {
+                let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                !state.refused && !self.state.is_poisoned()
+            };
+            if !admitted {
+                break;
+            }
+            match sqlx::query(statement.sql)
+                .bind(&namespace)
+                .fetch_all(&mut **connection)
+                .await
+            {
+                Ok(rows) => {
+                    let oversized = {
+                        let mut state =
+                            self.state.lock().unwrap_or_else(|error| error.into_inner());
+                        state.refused |= self.state.is_poisoned()
+                            || rows.len() > statement.rows
+                            || (index == 0 && rows.is_empty());
+                        state.raw_catalog[index] = Some(rows); // Before ANY decode/refusal.
+                        if index == 1 {
+                            state.raw_catalog[index].as_ref().map(|rows| {
+                                rows.iter()
+                                    .map(|row| row.try_get::<bool, _>("oversized"))
+                                    .collect::<Result<Vec<_>, _>>()
+                            })
+                        } else {
+                            None
+                        }
+                    };
+                    match oversized {
+                        Some(Ok(bounds)) if bounds.iter().any(|bound| *bound) => {
+                            self.cause(CommandCause::UnknownStatus)
+                        }
+                        Some(Err(raw)) => self.cause(CommandCause::Driver(raw)),
+                        _ => {}
+                    }
                 }
                 Err(raw) => self.cause(CommandCause::Driver(raw)),
             }
