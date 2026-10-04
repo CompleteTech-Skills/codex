@@ -307,6 +307,14 @@ impl PostgresPool {
     }
 }
 impl RetainedWriteSession {
+    pub(crate) fn into_original_hard_close(
+        self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), sqlx::Error>> + Send>> {
+        use sqlx::Connection;
+        // Ownership transfer only; actual future completion is separately owned.
+        let original = self.connection.detach();
+        Box::pin(original.close_hard())
+    }
     // SDK-private bootstrap consumer uses the SAME physical container, without
     // calling selected-write begin or claiming Runtime activation admission.
     pub(crate) fn bootstrap_connection(&mut self) -> &mut PgConnection {

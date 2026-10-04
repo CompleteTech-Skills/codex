@@ -37,6 +37,8 @@ struct State {
     origin: Option<NativeOrigin>,
     observation: Option<(Arc<String>, bool)>,
     causes: [Cause; 8],
+    sealed: bool,
+    close: Option<Arc<crate::bootstrap_original_close::OriginalClose>>,
 }
 pub(crate) struct Observation {
     pub(crate) original_diagnostic: Arc<DiagnosticSession>,
@@ -60,8 +62,13 @@ impl DiagnosticSession {
                 origin: None,
                 observation: None,
                 causes: std::array::from_fn(|_| Cause::default()),
+                sealed: false,
+                close: None,
             }),
         })
+    }
+    pub(crate) fn original_pool(&self) -> &Arc<PostgresPool> {
+        &self.original_pool
     }
     pub(crate) async fn observe(
         self: &Arc<Self>,
@@ -77,6 +84,9 @@ impl DiagnosticSession {
             .map_err(|_| refusal())?;
         let acquire = {
             let mut state = self.state.lock().map_err(|_| refusal())?;
+            if state.sealed {
+                return Err(refusal());
+            }
             if state.attempted && state.original.is_none() {
                 return Err(refusal());
             }
@@ -204,6 +214,41 @@ impl DiagnosticSession {
                 "original diagnostic query interrupted; outcome unknown",
             )),
         })
+    }
+    pub(crate) async fn close_original(self: &Arc<Self>) -> Result<(), Refusal> {
+        let refusal = || Refusal {
+            original: Arc::clone(self),
+        };
+        let _permit = Arc::clone(&self.gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| refusal())?;
+        let (close, poison) = {
+            let (mut state, poison) = match self.state.lock() {
+                Ok(state) => (state, false),
+                Err(cause) => (cause.into_inner(), true),
+            };
+            state.sealed = true;
+            if state.close.is_none() {
+                if let Some(original) = state.original.take() {
+                    state.close = Some(crate::bootstrap_original_close::OriginalClose::capture(
+                        original,
+                    ));
+                }
+            }
+            (state.close.clone(), poison)
+        };
+        if let Some(close) = close {
+            match close.finish().await {
+                Ok(receipt) if receipt.covers_pool(&self.original_pool) => {}
+                _ => return Err(refusal()),
+            }
+        }
+        if poison || self.state.is_poisoned() {
+            Err(refusal())
+        } else {
+            Ok(())
+        }
     }
 }
 struct Loan {

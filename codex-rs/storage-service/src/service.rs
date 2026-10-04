@@ -321,11 +321,19 @@ impl StorageService {
         let resolver = HostCredentialResolver::new(self.inputs.keyring.as_ref());
         let (settings, namespace) = connection_settings(profile, &resolver, LoginRole::Migrator)
             .map_err(|error| StorageError(error.into()))?;
+        // Independently resolve the genuine second schema-owner login before
+        // either SDK factory is polled; this is not a runtime-role fallback.
+        let (diagnostic_settings, diagnostic_namespace) =
+            connection_settings(profile, &resolver, LoginRole::Migrator)
+                .map_err(|error| StorageError(error.into()))?;
         let resources = self
             .operation_resources
             .as_ref()
             .ok_or(StorageError(BlockerCode::Internal))?;
         let slot = resources
+            .reserve_runtime_pool()
+            .map_err(|_| StorageError(BlockerCode::ConnectionFailed))?;
+        let diagnostic_slot = resources
             .reserve_runtime_pool()
             .map_err(|_| StorageError(BlockerCode::ConnectionFailed))?;
         // Same genuine schema-owner login/settings; no Runtime activation/schema
@@ -342,6 +350,26 @@ impl StorageService {
             Err(error) => {
                 slot.record_returned_failure(Arc::new(error));
                 return Err(StorageError(RemoteStorageError::Connection(error).into()));
+            }
+        };
+        let mut diagnostic_capture = |pool| {
+            diagnostic_slot
+                .capture_original_arc(pool)
+                .map_err(|_| codex_postgres_runtime::PoolError::Unavailable)
+        };
+        let diagnostic_pool = match PostgresPool::connect_retained_in_namespace(
+            diagnostic_settings,
+            diagnostic_namespace.as_ref(),
+            &mut diagnostic_capture,
+        )
+        .await
+        {
+            Ok(pool) => pool,
+            Err(original) => {
+                diagnostic_slot.record_returned_failure(Arc::new(original));
+                return Err(StorageError(
+                    RemoteStorageError::Connection(original).into(),
+                ));
             }
         };
         #[cfg(test)]
@@ -388,7 +416,7 @@ UNION ALL SELECT extnamespace FROM pg_catalog.pg_extension
             }
         }
         let session_owner = resources
-            .retain_bootstrap_session(Arc::clone(&pool))
+            .retain_bootstrap_session(Arc::clone(&pool), Arc::clone(&diagnostic_pool))
             .map_err(|_| StorageError(BlockerCode::SchemaInvalid))?;
         let result = match &namespace {
             Some(namespace) => {

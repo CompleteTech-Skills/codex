@@ -49,30 +49,6 @@ impl OriginalClose {
             }),
             permit: Arc::new(Semaphore::new(1)),
         });
-        {
-            let mut state = owner
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let task_owner = Arc::clone(&owner);
-            let task = tokio::spawn(async move {
-                // Sender holds this exact gate until the original handle is stored.
-                let future = {
-                    let mut state = task_owner
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    state.future.take()
-                };
-                match future {
-                    Some(future) => future.await.map_err(Arc::new),
-                    None => Err(Arc::new(sqlx::Error::Protocol(
-                        "missing original close future".into(),
-                    ))),
-                }
-            });
-            state.task = Some(task);
-        }
         owner
     }
     pub(crate) async fn finish(self: &Arc<Self>) -> Result<Closed, Refusal> {
@@ -88,6 +64,31 @@ impl OriginalClose {
                 Ok(state) => (state, false),
                 Err(cause) => (cause.into_inner(), true),
             };
+            if state.task.is_none()
+                && state.terminal.is_none()
+                && state.failure.is_none()
+                && state.future.is_some()
+            {
+                // capture() does not dispatch. This exact frame has already
+                // been stored in its exterior owner before finish() is invoked.
+                let task_owner = Arc::clone(self);
+                let task = tokio::spawn(async move {
+                    let future = {
+                        let mut state = task_owner
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.future.take()
+                    };
+                    match future {
+                        Some(future) => future.await.map_err(Arc::new),
+                        None => Err(Arc::new(sqlx::Error::Protocol(
+                            "missing original close future".into(),
+                        ))),
+                    }
+                });
+                state.task = Some(task); // Same gate precedes first native poll.
+            }
             // Cached error retains the actual original driver cause forever.
             (
                 if state.terminal.is_none() {

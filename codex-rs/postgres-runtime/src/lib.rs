@@ -49,6 +49,8 @@ pub use session_binding::OriginalTransactionAcknowledgment;
 pub use session_binding::OriginalTransactionOutcome;
 pub use session_binding::RetainedWriteAdmissionError;
 pub use session_binding::RetainedWriteSession;
+mod bootstrap_diagnostic_session;
+mod bootstrap_original_close;
 mod bootstrap_session_owner;
 pub use bootstrap_session_owner::BootstrapSessionCleanup;
 pub use bootstrap_session_owner::BootstrapSessionOwner;

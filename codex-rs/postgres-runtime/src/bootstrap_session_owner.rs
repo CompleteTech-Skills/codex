@@ -16,6 +16,7 @@ type ControlTerminal = Result<Result<(), BootstrapError>, Arc<tokio::task::JoinE
 
 pub struct BootstrapSessionOwner {
     pool: Arc<PostgresPool>,
+    diagnostic: Option<Arc<crate::bootstrap_diagnostic_session::DiagnosticSession>>,
     state: Mutex<State>,
     join: Arc<Semaphore>,
     #[cfg(test)]
@@ -41,6 +42,10 @@ struct State {
     acquisition: Option<crate::PoolError>,
     xid: Option<Arc<String>>,
     outcome: Option<bool>,
+    native_origin: Option<crate::bootstrap_diagnostic_session::NativeOrigin>,
+    native_status: Option<Option<String>>,
+    control_privilege: Option<bool>,
+    close: Option<Arc<crate::bootstrap_original_close::OriginalClose>>,
     causes: [Cause; 8],
 }
 #[derive(Default)]
@@ -50,8 +55,35 @@ struct Cause {
 }
 impl BootstrapSessionOwner {
     pub fn new(pool: Arc<PostgresPool>) -> Arc<Self> {
+        Self::with_diagnostic(pool, None)
+    }
+    pub fn new_recoverable(
+        pool: Arc<PostgresPool>,
+        diagnostic_pool: Arc<PostgresPool>,
+    ) -> Arc<Self> {
+        let aliases_original = Arc::ptr_eq(&pool, &diagnostic_pool);
+        let owner = Self::with_diagnostic(
+            pool,
+            Some(crate::bootstrap_diagnostic_session::DiagnosticSession::new(
+                diagnostic_pool,
+            )),
+        );
+        if aliases_original {
+            owner
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sealed = true;
+        }
+        owner
+    }
+    fn with_diagnostic(
+        pool: Arc<PostgresPool>,
+        diagnostic: Option<Arc<crate::bootstrap_diagnostic_session::DiagnosticSession>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pool,
+            diagnostic,
             join: Arc::new(Semaphore::new(1)),
             #[cfg(test)]
             stamp_probe: Mutex::new(None),
@@ -75,6 +107,10 @@ impl BootstrapSessionOwner {
                 acquisition: None,
                 xid: None,
                 outcome: None,
+                native_origin: None,
+                native_status: None,
+                control_privilege: None,
+                close: None,
                 causes: std::array::from_fn(|_| Cause::default()),
             }),
         })
@@ -218,6 +254,42 @@ impl BootstrapSessionOwner {
         self: &Arc<Self>,
         transaction: &mut Transaction<'_, Postgres>,
     ) -> Result<(), BootstrapError> {
+        if self.diagnostic.is_some() {
+            let permitted = self.query(sqlx::query_scalar::<_, bool>(
+                "SELECT pg_catalog.has_function_privilege(CURRENT_USER, 'pg_catalog.pg_control_system()', 'EXECUTE')",
+            ).fetch_one(&mut **transaction), false).await?;
+            let poison = {
+                let (mut state, poison) = match self.state.lock() {
+                    Ok(state) => (state, false),
+                    Err(cause) => (cause.into_inner(), true),
+                };
+                state.control_privilege = Some(permitted);
+                poison
+            };
+            if poison {
+                return Err(BootstrapError::Migration);
+            }
+            if !permitted {
+                return Err(BootstrapError::Privilege);
+            }
+            let origin = self
+                .query(
+                    crate::bootstrap_diagnostic_session::NativeOrigin::capture(&mut **transaction),
+                    false,
+                )
+                .await?;
+            let poison = {
+                let (mut state, poison) = match self.state.lock() {
+                    Ok(state) => (state, false),
+                    Err(cause) => (cause.into_inner(), true),
+                };
+                state.native_origin = Some(origin);
+                poison
+            };
+            if poison {
+                return Err(BootstrapError::Migration);
+            }
+        }
         let stamp = self
             .query(
                 sqlx::query_scalar::<_, String>("SELECT pg_catalog.pg_current_xact_id()::text")
@@ -353,14 +425,34 @@ impl BootstrapSessionOwner {
             session,
             _permit: permit,
         };
+        let prior_close = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .close
+            .clone();
+        if prior_close.is_some() {
+            self.recover_broken(&mut loan).await?;
+            return Ok(BootstrapSessionCleanup {
+                original: Arc::clone(self),
+                refused: poison || self.state.is_poisoned(),
+            });
+        }
         if let Some(session) = loan.session.as_mut() {
             if !complete {
-                self.query(
-                    sqlx::query("ROLLBACK").execute(session.bootstrap_connection()),
-                    true,
-                )
-                .await
-                .map_err(|_| refusal())?;
+                let rollback = self
+                    .query(
+                        sqlx::query("ROLLBACK").execute(session.bootstrap_connection()),
+                        true,
+                    )
+                    .await;
+                if rollback.is_err() {
+                    self.recover_broken(&mut loan).await?;
+                    return Ok(BootstrapSessionCleanup {
+                        original: Arc::clone(self),
+                        refused: poison || self.state.is_poisoned(),
+                    });
+                }
                 if let Some(stamp) = stamp {
                     let status = self
                         .query(
@@ -371,8 +463,21 @@ impl BootstrapSessionOwner {
                             .fetch_one(session.bootstrap_connection()),
                             true,
                         )
-                        .await
-                        .map_err(|_| refusal())?;
+                        .await;
+                    let status = match status {
+                        Ok(status) => status,
+                        Err(_) => {
+                            self.recover_broken(&mut loan).await?;
+                            return Ok(BootstrapSessionCleanup {
+                                original: Arc::clone(self),
+                                refused: poison || self.state.is_poisoned(),
+                            });
+                        }
+                    };
+                    self.state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .native_status = Some(status.clone());
                     let committed = match status.as_deref() {
                         Some("committed") => true,
                         Some("aborted") => false,
@@ -397,11 +502,112 @@ impl BootstrapSessionOwner {
             state.cleanup_complete = true; // Actual ACK BEFORE return to original pool.
             poison || final_poison
         };
+        if let Some(diagnostic) = &self.diagnostic {
+            diagnostic.close_original().await.map_err(|cause| {
+                let _ = &cause.original;
+                refusal()
+            })?;
+        }
         drop(loan.session.take());
         Ok(BootstrapSessionCleanup {
             original: Arc::clone(self),
-            refused,
+            refused: refused || self.state.is_poisoned(),
         })
+    }
+    async fn recover_broken(
+        self: &Arc<Self>,
+        loan: &mut SessionLoan,
+    ) -> Result<(), BootstrapSessionRefusal> {
+        let refusal = || BootstrapSessionRefusal {
+            original: Arc::clone(self),
+        };
+        let (origin, xid, prior_close) = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.native_origin.clone(),
+                state.xid.clone(),
+                state.close.clone(),
+            )
+        };
+        let diagnostic = self.diagnostic.as_ref().ok_or_else(refusal)?;
+        let xid = xid.ok_or_else(refusal)?;
+        let close = match prior_close {
+            Some(close) => close,
+            None => {
+                let original = loan.session.take().ok_or_else(refusal)?;
+                let close = crate::bootstrap_original_close::OriginalClose::capture(original);
+                self.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .close = Some(Arc::clone(&close));
+                close
+            }
+        };
+        match close.finish().await {
+            Ok(receipt) if receipt.covers_pool(&self.pool) => {}
+            Err(cause) => {
+                let _ = &cause.original;
+                return Err(refusal());
+            }
+            _ => return Err(refusal()),
+        }
+        // The server may need actual frontend shutdown to abort an in-progress
+        // original transaction. Physical close itself is never an xid outcome.
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .outcome
+            .is_none()
+        {
+            let observed = diagnostic
+                .observe(&origin.ok_or_else(refusal)?, &xid)
+                .await
+                .map_err(|cause| {
+                    let _ = &cause.original;
+                    refusal()
+                })?;
+            if !Arc::ptr_eq(&observed.original_diagnostic, diagnostic)
+                || !Arc::ptr_eq(&observed.xid, &xid)
+            {
+                return Err(refusal());
+            }
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.outcome = Some(observed.committed); // Native same-instance original-xid fact, not driver ACK.
+        }
+        diagnostic.close_original().await.map_err(|cause| {
+            let _ = &cause.original;
+            refusal()
+        })?;
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cleanup_complete = true;
+        Ok(())
+    }
+    /// Returned native status associated with the same immutable original xid.
+    /// An observed NULL remains distinct from no status query and grants no ACK.
+    pub fn original_native_status(&self) -> Option<(Arc<String>, Option<String>)> {
+        let state = self.state.lock().ok()?;
+        Some((state.xid.clone()?, state.native_status.clone()?))
+    }
+    pub fn diagnostic_pool(&self) -> Option<&Arc<PostgresPool>> {
+        self.diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.original_pool())
+    }
+    /// Observed function access only; never a grant or SQL cleanup capability.
+    pub fn original_control_privilege(&self) -> Option<bool> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.control_privilege)
     }
 }
 pub(crate) struct SessionLoan {

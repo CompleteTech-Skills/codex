@@ -210,9 +210,11 @@ impl Resources {
     pub(crate) fn retain_bootstrap_session(
         &self,
         pool: Arc<codex_postgres_runtime::PostgresPool>,
+        diagnostic_pool: Arc<codex_postgres_runtime::PostgresPool>,
     ) -> Result<Arc<codex_postgres_runtime::BootstrapSessionOwner>, Refusal> {
         let slot = self.bootstrap_sessions.reserve()?;
-        let owner = codex_postgres_runtime::BootstrapSessionOwner::new(pool);
+        let owner =
+            codex_postgres_runtime::BootstrapSessionOwner::new_recoverable(pool, diagnostic_pool);
         slot.capture_original_arc(Arc::clone(&owner))?;
         Ok(owner)
     }
@@ -449,6 +451,8 @@ impl Resources {
                         || bootstrap_poison);
                     let mut blocked_bootstrap_pools =
                         std::array::from_fn::<_, CAPACITY, _>(|_| None);
+                    let mut blocked_diagnostic_pools =
+                        std::array::from_fn::<_, CAPACITY, _>(|_| None);
                     for (index, owner) in bootstrap_sessions.into_iter().enumerate() {
                         if let Some(owner) = owner {
                             match owner.reconcile_original().await {
@@ -458,11 +462,15 @@ impl Resources {
                                 Ok(_) => {
                                     blocked_bootstrap_pools[index] =
                                         Some(Arc::clone(owner.original_pool()));
+                                    blocked_diagnostic_pools[index] =
+                                        owner.diagnostic_pool().map(Arc::clone);
                                     complete = false;
                                 }
                                 Err(cause) => {
                                     blocked_bootstrap_pools[index] =
                                         Some(Arc::clone(owner.original_pool()));
+                                    blocked_diagnostic_pools[index] =
+                                        owner.diagnostic_pool().map(Arc::clone);
                                     original
                                         .bootstrap_cleanup_causes
                                         .lock()
@@ -503,6 +511,7 @@ impl Resources {
                     for pool in pools.into_iter().flatten() {
                         if blocked_bootstrap_pools
                             .iter()
+                            .chain(blocked_diagnostic_pools.iter())
                             .flatten()
                             .any(|blocked| Arc::ptr_eq(blocked, &pool))
                         {
