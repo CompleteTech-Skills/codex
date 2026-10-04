@@ -1098,3 +1098,16 @@ mod return_tests;
 mod return_fence;
 use return_fence::FencePoint;
 pub use return_fence::ReturnOperationFence;
+
+#[cfg(test)]
+#[path = "fresh_reverse_observation.rs"]
+mod fresh_reverse_observation;
+#[cfg(test)]
+#[path = "fresh_reverse_tests.rs"]
+mod fresh_reverse_tests;
+#[cfg(test)]
+#[path = "latest_remote_board.rs"]
+mod latest_remote_board;
+#[cfg(test)]
+#[path = "latest_remote_writes.rs"]
+mod latest_remote_writes;

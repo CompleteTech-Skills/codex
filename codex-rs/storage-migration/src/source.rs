@@ -14,6 +14,8 @@ pub struct SqliteSource {
     /// The home these files will be installed into, when this source is a staged copy whose
     /// recorded paths already name that final location.
     relocated_from: Option<PathBuf>,
+    #[cfg(test)]
+    reverse_reads: Option<std::sync::Arc<crate::engine::fresh_reverse_observation::ReadOwner>>,
 }
 
 /// Which database file a read targets.
@@ -32,6 +34,8 @@ impl SqliteSource {
         Self {
             config,
             relocated_from: None,
+            #[cfg(test)]
+            reverse_reads: None,
         }
     }
 
@@ -42,6 +46,14 @@ impl SqliteSource {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_reverse_reads(
+        mut self,
+        original: std::sync::Arc<crate::engine::fresh_reverse_observation::ReadOwner>,
+    ) -> Self {
+        self.reverse_reads = Some(original);
+        self
+    }
     /// The file a recorded path refers to on this source.
     pub(crate) fn resolve(&self, recorded: &str) -> PathBuf {
         let path = PathBuf::from(recorded);
@@ -80,6 +92,18 @@ impl SqliteSource {
         let path = self.database_path(database);
         if !path.exists() {
             return Ok(None);
+        }
+        #[cfg(test)]
+        if let Some(original) = self.reverse_reads.as_ref() {
+            return Ok(Some(
+                self.config
+                    .open_read_only_pool_retained(
+                        &path,
+                        Some(Duration::from_secs(30)),
+                        &mut |pool| original.capture(pool),
+                    )
+                    .await?,
+            ));
         }
         Ok(Some(
             self.config

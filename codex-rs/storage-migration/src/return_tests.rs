@@ -35,7 +35,7 @@ const CONTROL_FILES: [&str; 4] = [
 ];
 
 /// Put the home and the store in the state a finished forward cutover leaves them in.
-async fn remote_authority(pool: &Arc<PostgresPool>, source: &SqliteSource, home: &Path) {
+pub(super) async fn remote_authority(pool: &Arc<PostgresPool>, source: &SqliteSource, home: &Path) {
     reset_target(pool).await;
     for file in CONTROL_FILES {
         let _ = std::fs::remove_file(home.join(file));

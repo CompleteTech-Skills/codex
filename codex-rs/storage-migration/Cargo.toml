@@ -27,6 +27,11 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v7"] }
 
 [dev-dependencies]
+codex-agent-message-board-extension = { workspace = true }
+codex-postgres-goal-store = { workspace = true }
+codex-postgres-import-store = { workspace = true }
+codex-postgres-memory-store = { workspace = true }
+codex-postgres-message-board = { workspace = true }
 codex-postgres-log-store = { workspace = true }
 codex-postgres-queue-store = { workspace = true }
 codex-postgres-rollout-store = { workspace = true }
