@@ -50,6 +50,7 @@ impl ReturnCutover {
     /// Record the intent and the swap plan. Nothing else changes yet.
     pub fn prepare(&self, run_id: Uuid) -> Result<CutoverIntent, CutoverError> {
         self.migrator.check_return_fence(run_id)?;
+        install::validate_staged_sqlite_sidecars(&self.staged_home).map_err(io_error)?;
         let intent = begin_cutover(&self.home, run_id, ActiveBackend::Local).map_err(authority)?;
         if let Err(error) = install::plan_install(&self.home, &self.staged_home, run_id) {
             self.migrator.check_return_fence(run_id)?;
