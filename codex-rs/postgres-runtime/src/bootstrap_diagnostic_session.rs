@@ -91,6 +91,19 @@ impl DiagnosticSession {
                     .map(|status| status.as_ref().clone())
             })
     }
+    #[cfg(test)]
+    pub(crate) fn control_origin_difference(&self, xid: &Arc<String>) -> Option<(bool, bool)> {
+        let state = self.state.lock().ok()?;
+        let (requested, original_xid) = state.original_request.as_ref()?;
+        let observed = state.origin.as_ref()?;
+        if !Arc::ptr_eq(original_xid, xid) {
+            return None;
+        }
+        Some((
+            requested.system_identifier != observed.system_identifier,
+            requested.database_oid != observed.database_oid,
+        ))
+    }
     pub(crate) fn has_original_observation(&self, xid: &Arc<String>) -> bool {
         self.state.lock().ok().is_some_and(|state| {
             state

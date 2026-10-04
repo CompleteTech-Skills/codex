@@ -186,22 +186,42 @@ async fn selected_bootstrap_with_diagnostic(
     };
     // Independently read the same protected genuine Migrator profile BEFORE
     // either factory future is polled. Original relay port never flows here.
+    // ROOT must independently admit this OTHER protected diagnostic fixture.
+    // These settings select a real endpoint/database; the native query, not
+    // this locator, must witness the system/database mismatch below.
+    let foreign_state = if fault == 8 {
+        Some(std::path::PathBuf::from(std::env::var(
+            "CODEX_TEST_BOOTSTRAP_FOREIGN_DIAGNOSTIC_STATE",
+        )?))
+    } else {
+        None
+    };
+    let diagnostic_state = foreign_state.as_deref().unwrap_or(state);
+    let diagnostic_receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(diagnostic_state.join("receipt.json"))?)?;
+    let diagnostic_database = if fault == 9 {
+        std::env::var("CODEX_TEST_BOOTSTRAP_FOREIGN_DIAGNOSTIC_DATABASE")?
+    } else {
+        "codex".to_owned()
+    };
     let diagnostic_settings = recoverable
         .then(|| -> Result<ConnectionSettings> {
             Ok(ConnectionSettings {
                 host: "localhost".into(),
                 port: u16::try_from(
-                    receipt["port"]
+                    diagnostic_receipt["port"]
                         .as_u64()
                         .ok_or("missing diagnostic fixture port")?,
                 )?,
-                database: "codex".into(),
+                database: diagnostic_database.clone(),
                 username: format!("codex_{role}"),
-                password: std::fs::read_to_string(state.join(format!("secrets/{role}.password")))?
-                    .trim()
-                    .to_owned()
-                    .into(),
-                ca_certificate: state.join("secrets/ca.crt"),
+                password: std::fs::read_to_string(
+                    diagnostic_state.join(format!("secrets/{role}.password")),
+                )?
+                .trim()
+                .to_owned()
+                .into(),
+                ca_certificate: diagnostic_state.join("secrets/ca.crt"),
                 limits: PoolLimits {
                     connect_timeout: Duration::from_secs(5),
                     acquire_timeout: Duration::from_secs(5),
@@ -420,7 +440,7 @@ async fn selected_bootstrap_with_diagnostic(
                     let probe = Arc::new(StampProbe::default());
                     *match fault {
                         3 => &owner.commit_probe,
-                        4 => &owner.outcome_probe,
+                        4 | 8 | 9 => &owner.outcome_probe,
                         _ => &owner.stamp_probe,
                     }
                     .lock()
@@ -507,7 +527,7 @@ async fn selected_bootstrap_with_diagnostic(
                             });
                         }
                     }
-                    if fault != 6 { task.abort(); }
+                    if fault != 6 && fault != 8 && fault != 9 { task.abort(); }
                     probe.release.notify_one();
                     let joined = task.await.map_err(Arc::new);
                     *owner.control_terminal.lock()
@@ -532,6 +552,8 @@ async fn selected_bootstrap_with_diagnostic(
                         Ok(result) => {
                             if fault == 6 {
                                 witnessed &= result == Err(BootstrapError::Unavailable);
+                            } else if fault == 8 || fault == 9 {
+                                witnessed &= result.is_ok();
                             } else { witnessed = false; }
                             result
                         }
@@ -567,8 +589,31 @@ async fn selected_bootstrap_with_diagnostic(
         }
     }
     recovered_blocker.connection.take();
+    let foreign_origin_witness = if fault == 8 || fault == 9 {
+        let original_facts = {
+            let state = owner.state.lock().ok();
+            state.and_then(|state| state.native_origin.clone().zip(state.xid.clone()))
+        };
+        match (owner.diagnostic.as_ref(), original_facts) {
+            (Some(diagnostic), Some((origin, xid))) => {
+                let refused = diagnostic.observe(&origin, &xid).await.is_err();
+                let difference = diagnostic.control_origin_difference(&xid);
+                refused
+                    && diagnostic.original_native_status().is_none()
+                    && !diagnostic.has_original_observation(&xid)
+                    && if fault == 8 {
+                        difference.is_some_and(|(system, _)| system)
+                    } else {
+                        difference == Some((false, true))
+                    }
+            }
+            _ => false,
+        }
+    } else {
+        true
+    };
     // Never infer task/session termination from a bare bootstrap error.
-    let reconciled = if recoverable && fault != 6 {
+    let reconciled = if recoverable && fault != 6 && fault != 8 && fault != 9 {
         let mut result = owner.control_close_original_and_observe().await;
         for _ in 0..6 {
             let in_progress = owner.diagnostic.as_ref().is_some_and(|diagnostic| {
@@ -654,6 +699,8 @@ async fn selected_bootstrap_with_diagnostic(
         state.xid.clone().zip(state.outcome)
     };
     let native_recovery_fact = !recoverable
+        || fault == 8
+        || fault == 9
         || owner.diagnostic.as_ref().is_some_and(|diagnostic| {
             let original_xid = owner.state.lock().ok().and_then(|state| state.xid.clone());
             diagnostic
@@ -791,6 +838,7 @@ async fn selected_bootstrap_with_diagnostic(
         || !diagnostic_closed
         || !diagnostic_ok
         || !lost_reply_witness
+        || !foreign_origin_witness
     {
         return Err(Box::new(Failure {
             original: owner,
@@ -807,7 +855,7 @@ async fn selected_bootstrap_with_diagnostic(
         || !native_unknown_witnessed
         || !native_recovery_fact
         || refused != (fault == 2)
-        || !matches!(outcome, Some((_, committed)) if committed == (fault == 0 || fault == 4 || recoverable && fault == 6))
+        || !matches!(outcome, Some((_, committed)) if committed == (fault == 0 || fault == 4 || fault == 8 || fault == 9 || recoverable && fault == 6))
     {
         return Err(Box::new(Failure {
             original: owner,
@@ -1061,6 +1109,59 @@ async fn named_bootstrap_rejects_default_diagnostic_namespace() -> Result<()> {
         )?),
         true,
         7,
+        true,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires separate ROOT-admitted actual foreign PostgreSQL instance and migrator control-function privilege"]
+async fn default_bootstrap_rejects_foreign_instance_diagnostic() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_FOREIGN_INSTANCE_STATE",
+        )?),
+        false,
+        8,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires separate ROOT-admitted actual foreign PostgreSQL instance and named migrator privilege"]
+async fn named_bootstrap_rejects_foreign_instance_diagnostic() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_FOREIGN_INSTANCE_STATE",
+        )?),
+        true,
+        8,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires ROOT-admitted second actual database on same instance with genuine migrator control-function privilege"]
+async fn default_bootstrap_rejects_foreign_database_diagnostic() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_DEFAULT_FOREIGN_DATABASE_STATE",
+        )?),
+        false,
+        9,
+        true,
+    )
+    .await
+}
+#[tokio::test]
+#[ignore = "requires ROOT-admitted second actual database on same instance with genuine named migrator privilege"]
+async fn named_bootstrap_rejects_foreign_database_diagnostic() -> Result<()> {
+    selected_bootstrap_with_diagnostic(
+        Path::new(&std::env::var(
+            "CODEX_TEST_POSTGRES_BOOTSTRAP_NAMED_FOREIGN_DATABASE_STATE",
+        )?),
+        true,
+        9,
         true,
     )
     .await
