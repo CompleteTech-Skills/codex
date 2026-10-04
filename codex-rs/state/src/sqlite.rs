@@ -483,6 +483,34 @@ impl SqliteConfig {
         path: &Path,
         busy_timeout: Option<Duration>,
     ) -> Result<SqlitePool, Error> {
+        let options = Self::read_only_options(path, busy_timeout);
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+    }
+
+    /// Capture the exact read-only SDK pool before its first physical acquisition.
+    /// The callback must retain the supplied original even when it refuses. Its
+    /// success grants no Home or transaction authority. The caller must retain
+    /// this creation task and close this same pool after its actual terminal result.
+    pub async fn open_read_only_pool_retained(
+        &self,
+        path: &Path,
+        busy_timeout: Option<Duration>,
+        capture: &mut (dyn FnMut(SqlitePool) -> Result<(), Error> + Send),
+    ) -> Result<SqlitePool, Error> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_lazy_with(Self::read_only_options(path, busy_timeout));
+        capture(pool.clone())?;
+        let original_connection = pool.acquire().await?;
+        drop(original_connection);
+        Ok(pool)
+    }
+
+    fn read_only_options(path: &Path, busy_timeout: Option<Duration>) -> SqliteConnectOptions {
         let mut options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(false)
@@ -491,10 +519,7 @@ impl SqliteConfig {
         if let Some(busy_timeout) = busy_timeout {
             options = options.busy_timeout(busy_timeout);
         }
-        SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await
+        options
     }
 }
 
