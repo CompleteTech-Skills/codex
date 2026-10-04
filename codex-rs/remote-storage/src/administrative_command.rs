@@ -6,6 +6,10 @@
 //! with real callers before declaration. Returned rows/status never mint authority.
 
 use super::OriginalAdministrativeRuntimeSession;
+use super::RemoteAdministrativeObserver;
+use crate::administration_registry::AdministrativeRegistryRefusal;
+use crate::administration_startup::OriginalAdministrativeStartup;
+use crate::runtime_origin::RuntimeNativeOrigin;
 use sqlx::Row;
 use sqlx::postgres::PgRow;
 use std::sync::Arc;
@@ -27,13 +31,16 @@ pub(super) enum CommandCause {
     Runtime(tokio::runtime::TryCurrentError),
     MissingSession,
     UnknownStatus,
+    Wait(tokio::sync::AcquireError),
 }
 
 struct State {
     task: Option<JoinHandle<()>>,
     dispatched: bool,
+    sealed: bool,
     terminal: bool,
     joined_failure: Option<Arc<tokio::task::JoinError>>,
+    native_baseline: Option<Result<sqlx::postgres::PgQueryResult, Arc<sqlx::Error>>>,
     raw_stamp: Option<PgRow>,
     xid: Option<String>,
     raw_rows: Option<Vec<PgRow>>,
@@ -43,12 +50,19 @@ struct State {
     causes: [Option<Arc<CommandCause>>; CAUSES],
     refused: bool,
     hold: Option<Arc<OriginalAdministrativeCommand>>,
+    observer: Arc<RemoteAdministrativeObserver>,
+    origin: Arc<RuntimeNativeOrigin>,
+    startup: Arc<OriginalAdministrativeStartup>,
+    close_task: Option<JoinHandle<Result<(), AdministrativeRegistryRefusal>>>,
+    close_returned: Option<Result<(), Arc<AdministrativeRegistryRefusal>>>,
+    close_joined_failure: Option<Arc<tokio::task::JoinError>>,
 }
 
 pub(super) struct OriginalAdministrativeCommand {
     original: Arc<AsyncMutex<Option<OriginalAdministrativeRuntimeSession>>>,
     state: Mutex<State>,
     join: Arc<Semaphore>,
+    close_join: Arc<Semaphore>,
 }
 
 pub(super) struct AdministrativeCommandRefusal {
@@ -69,6 +83,9 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
                 CommandCause::Runtime(raw) => {
                     let _ = raw;
                 }
+                CommandCause::Wait(raw) => {
+                    let _ = raw;
+                }
                 CommandCause::MissingSession | CommandCause::UnknownStatus => {}
             }
         }
@@ -76,10 +93,16 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
             &state.joined_failure,
             &state.raw_rows,
             &state.raw_stamp,
+            &state.native_baseline,
             &state.xid,
             &state.observed_status,
             state.commit_attempted,
             state.rollback_attempted,
+            &state.close_returned,
+            &state.close_joined_failure,
+            &state.observer,
+            &state.origin,
+            &state.startup,
         );
         formatter.write_str("AdministrativeCommandRefused([original retained])")
     }
@@ -103,15 +126,45 @@ impl Drop for TaskLoan {
     }
 }
 
+pub(super) struct AdministrativeCommandArchive {
+    original: Arc<OriginalAdministrativeCommand>,
+}
+impl std::fmt::Debug for AdministrativeCommandArchive {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _retained = &self.original;
+        formatter.write_str("AdministrativeCommandArchive([original causes retained])")
+    }
+}
+struct CloseTaskLoan {
+    original: Arc<OriginalAdministrativeCommand>,
+    task: Option<JoinHandle<Result<(), AdministrativeRegistryRefusal>>>,
+}
+impl Drop for CloseTaskLoan {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            self.original
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .close_task = Some(task);
+        }
+    }
+}
+
 impl OriginalAdministrativeCommand {
     pub(super) fn prepare(original: OriginalAdministrativeRuntimeSession) -> Arc<Self> {
+        let observer = Arc::clone(&original.original);
+        let origin = Arc::clone(&original.origin);
+        let startup = Arc::clone(original.borrowed.original_startup());
         let original = Arc::new(Self {
             original: Arc::new(AsyncMutex::new(Some(original))),
             state: Mutex::new(State {
                 task: None,
                 dispatched: false,
+                sealed: false,
                 terminal: false,
                 joined_failure: None,
+                native_baseline: None,
                 raw_stamp: None,
                 xid: None,
                 raw_rows: None,
@@ -121,8 +174,15 @@ impl OriginalAdministrativeCommand {
                 causes: std::array::from_fn(|_| None),
                 refused: false,
                 hold: None,
+                observer,
+                origin,
+                startup,
+                close_task: None,
+                close_returned: None,
+                close_joined_failure: None,
             }),
             join: Arc::new(Semaphore::new(1)),
+            close_join: Arc::new(Semaphore::new(1)),
         });
         // Also own the prepared native session and raw admission causes when
         // runtime entry/first dispatch refuses. Only real cleanup/archive may
@@ -150,7 +210,7 @@ impl OriginalAdministrativeCommand {
             original: Arc::clone(self),
         };
         let mut state = self.state.lock().map_err(|_| refused())?;
-        if state.dispatched || state.refused {
+        if state.dispatched || state.refused || state.sealed {
             return Err(refused());
         }
         let runtime = match tokio::runtime::Handle::try_current() {
@@ -187,6 +247,26 @@ impl OriginalAdministrativeCommand {
             self.cause(CommandCause::MissingSession);
             return;
         };
+        // PostgreSQL 17 RequireTransactionBlock rejects SAVEPOINT outside an
+        // explicit transaction with 25P01. SQLx transaction depth cannot detect
+        // raw BEGIN. Keep this native result before classification; unexpected
+        // success means an existing transaction and MUST NOT authorize BEGIN or
+        // rollback of an unknown owner's work. This probe is a native command,
+        // not an exclusive-access/privilege proof. Same owned session guard is
+        // retained continuously through the probe and subsequent transaction.
+        let baseline = sqlx::query("SAVEPOINT codex_administrative_baseline")
+            .execute(&mut **connection)
+            .await;
+        let idle = matches!(&baseline, Err(sqlx::Error::Database(raw))
+            if raw.code().as_deref() == Some("25P01"));
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.native_baseline = Some(baseline.map_err(Arc::new));
+            state.refused |= self.state.is_poisoned() || !idle;
+            if state.refused {
+                return;
+            }
+        }
         if let Err(raw) = sqlx::query("BEGIN").execute(&mut **connection).await {
             self.cause(CommandCause::Driver(raw));
             return;
@@ -233,7 +313,8 @@ impl OriginalAdministrativeCommand {
                 Err(raw) => self.cause(CommandCause::Driver(raw)),
             }
         }
-        // This immutable preflight is READ-ONLY. Always explicitly rollback the
+        // This preflight reads application data but BEGIN and xid allocation
+        // affect native transaction state. Always explicitly rollback the
         // SAME native transaction; no commit proof/retirement effect is claimed.
         {
             self.state
@@ -282,7 +363,10 @@ impl OriginalAdministrativeCommand {
         let _permit = Arc::clone(&self.join)
             .acquire_owned()
             .await
-            .map_err(|_| refused())?;
+            .map_err(|raw| {
+                self.cause(CommandCause::Wait(raw));
+                refused()
+            })?;
         let task = {
             self.state
                 .lock()
@@ -319,7 +403,112 @@ impl OriginalAdministrativeCommand {
         }
         Ok(())
     }
+    /// Reconcile the SAME query task, then register the actual close before
+    /// consuming the scoped frame. Empty original Option never proves closure.
+    pub(super) async fn close_into_archive(
+        self: &Arc<Self>,
+    ) -> Result<AdministrativeCommandArchive, AdministrativeCommandRefusal> {
+        let refused = || AdministrativeCommandRefusal {
+            original: Arc::clone(self),
+        };
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.sealed = true;
+            state.refused |= self.state.is_poisoned();
+        }
+        let _query_result = self.finish_original().await;
+        let _close_permit = Arc::clone(&self.close_join)
+            .acquire_owned()
+            .await
+            .map_err(|raw| {
+                self.cause(CommandCause::Wait(raw));
+                refused()
+            })?;
+        let needs_close = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let terminal = (!state.dispatched && state.task.is_none())
+                || (state.terminal && state.task.is_none());
+            if !terminal {
+                return Err(refused());
+            }
+            state.close_task.is_none()
+                && state.close_returned.is_none()
+                && state.close_joined_failure.is_none()
+        };
+        if needs_close {
+            let mut slot = Arc::clone(&self.original).lock_owned().await;
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let runtime = match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => runtime,
+                Err(raw) => {
+                    if let Some(cause) = state.causes.iter_mut().find(|cause| cause.is_none()) {
+                        *cause = Some(Arc::new(CommandCause::Runtime(raw)));
+                    }
+                    state.refused = true;
+                    return Err(refused());
+                }
+            };
+            let frame = slot.take().ok_or_else(refused)?;
+            let original = Arc::clone(self);
+            // observer/origin/startup were stored before frame was first polled.
+            // The original frame/registry owns native resources even if this
+            // close body panics; raw task cause still requires reconciliation.
+            state.close_task = Some(runtime.spawn(async move {
+                {
+                    let _entry = original
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+                frame.close_original().await
+            }));
+        }
+        let task = {
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .close_task
+                .take()
+        };
+        if let Some(task) = task {
+            let mut loan = CloseTaskLoan {
+                original: Arc::clone(self),
+                task: Some(task),
+            };
+            let returned = loan.task.as_mut().ok_or_else(refused)?.await;
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            match returned {
+                Ok(result) => state.close_returned = Some(result.map_err(Arc::new)),
+                Err(raw) => state.close_joined_failure = Some(Arc::new(raw)),
+            }
+            loan.task = None; // Raw original close result cached before clear.
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let query_terminal =
+            (!state.dispatched && state.task.is_none()) || (state.terminal && state.task.is_none());
+        if !query_terminal
+            || !state.sealed
+            || state.close_task.is_some()
+            || state.close_returned.is_none()
+            || state.close_joined_failure.is_some()
+            || !state.startup.known_physical_closed()
+        {
+            return Err(refused());
+        }
+        // This is a plain owning resource/failure handoff, NOT a clean business
+        // result, remote-xid proof, retirement/exclusive permit or role admission.
+        // Caller must already own a reserved history slot before SQL dispatch.
+        let archive = AdministrativeCommandArchive {
+            original: Arc::clone(self),
+        };
+        state.hold = None;
+        Ok(archive)
+    }
     // Selfhold is intentionally NOT released by query completion. Native session
     // and SDK cleanup and finite failure-archive handoff are separate mandatory
     // consumer steps; absence/JoinError/query refusal never substitutes for ACK.
 }
+
+#[cfg(test)]
+#[path = "administrative_command_tests.rs"]
+mod tests;
