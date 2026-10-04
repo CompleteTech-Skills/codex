@@ -67,7 +67,7 @@ pub struct OperationRecord {
 /// The operation records of one home.
 pub(crate) struct Journal {
     directory: PathBuf,
-    observer: Option<Observer>,
+    observer: std::sync::Mutex<Option<Observer>>,
     #[cfg(unix)]
     namespace: std::sync::Mutex<Option<std::sync::Arc<namespace::Namespace>>>,
     #[cfg(unix)]
@@ -105,7 +105,7 @@ impl Journal {
     pub(crate) fn new(codex_home: &std::path::Path) -> Self {
         Self {
             directory: codex_home.join(DIRECTORY),
-            observer: None,
+            observer: std::sync::Mutex::new(None),
             #[cfg(unix)]
             namespace: std::sync::Mutex::new(None),
             #[cfg(unix)]
@@ -117,13 +117,25 @@ impl Journal {
         }
     }
 
-    pub(crate) fn observed_by(mut self, observer: Observer) -> Self {
-        self.observer = Some(observer);
+    #[cfg(test)]
+    pub(crate) fn observed_by(self, observer: Observer) -> Self {
+        self.set_observer(observer);
         self
+    }
+    pub(crate) fn set_observer(&self, observer: Observer) {
+        *self
+            .observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
     }
 
     fn notify(&self, record: &OperationRecord) {
-        if let Some(observer) = &self.observer {
+        let observer = self
+            .observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
             observer(record);
         }
     }

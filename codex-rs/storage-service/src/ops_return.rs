@@ -214,7 +214,7 @@ impl StorageService {
     }
 
     /// Export and verify a prepared return. Does nothing if this process already drives it.
-    pub async fn run_return(
+    pub(crate) async fn run_return_original(
         &self,
         mut record: OperationRecord,
     ) -> Result<OperationRecord, StorageError> {
@@ -276,6 +276,26 @@ impl StorageService {
             Ok(storage) => storage,
             Err(error) => return Err(self.fail(record, error.0)),
         };
+        let migration_pool = match self.migration_pool_or_close(&storage).await {
+            Ok(pool) => pool,
+            Err(original) => return Err(self.fail(record, original.0)),
+        };
+        // No target/pool is created until the owning startup has actually joined.
+        let resources = match self.operation_resources.as_ref() {
+            Some(resources) => resources,
+            None => return Err(self.fail(record, BlockerCode::StagingFailed)),
+        };
+        if let Err(original) = resources.retain_staged_config(config.clone()) {
+            resources.record_admission_failure(original);
+            return Err(self.fail(record, BlockerCode::StagingFailed));
+        }
+        let target_slot = match resources.reserve_target() {
+            Ok(slot) => slot,
+            Err(original) => {
+                resources.record_admission_failure(original);
+                return Err(self.fail(record, BlockerCode::StagingFailed));
+            }
+        };
         let target = match SqliteTarget::create(
             config.clone(),
             self.inputs.codex_home.clone(),
@@ -283,14 +303,20 @@ impl StorageService {
         )
         .await
         {
-            Ok(target) => target,
-            Err(_) => {
-                storage.close().await;
+            Ok(target) => match target_slot.install(target) {
+                Ok(target) => target,
+                Err(owning) => {
+                    let _ = (&owning.original_value, owning.original_slots());
+                    return Err(self.fail(record, BlockerCode::StagingFailed));
+                }
+            },
+            Err(original) => {
+                target_slot.record_returned_failure(std::sync::Arc::new(original));
                 return Err(self.fail(record, BlockerCode::StagingFailed));
             }
         };
         let exporter = Self::guard_return_migrator(
-            Migrator::new(self.staged_source(config), storage.pool().clone()),
+            Migrator::new(self.staged_source(config), migration_pool),
             _owner,
             storage.namespace(),
         );
@@ -298,13 +324,11 @@ impl StorageService {
             Ok(summary) => summary,
             Err(error) => {
                 target.close().await;
-                storage.close().await;
                 return Err(self.fail(record, error.into()));
             }
         };
         if summary.run_id != run_id {
             target.close().await;
-            storage.close().await;
             return Err(self.fail(record, BlockerCode::OperationConflict));
         }
         record.run_id = Some(summary.run_id);
@@ -315,12 +339,10 @@ impl StorageService {
             .collect();
         if let Err(error) = self.save(record, OperationState::Verifying) {
             target.close().await;
-            storage.close().await;
             return Err(error);
         }
         let verified = exporter.verify(summary.run_id).await;
         target.close().await;
-        storage.close().await;
         if let Err(error) = verified {
             return Err(self.fail(record, error.into()));
         }
@@ -365,7 +387,10 @@ impl StorageService {
         let config = self.staged_config(&staged_home)?;
         let storage = self.connect().await?;
         let migrator = Self::guard_return_migrator(
-            Migrator::new(self.staged_source(config), storage.pool().clone()),
+            Migrator::new(
+                self.staged_source(config),
+                self.migration_pool_or_close(&storage).await?,
+            ),
             &_owner,
             storage.namespace(),
         );
@@ -382,20 +407,17 @@ impl StorageService {
                     && i64::try_from(local.identity.generation).ok() == Some(remote.generation)
             });
             if !completed {
-                storage.close().await;
                 return Err(StorageError(BlockerCode::OperationConflict));
             }
             // A leftover owned plan after authority publication can now be discarded.
             let returning =
                 ReturnCutover::new(self.inputs.codex_home.clone(), staged_home, migrator);
             let recovered = returning.recover().await;
-            storage.close().await;
             recovered.map_err(|error| StorageError(error.into()))?;
             self.save(&mut record, OperationState::Active)?;
             return Ok(record);
         }
         if let Err(error) = self.save(&mut record, OperationState::Committing) {
-            storage.close().await;
             return Err(error);
         }
         let returning = ReturnCutover::new(self.inputs.codex_home.clone(), staged_home, migrator);
@@ -403,7 +425,6 @@ impl StorageService {
         let result = match returning.recover().await {
             Ok(RecoveryOutcome::RolledForward { .. }) => Ok(()),
             Ok(RecoveryOutcome::RolledBack) => {
-                storage.close().await;
                 record.blocker = None;
                 self.save(&mut record, OperationState::Cancelled)?;
                 return Ok(record);
@@ -411,7 +432,6 @@ impl StorageService {
             Ok(RecoveryOutcome::Idle) => returning.execute(run_id).await.map(|_| ()),
             Err(error) => Err(error),
         };
-        storage.close().await;
         match result {
             Ok(()) => {
                 self.save(&mut record, OperationState::Active)?;
@@ -526,13 +546,15 @@ impl StorageService {
             self.inputs.codex_home.clone(),
             plan.staged_home,
             Self::guard_return_migrator(
-                Migrator::new(self.staged_source(config), storage.pool().clone()),
+                Migrator::new(
+                    self.staged_source(config),
+                    self.migration_pool_or_close(&storage).await?,
+                ),
                 &_owner,
                 storage.namespace(),
             ),
         );
         let outcome = returning.recover().await;
-        storage.close().await;
         let outcome = outcome.map_err(|error| StorageError(error.into()))?;
         let mut touched = Vec::new();
         for mut record in [owner] {
@@ -593,7 +615,10 @@ impl StorageService {
         let config = self.staged_config(&staged_home)?;
         let storage = self.connect().await?;
         let migrator = Self::guard_return_migrator(
-            Migrator::new(self.staged_source(config.clone()), storage.pool().clone()),
+            Migrator::new(
+                self.staged_source(config.clone()),
+                self.migration_pool_or_close(&storage).await?,
+            ),
             &_owner,
             storage.namespace(),
         );
@@ -601,7 +626,10 @@ impl StorageService {
             self.inputs.codex_home.clone(),
             staged_home,
             Self::guard_return_migrator(
-                Migrator::new(self.staged_source(config), storage.pool().clone()),
+                Migrator::new(
+                    self.staged_source(config),
+                    self.migration_pool_or_close(&storage).await?,
+                ),
                 &_owner,
                 storage.namespace(),
             ),
@@ -633,10 +661,28 @@ impl StorageService {
             Ok(())
         }
         .await;
-        storage.close().await;
         result?;
         record.blocker = None;
         self.save(&mut record, OperationState::Cancelled)?;
         Ok(record)
+    }
+}
+
+impl StorageService {
+    pub async fn run_return(
+        &self,
+        record: OperationRecord,
+    ) -> Result<OperationRecord, StorageError> {
+        match self
+            .original_operation(
+                crate::service_operations::Kind::Return,
+                Some(record.operation_id),
+                Some(record),
+            )
+            .await?
+        {
+            crate::service_operations::Output::Record(record) => Ok(*record),
+            _ => Err(StorageError(BlockerCode::Internal)),
+        }
     }
 }

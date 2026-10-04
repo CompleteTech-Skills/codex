@@ -4,7 +4,8 @@ use crate::service::StorageServiceInputs;
 use codex_remote_storage::RemoteStorage;
 use codex_state::SqliteConfig;
 use codex_storage_migration::SqliteTarget;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 const CAPACITY: usize = 8;
 pub(crate) struct Resources {
     _original_inputs: Arc<StorageServiceInputs>,

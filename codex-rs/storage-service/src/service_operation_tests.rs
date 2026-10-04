@@ -1,6 +1,8 @@
 //! Actual service Activate(Active) dispatch, no SQL/network or replacement task.
 use super::*;
-use crate::{OperationState, PlanAction, StorageServiceInputs};
+use crate::OperationState;
+use crate::PlanAction;
+use crate::StorageServiceInputs;
 use codex_keyring_store::tests::MockKeyringStore;
 use codex_state::SqliteConfig;
 use codex_utils_absolute_path::test_support::PathExt;

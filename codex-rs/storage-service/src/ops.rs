@@ -62,23 +62,62 @@ fn internal<E>(_: E) -> StorageError {
 }
 
 impl StorageService {
-    pub(crate) async fn connect(&self) -> Result<RemoteStorage, StorageError> {
+    pub(crate) async fn connect(&self) -> Result<std::sync::Arc<RemoteStorage>, StorageError> {
         let profile = self
             .inputs
             .candidate
             .as_ref()
             .ok_or(StorageError(BlockerCode::NoCandidateProfile))?;
         let resolver = HostCredentialResolver::new(self.inputs.keyring.as_ref());
-        RemoteStorage::connect(profile, &resolver)
-            .await
-            .map_err(|error| StorageError(error.into()))
+        let reserved = self
+            .operation_resources
+            .as_ref()
+            .map(|resources| resources.reserve_runtime())
+            .transpose()
+            .map_err(|_| StorageError(BlockerCode::ConnectionFailed))?;
+        let pool_slot = self
+            .operation_resources
+            .as_ref()
+            .map(|resources| resources.reserve_runtime_pool())
+            .transpose()
+            .map_err(|_| StorageError(BlockerCode::ConnectionFailed))?;
+        let result = if let Some(pool_slot) = pool_slot.as_ref() {
+            let mut capture = |pool| {
+                pool_slot
+                    .capture_original_arc(pool)
+                    .map_err(|_| codex_postgres_runtime::PoolError::Unavailable)
+            };
+            RemoteStorage::connect_with_retained_sdk(profile, &resolver, &mut capture).await
+        } else {
+            RemoteStorage::connect(profile, &resolver).await
+        };
+        let storage = match result {
+            Ok(storage) => storage,
+            Err(original) => {
+                if let Some(slot) = reserved {
+                    slot.record_returned_failure(std::sync::Arc::new(original));
+                }
+                if let Some(slot) = pool_slot {
+                    slot.record_returned_failure(std::sync::Arc::new(original));
+                }
+                return Err(StorageError(original.into()));
+            }
+        };
+        match reserved {
+            Some(original) => original.install(storage).map_err(|owning| {
+                // Original is already retained in its pre-dispatch resource slot.
+                let _ = (&owning.original_value, owning.original_slots());
+                StorageError(BlockerCode::ConnectionFailed)
+            }),
+            None => Ok(std::sync::Arc::new(storage)),
+        }
     }
 
-    pub(crate) fn migrator(&self, storage: &RemoteStorage) -> Migrator {
-        Migrator::new(
+    pub(crate) async fn migrator(&self, storage: &RemoteStorage) -> Result<Migrator, StorageError> {
+        Ok(Migrator::new(
             SqliteSource::new(self.inputs.sqlite.clone()),
-            storage.pool().clone(),
-        )
+            self.migration_pool_or_close(storage).await?,
+        ))
     }
 
     pub(crate) fn save(
@@ -230,7 +269,7 @@ impl StorageService {
     }
 
     /// Copy and verify a prepared migration. Does nothing if this process already drives it.
-    pub async fn run_migration(
+    pub(crate) async fn run_migration_original(
         &self,
         mut record: OperationRecord,
     ) -> Result<OperationRecord, StorageError> {
@@ -251,12 +290,16 @@ impl StorageService {
             Ok(storage) => storage,
             Err(error) => return Err(self.fail(record, error.0)),
         };
-        self.save(record, OperationState::Copying)?;
-        let migrator = self.migrator(&storage);
+        if let Err(error) = self.save(record, OperationState::Copying) {
+            return Err(error);
+        }
+        let migrator = match self.migrator(&storage).await {
+            Ok(migrator) => migrator,
+            Err(original) => return Err(self.fail(record, original.0)),
+        };
         let summary = match migrator.import().await {
             Ok(summary) => summary,
             Err(error) => {
-                storage.close().await;
                 return Err(self.fail(record, error.into()));
             }
         };
@@ -268,16 +311,17 @@ impl StorageService {
             .collect();
         self.save(record, OperationState::Verifying)?;
         if let Err(error) = migrator.verify(summary.run_id).await {
-            storage.close().await;
             return Err(self.fail(record, error.into()));
         }
-        storage.close().await;
         self.save(record, OperationState::Ready)
     }
 
     /// Make a verified copy authoritative. Repeating the call after it succeeded returns the
     /// same record.
-    pub async fn activate(&self, operation_id: Uuid) -> Result<OperationRecord, StorageError> {
+    pub(crate) async fn activate_original(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<OperationRecord, StorageError> {
         let mut record = self.operation(operation_id)?;
         match record.state {
             OperationState::Active => return Ok(record),
@@ -300,15 +344,26 @@ impl StorageService {
         codex_storage_migration::write_source_manifest(&self.inputs.codex_home, run_id)
             .map_err(internal)?;
         let storage = self.connect().await?;
-        self.save(&mut record, OperationState::Committing)?;
-        let cutover = Cutover::new(self.inputs.codex_home.clone(), self.migrator(&storage));
+        if let Err(error) = self.save(&mut record, OperationState::Committing) {
+            return Err(error);
+        }
+        let migrator = match self.migrator(&storage).await {
+            Ok(migrator) => migrator,
+            Err(original) => {
+                // Preserve an earlier cutover/intent; admission refusal proves no
+                // new mutation, not that an old Committing operation rolled back.
+                record.blocker = Some(original.0);
+                self.save(&mut record, OperationState::Committing)?;
+                return Err(original);
+            }
+        };
+        let cutover = Cutover::new(self.inputs.codex_home.clone(), migrator);
         // An interrupted earlier attempt left an intent behind; settle it before starting.
         let result = match cutover.recover().await {
             Ok(RecoveryOutcome::RolledForward { .. }) => Ok(()),
             Ok(_) => cutover.execute(run_id).await.map(|_| ()),
             Err(error) => Err(error),
         };
-        storage.close().await;
         match result {
             Ok(()) => {
                 self.save(&mut record, OperationState::Active)?;
@@ -325,7 +380,7 @@ impl StorageService {
 
     /// Settle an interrupted cutover from the evidence on both sides and bring the records in
     /// line with the outcome.
-    pub async fn recover(&self) -> Result<RecoveryReport, StorageError> {
+    pub(crate) async fn recover_original(&self) -> Result<RecoveryReport, StorageError> {
         let records = self.journal.list_checked().map_err(internal)?;
         let returning = read_cutover(&self.inputs.codex_home)
             .map_err(internal)?
@@ -348,9 +403,11 @@ impl StorageService {
             return self.recover_return().await;
         }
         let storage = self.connect().await?;
-        let cutover = Cutover::new(self.inputs.codex_home.clone(), self.migrator(&storage));
+        let cutover = Cutover::new(
+            self.inputs.codex_home.clone(),
+            self.migrator(&storage).await?,
+        );
         let outcome = cutover.recover().await;
-        storage.close().await;
         let outcome = outcome.map_err(|error| StorageError(error.into()))?;
         let mut touched = Vec::new();
         for mut record in self
@@ -385,7 +442,10 @@ impl StorageService {
 
     /// Cancel an operation that has not been activated. The home stays local and the partial
     /// copy stays closed in the destination, where the same source can resume it.
-    pub async fn cancel(&self, operation_id: Uuid) -> Result<OperationRecord, StorageError> {
+    pub(crate) async fn cancel_original(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<OperationRecord, StorageError> {
         let mut record = self.operation(operation_id)?;
         match record.state {
             OperationState::Cancelled => return Ok(record),
@@ -401,11 +461,13 @@ impl StorageService {
             return self.cancel_return(record).await;
         }
         let storage = self.connect().await?;
-        let migrator = self.migrator(&storage);
-        let cutover = Cutover::new(self.inputs.codex_home.clone(), self.migrator(&storage));
+        let migrator = self.migrator(&storage).await?;
+        let cutover = Cutover::new(
+            self.inputs.codex_home.clone(),
+            self.migrator(&storage).await?,
+        );
         let aborted = cutover.abort().await;
         if let Err(error) = aborted {
-            storage.close().await;
             return Err(StorageError(error.into()));
         }
         let activation = migrator
@@ -421,7 +483,6 @@ impl StorageService {
                 .await
                 .map_err(|error| StorageError(error.into()))?;
         }
-        storage.close().await;
         record.blocker = None;
         self.save(&mut record, OperationState::Cancelled)?;
         Ok(record)
@@ -433,5 +494,59 @@ impl StorageService {
             codex_storage_authority::authority_state(&self.inputs.codex_home),
             Ok(AuthorityState::Remote(_))
         )
+    }
+}
+
+impl StorageService {
+    pub async fn run_migration(
+        &self,
+        record: OperationRecord,
+    ) -> Result<OperationRecord, StorageError> {
+        match self
+            .original_operation(
+                crate::service_operations::Kind::Forward,
+                Some(record.operation_id),
+                Some(record),
+            )
+            .await?
+        {
+            crate::service_operations::Output::Record(record) => Ok(*record),
+            _ => Err(StorageError(BlockerCode::Internal)),
+        }
+    }
+    pub async fn activate(&self, operation_id: Uuid) -> Result<OperationRecord, StorageError> {
+        match self
+            .original_operation(
+                crate::service_operations::Kind::Activate,
+                Some(operation_id),
+                None,
+            )
+            .await?
+        {
+            crate::service_operations::Output::Record(record) => Ok(*record),
+            _ => Err(StorageError(BlockerCode::Internal)),
+        }
+    }
+    pub async fn recover(&self) -> Result<RecoveryReport, StorageError> {
+        match self
+            .original_operation(crate::service_operations::Kind::Recover, None, None)
+            .await?
+        {
+            crate::service_operations::Output::Recovery(report) => Ok(report),
+            _ => Err(StorageError(BlockerCode::Internal)),
+        }
+    }
+    pub async fn cancel(&self, operation_id: Uuid) -> Result<OperationRecord, StorageError> {
+        match self
+            .original_operation(
+                crate::service_operations::Kind::Cancel,
+                Some(operation_id),
+                None,
+            )
+            .await?
+        {
+            crate::service_operations::Output::Record(record) => Ok(*record),
+            _ => Err(StorageError(BlockerCode::Internal)),
+        }
     }
 }

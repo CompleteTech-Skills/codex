@@ -6,10 +6,14 @@
 //! referenced, never carried: results contain codes and counts, not secrets or row contents.
 
 mod journal;
+mod migration_startups;
+pub use migration_startups::MigrationStartupRegistry;
+mod operation_resources;
 mod ops;
 mod ops_return;
 mod plan;
 mod service;
+mod service_operations;
 mod types;
 
 pub use journal::Observer;

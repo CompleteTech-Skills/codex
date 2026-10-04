@@ -45,9 +45,12 @@ pub struct StorageServiceInputs {
 
 /// The one implementation behind the CLI, the API and the TUI.
 pub struct StorageService {
-    pub(crate) inputs: StorageServiceInputs,
-    pub(crate) journal: Journal,
-    running: std::sync::Mutex<std::collections::HashSet<Uuid>>,
+    pub(crate) inputs: Arc<StorageServiceInputs>,
+    pub(crate) journal: Arc<Journal>,
+    running: Arc<std::sync::Mutex<std::collections::HashSet<Uuid>>>,
+    pub(crate) migration_startups: Arc<crate::MigrationStartupRegistry>,
+    pub(crate) original_operations: Arc<crate::service_operations::Operations>,
+    pub(crate) operation_resources: Option<Arc<crate::operation_resources::Resources>>,
 }
 
 /// Held while this process drives an operation, so a repeated request cannot drive it twice.
@@ -70,17 +73,31 @@ impl StorageService {
     pub fn new(inputs: StorageServiceInputs) -> Self {
         let journal = Journal::new(&inputs.codex_home);
         Self {
-            inputs,
-            journal,
-            running: std::sync::Mutex::default(),
+            inputs: Arc::new(inputs),
+            journal: Arc::new(journal),
+            running: Arc::new(std::sync::Mutex::default()),
+            original_operations: Arc::default(),
+            operation_resources: None,
+            migration_startups: Arc::new(crate::MigrationStartupRegistry::default()),
         }
     }
 
     /// Report every durable change to an operation record to `observer`, so a front end can push
     /// progress instead of being polled.
-    pub fn observed_by(mut self, observer: Observer) -> Self {
-        self.journal = self.journal.observed_by(observer);
+    pub fn observed_by(self, observer: Observer) -> Self {
+        self.journal.set_observer(observer);
         self
+    }
+    // Same original state owners; no new controller, namespace, or pool selection.
+    pub(crate) fn operation_context(&self) -> Self {
+        Self {
+            inputs: Arc::clone(&self.inputs),
+            journal: Arc::clone(&self.journal),
+            running: Arc::clone(&self.running),
+            migration_startups: Arc::clone(&self.migration_startups),
+            original_operations: Arc::clone(&self.original_operations),
+            operation_resources: self.operation_resources.as_ref().map(Arc::clone),
+        }
     }
 
     /// Claim the right to drive an operation; `None` means this process already is.
@@ -326,7 +343,11 @@ impl StorageService {
         let Ok(storage) = self.connect().await else {
             return Ok(record);
         };
-        let migrator = self.migrator(&storage);
+        // Progress is read-only and keeps the runtime credential.
+        let migrator = codex_storage_migration::Migrator::new(
+            SqliteSource::new(self.inputs.sqlite.clone()),
+            Arc::clone(storage.pool()),
+        );
         if let Ok(state) = migrator.activation_state().await
             && let Some(run_id) = record.run_id.or(state.run_id)
             && let Ok(rows) = migrator.progress(run_id).await
