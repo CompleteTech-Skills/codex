@@ -12,9 +12,11 @@ use codex_state::StateRuntime;
 use codex_state::ThreadMetadataBuilder;
 use codex_storage_authority::HostCredentialResolver;
 use codex_storage_authority::RemotePostgresProfile;
+use codex_storage_migration::InstallPlan;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -185,6 +187,19 @@ fn stored_operation(service: &StorageService, operation_id: Uuid) -> crate::Oper
         .expect("operation record exists")
 }
 
+struct FailedReturnFixture {
+    home: tempfile::TempDir,
+    service: StorageService,
+    operation_id: Uuid,
+    run_id: Uuid,
+    backup_obstruction: PathBuf,
+    obstruction_bytes: Vec<u8>,
+    intent_bytes: Vec<u8>,
+    plan_bytes: Vec<u8>,
+    retired: codex_storage_migration::ActivationState,
+    progress: Vec<(String, u64)>,
+}
+
 async fn ready_return_service(
     state: &Path,
 ) -> (tempfile::TempDir, StorageService, crate::OperationRecord) {
@@ -230,6 +245,472 @@ async fn ready_return_service(
         .expect("export return");
     assert_eq!(ready_return.state, OperationState::Ready);
     (home, service, ready_return)
+}
+
+async fn fail_return_install_at_backup_creation(state: &Path) -> FailedReturnFixture {
+    let (home, service, ready) = ready_return_service(state).await;
+    let operation_id = ready.operation_id;
+    let run_id = ready.run_id.expect("return export run");
+    let backup_obstruction = home
+        .path()
+        .join("storage-backups")
+        .join(format!("{run_id}-before-return"));
+    std::fs::create_dir_all(
+        backup_obstruction
+            .parent()
+            .expect("backup parent directory"),
+    )
+    .expect("create backup parent");
+    let obstruction_bytes = b"B5 test-owned backup path obstruction".to_vec();
+    std::fs::write(&backup_obstruction, &obstruction_bytes).expect("write backup obstruction");
+
+    let (before, progress_before) = remote_fence_and_progress(&service, run_id).await;
+    assert!(before.migrating);
+    assert!(!before.retired);
+    assert_eq!(before.run_id, Some(run_id));
+
+    assert!(matches!(
+        service.activate(operation_id).await,
+        Err(StorageError(BlockerCode::AuthorityInvalid))
+    ));
+    let failed = stored_operation(&service, operation_id);
+    assert_eq!(failed.state, OperationState::Failed);
+    assert_eq!(failed.blocker, Some(BlockerCode::AuthorityInvalid));
+
+    let intent_path = home.path().join("storage-cutover.json");
+    let intent = codex_storage_authority::read_cutover(home.path())
+        .expect("read retained Local intent")
+        .expect("intent remains after install error");
+    assert_eq!(intent.run_id, run_id);
+    assert_eq!(intent.target, codex_storage_authority::ActiveBackend::Local);
+    let intent_bytes = std::fs::read(intent_path).expect("intent bytes");
+    let plan_path = home.path().join("storage-install.json");
+    let plan = codex_storage_migration::read_plan(home.path())
+        .expect("read retained install plan")
+        .expect("plan remains after install error");
+    assert_eq!(plan.run_id, run_id);
+    assert_eq!(plan.staged_home, service.staged_home(operation_id));
+    assert_eq!(plan.backup_dir, backup_obstruction);
+    let plan_bytes = std::fs::read(plan_path).expect("plan bytes");
+    assert_eq!(
+        std::fs::read(&backup_obstruction).expect("obstruction remains"),
+        obstruction_bytes
+    );
+    assert!(matches!(
+        codex_storage_authority::authority_state(home.path()),
+        Ok(codex_storage_authority::AuthorityState::CutoverInProgress(current))
+            if current == intent
+    ));
+
+    let (retired, progress) = remote_fence_and_progress(&service, run_id).await;
+    assert!(!retired.migrating);
+    assert!(retired.retired);
+    assert_eq!(retired.run_id, Some(run_id));
+    assert_eq!(retired.dataset_id, before.dataset_id);
+    assert_eq!(retired.generation, before.generation + 1);
+    assert_eq!(progress, progress_before);
+
+    FailedReturnFixture {
+        home,
+        service,
+        operation_id,
+        run_id,
+        backup_obstruction,
+        obstruction_bytes,
+        intent_bytes,
+        plan_bytes,
+        retired,
+        progress,
+    }
+}
+
+async fn assert_return_is_active_after_reconciliation(fixture: &FailedReturnFixture) {
+    let record = stored_operation(&fixture.service, fixture.operation_id);
+    assert_eq!(record.state, OperationState::Active);
+    assert_eq!(record.blocker, None);
+    assert_eq!(record.run_id, Some(fixture.run_id));
+    assert_eq!(
+        codex_storage_authority::read_cutover(fixture.home.path()).expect("read intent"),
+        None
+    );
+    assert_eq!(
+        codex_storage_migration::read_plan(fixture.home.path()).expect("read plan"),
+        None
+    );
+    assert!(fixture.backup_obstruction.is_dir());
+    let backup_manifest = fixture.backup_obstruction.join("manifest.json");
+    let backup_plan: InstallPlan =
+        serde_json::from_slice(&std::fs::read(backup_manifest).expect("backup manifest"))
+            .expect("backup plan json");
+    assert_eq!(backup_plan.run_id, fixture.run_id);
+    assert_eq!(
+        backup_plan.staged_home,
+        fixture.service.staged_home(fixture.operation_id)
+    );
+    assert!(codex_storage_migration::verify_backup(&backup_plan).expect("verify backup"));
+    assert!(matches!(
+        codex_storage_authority::authority_state(fixture.home.path()),
+        Ok(codex_storage_authority::AuthorityState::Local(_))
+    ));
+    let status = fixture.service.status(true).await;
+    assert_eq!(status.active_backend, BackendName::LocalSqlite);
+    assert_eq!(
+        status
+            .remote
+            .expect("retired remote summary")
+            .state
+            .as_deref(),
+        Some("retired")
+    );
+    let (remote, progress) = remote_fence_and_progress(&fixture.service, fixture.run_id).await;
+    assert!(remote.retired);
+    assert!(!remote.migrating);
+    assert_eq!(remote.run_id, Some(fixture.run_id));
+    assert_eq!(remote.dataset_id, fixture.retired.dataset_id);
+    assert_eq!(remote.generation, fixture.retired.generation);
+    assert_eq!(progress, fixture.progress);
+}
+
+#[tokio::test]
+async fn failed_return_install_owner_recovers_after_real_io_error() {
+    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE") else {
+        return;
+    };
+    let state = Path::new(&state);
+    reset_target(state).await;
+    let fixture = fail_return_install_at_backup_creation(state).await;
+    assert_eq!(
+        std::fs::read(fixture.home.path().join("storage-cutover.json"))
+            .expect("intent remains before retry"),
+        fixture.intent_bytes
+    );
+    assert_eq!(
+        std::fs::read(fixture.home.path().join("storage-install.json"))
+            .expect("plan remains before retry"),
+        fixture.plan_bytes
+    );
+    assert_eq!(
+        std::fs::read(&fixture.backup_obstruction).expect("obstruction remains before retry"),
+        fixture.obstruction_bytes
+    );
+
+    std::fs::remove_file(&fixture.backup_obstruction).expect("remove test-owned obstruction");
+    let report = fixture
+        .service
+        .recover()
+        .await
+        .expect("recover the exact failed return owner");
+    assert_eq!(report.outcome, RecoveryKind::RolledForward);
+    assert_eq!(report.operations.len(), 1);
+    assert_eq!(report.operations[0].operation_id, fixture.operation_id);
+    assert_eq!(report.operations[0].state, OperationState::Active);
+    assert_return_is_active_after_reconciliation(&fixture).await;
+    reset_target(state).await;
+}
+
+#[tokio::test]
+async fn failed_return_cancel_roll_forward_keeps_active_journal_state() {
+    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE") else {
+        return;
+    };
+    let state = Path::new(&state);
+    reset_target(state).await;
+    let fixture = fail_return_install_at_backup_creation(state).await;
+    std::fs::remove_file(&fixture.backup_obstruction).expect("remove test-owned obstruction");
+
+    assert_eq!(
+        fixture.service.cancel(fixture.operation_id).await,
+        Err(StorageError(BlockerCode::AlreadyRemote)),
+        "cancel reports that recovery completed the local return"
+    );
+    assert_return_is_active_after_reconciliation(&fixture).await;
+    let active = stored_operation(&fixture.service, fixture.operation_id);
+    assert_eq!(
+        fixture.service.cancel(fixture.operation_id).await,
+        Err(StorageError(BlockerCode::AlreadyRemote))
+    );
+    assert_eq!(
+        stored_operation(&fixture.service, fixture.operation_id),
+        active
+    );
+    assert_eq!(active.state, OperationState::Active);
+    reset_target(state).await;
+}
+
+#[tokio::test]
+async fn failed_return_cancel_journal_error_cannot_become_cancelled() {
+    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE") else {
+        return;
+    };
+    let state = Path::new(&state);
+    reset_target(state).await;
+    let fixture = fail_return_install_at_backup_creation(state).await;
+    std::fs::remove_file(&fixture.backup_obstruction).expect("remove test-owned obstruction");
+
+    let journal_temporary = fixture
+        .home
+        .path()
+        .join("storage-operations")
+        .join(format!("{}.json.tmp", fixture.operation_id));
+    std::fs::create_dir_all(&journal_temporary).expect("block only the journal replacement");
+    assert_eq!(
+        fixture.service.cancel(fixture.operation_id).await,
+        Err(StorageError(BlockerCode::Internal)),
+        "failed Active journal write is reported after cutover completion"
+    );
+    let failed = stored_operation(&fixture.service, fixture.operation_id);
+    assert_eq!(failed.state, OperationState::Failed);
+    assert_eq!(
+        codex_storage_authority::read_cutover(fixture.home.path()).expect("read intent"),
+        None
+    );
+    assert_eq!(
+        codex_storage_migration::read_plan(fixture.home.path()).expect("read plan"),
+        None
+    );
+    let local = codex_storage_authority::authority_state(fixture.home.path())
+        .expect("read local authority");
+    assert!(matches!(
+        local,
+        codex_storage_authority::AuthorityState::Local(authority)
+            if authority.identity.dataset_id == fixture.retired.dataset_id.expect("retired dataset")
+                && authority.identity.generation == fixture.retired.generation as u64
+    ));
+    let (remote, progress) = remote_fence_and_progress(&fixture.service, fixture.run_id).await;
+    assert!(remote.retired);
+    assert_eq!(remote.run_id, Some(fixture.run_id));
+    assert_eq!(remote.dataset_id, fixture.retired.dataset_id);
+    assert_eq!(remote.generation, fixture.retired.generation);
+    assert_eq!(progress, fixture.progress);
+
+    let storage = fixture
+        .service
+        .connect()
+        .await
+        .expect("connect for retired-run refusal controls");
+    let mut connection = storage
+        .pool()
+        .acquire()
+        .await
+        .expect("migration receipt connection");
+    let (direction, source_fingerprint, run_state) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT direction, source_fingerprint, state \
+             FROM storage_migration_runs WHERE run_id = $1",
+    )
+    .bind(fixture.run_id)
+    .fetch_one(&mut *connection)
+    .await
+    .expect("read exact retired export receipt");
+    assert_eq!(direction, "export");
+    assert_eq!(run_state, "activated");
+    let changed =
+        sqlx::query("UPDATE storage_migration_runs SET direction = 'import' WHERE run_id = $1")
+            .bind(fixture.run_id)
+            .execute(&mut *connection)
+            .await
+            .expect("install foreign direction");
+    assert_eq!(changed.rows_affected(), 1);
+    drop(connection);
+    storage.close().await;
+    assert_eq!(
+        fixture.service.cancel(fixture.operation_id).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    );
+    assert_eq!(
+        stored_operation(&fixture.service, fixture.operation_id),
+        failed
+    );
+    let (after_direction, direction_progress) =
+        remote_fence_and_progress(&fixture.service, fixture.run_id).await;
+    assert_eq!(after_direction, fixture.retired);
+    assert_eq!(direction_progress, fixture.progress);
+
+    let storage = fixture
+        .service
+        .connect()
+        .await
+        .expect("connect to restore direction and test fingerprint");
+    let mut connection = storage
+        .pool()
+        .acquire()
+        .await
+        .expect("migration receipt connection");
+    let changed = sqlx::query(
+        "UPDATE storage_migration_runs SET direction = 'export', \
+         source_fingerprint = 'foreign-source' WHERE run_id = $1",
+    )
+    .bind(fixture.run_id)
+    .execute(&mut *connection)
+    .await
+    .expect("install foreign source fingerprint");
+    assert_eq!(changed.rows_affected(), 1);
+    drop(connection);
+    storage.close().await;
+    assert_eq!(
+        fixture.service.cancel(fixture.operation_id).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    );
+    assert_eq!(
+        stored_operation(&fixture.service, fixture.operation_id),
+        failed
+    );
+    let (after_fingerprint, fingerprint_progress) =
+        remote_fence_and_progress(&fixture.service, fixture.run_id).await;
+    assert_eq!(after_fingerprint, fixture.retired);
+    assert_eq!(fingerprint_progress, fixture.progress);
+
+    let storage = fixture
+        .service
+        .connect()
+        .await
+        .expect("restore exact export fingerprint");
+    let mut connection = storage
+        .pool()
+        .acquire()
+        .await
+        .expect("migration receipt connection");
+    sqlx::query("UPDATE storage_migration_runs SET source_fingerprint = $2 WHERE run_id = $1")
+        .bind(fixture.run_id)
+        .bind(source_fingerprint)
+        .execute(&mut *connection)
+        .await
+        .expect("restore exact export fingerprint");
+    drop(connection);
+    storage.close().await;
+
+    std::fs::remove_dir(&journal_temporary).expect("remove test-owned journal obstruction");
+    assert_eq!(
+        fixture.service.cancel(fixture.operation_id).await,
+        Err(StorageError(BlockerCode::AlreadyRemote)),
+        "the exact markerless retired owner settles Active instead of Cancelled"
+    );
+    assert_return_is_active_after_reconciliation(&fixture).await;
+    reset_target(state).await;
+}
+
+#[tokio::test]
+async fn failed_intent_only_return_owner_can_retry_unretired_rollback() {
+    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE") else {
+        return;
+    };
+    let state = Path::new(&state);
+    reset_target(state).await;
+    let (home, service, ready) = ready_return_service(state).await;
+    let operation_id = ready.operation_id;
+    let run_id = ready.run_id.expect("return export run");
+    let staged_home = service.staged_home(operation_id);
+    let storage = service.connect().await.expect("return preparation storage");
+    let returning = codex_storage_migration::ReturnCutover::new(
+        home.path().to_path_buf(),
+        staged_home.clone(),
+        codex_storage_migration::Migrator::new(
+            codex_storage_migration::SqliteSource::new(SqliteConfig::new_for_testing(
+                staged_home.abs(),
+            ))
+            .relocated_from(home.path().to_path_buf()),
+            storage.pool().clone(),
+        ),
+    );
+    let intent = returning
+        .prepare(run_id)
+        .expect("persist exact return intent");
+    assert_eq!(intent.run_id, run_id);
+    assert_eq!(intent.target, codex_storage_authority::ActiveBackend::Local);
+    storage.close().await;
+    let intent_path = home.path().join("storage-cutover.json");
+    let intent_bytes = std::fs::read(&intent_path).expect("intent bytes");
+    let plan_path = home.path().join("storage-install.json");
+    assert!(plan_path.exists());
+    std::fs::remove_file(&plan_path).expect("model failed plan cleanup");
+
+    let (before, progress_before) = remote_fence_and_progress(&service, run_id).await;
+    assert!(before.migrating);
+    assert!(!before.retired);
+    assert_eq!(before.run_id, Some(run_id));
+    let storage = service.connect().await.expect("inject foreign generation");
+    let mut connection = storage
+        .pool()
+        .acquire()
+        .await
+        .expect("activation connection");
+    sqlx::query(
+        "UPDATE storage_activation SET state = 'open', generation = generation + 1 WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .execute(&mut *connection)
+    .await
+    .expect("install temporary conflicting activation state");
+    drop(connection);
+    storage.close().await;
+
+    assert_eq!(
+        service.activate(operation_id).await,
+        Err(StorageError(BlockerCode::DatasetMismatch)),
+        "the public activation records a retryable Failed owner when SQL evidence conflicts"
+    );
+    let failed = stored_operation(&service, operation_id);
+    assert_eq!(failed.state, OperationState::Failed);
+    assert_eq!(failed.blocker, Some(BlockerCode::DatasetMismatch));
+    assert_eq!(
+        std::fs::read(&intent_path).expect("intent remains"),
+        intent_bytes
+    );
+    assert!(!plan_path.exists());
+    let (foreign, foreign_progress) = remote_fence_and_progress(&service, run_id).await;
+    assert!(!foreign.migrating);
+    assert!(!foreign.retired);
+    assert_eq!(foreign.generation, before.generation + 1);
+    assert_eq!(foreign_progress, progress_before);
+
+    let storage = service
+        .connect()
+        .await
+        .expect("restore exact activation state");
+    let mut connection = storage
+        .pool()
+        .acquire()
+        .await
+        .expect("activation connection");
+    sqlx::query(
+        "UPDATE storage_activation SET state = 'migrating', generation = $2 WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .bind(before.generation)
+    .execute(&mut *connection)
+    .await
+    .expect("restore the exact unretired source generation");
+    drop(connection);
+    storage.close().await;
+    let (restored, restored_progress) = remote_fence_and_progress(&service, run_id).await;
+    assert!(restored.migrating);
+    assert!(!restored.retired);
+    assert_eq!(restored.generation, before.generation);
+    assert_eq!(restored.dataset_id, before.dataset_id);
+    assert_eq!(restored_progress, progress_before);
+
+    let report = service
+        .recover()
+        .await
+        .expect("retry the Failed intent-only rollback");
+    assert_eq!(report.outcome, RecoveryKind::RolledBack);
+    assert_eq!(report.operations.len(), 1);
+    assert_eq!(report.operations[0].operation_id, operation_id);
+    assert_eq!(report.operations[0].state, OperationState::Cancelled);
+    assert_eq!(
+        codex_storage_authority::read_cutover(home.path()).expect("read cleared intent"),
+        None
+    );
+    assert_eq!(
+        codex_storage_migration::read_plan(home.path()).expect("read plan"),
+        None
+    );
+    let (reopened, final_progress) = remote_fence_and_progress(&service, run_id).await;
+    assert!(!reopened.migrating);
+    assert!(!reopened.retired);
+    assert_eq!(reopened.generation, before.generation);
+    assert_eq!(reopened.dataset_id, before.dataset_id);
+    assert_eq!(final_progress, progress_before);
+    reset_target(state).await;
 }
 
 #[tokio::test]
@@ -786,6 +1267,268 @@ async fn real_postgres_storage_service() {
     assert_eq!(
         waiting.remote.expect("remote summary").state.as_deref(),
         Some("migrating")
+    );
+
+    let run_id = ready.run_id.expect("return run id");
+    let staged_home = service.staged_home(returning);
+    let plan = InstallPlan {
+        run_id,
+        staged_home,
+        backup_dir: home
+            .path()
+            .join("storage-backups")
+            .join(format!("{run_id}-before-return")),
+        units: Vec::new(),
+    };
+    let plan_bytes = serde_json::to_vec(&plan).expect("plan bytes");
+    let plan_path = home.path().join("storage-install.json");
+    std::fs::write(&plan_path, &plan_bytes).expect("plan-only recovery marker");
+    assert_eq!(
+        service.cancel(returning).await,
+        Err(StorageError(BlockerCode::OperationConflict)),
+        "a Ready journal entry cannot own cutover markers"
+    );
+    assert_eq!(service.operation(returning).expect("operation"), ready);
+
+    let mut committing = ready.clone();
+    committing.state = OperationState::Committing;
+    committing.blocker = Some(BlockerCode::CutoverInProgress);
+    service
+        .journal
+        .update(&committing)
+        .expect("persist interrupted return");
+    let mut foreign_plan = plan.clone();
+    foreign_plan.staged_home = home.path().join("foreign-storage-staging");
+    let foreign_plan_bytes = serde_json::to_vec(&foreign_plan).expect("foreign plan bytes");
+    std::fs::write(&plan_path, &foreign_plan_bytes).expect("foreign staged path marker");
+    assert_eq!(
+        service.cancel(returning).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    );
+    assert_eq!(
+        std::fs::read(&plan_path).expect("foreign plan remains"),
+        foreign_plan_bytes
+    );
+    assert_eq!(service.operation(returning).expect("operation"), committing);
+    std::fs::write(&plan_path, &plan_bytes).expect("restore matching plan");
+
+    // The service accepts the unique owner, then the cutover's plan-only conflict
+    // follows the existing public DatasetMismatch mapping.
+    let plan_only_remote_before = remote_fence_and_progress(&service, run_id).await;
+    assert_eq!(
+        service.recover().await,
+        Err(StorageError(BlockerCode::DatasetMismatch))
+    );
+    assert_eq!(
+        std::fs::read(&plan_path).expect("plan remains"),
+        plan_bytes,
+        "plan-only conflict must not delete recovery evidence"
+    );
+    assert_eq!(service.operation(returning).expect("operation"), committing);
+    assert_eq!(
+        remote_fence_and_progress(&service, run_id).await,
+        plan_only_remote_before
+    );
+    assert_eq!(
+        service.cancel(returning).await,
+        Err(StorageError(BlockerCode::DatasetMismatch))
+    );
+    assert_eq!(
+        std::fs::read(&plan_path).expect("plan remains after cancel"),
+        plan_bytes
+    );
+    assert_eq!(service.operation(returning).expect("operation"), committing);
+    assert_eq!(
+        remote_fence_and_progress(&service, run_id).await,
+        plan_only_remote_before
+    );
+    assert_eq!(
+        service
+            .status(true)
+            .await
+            .remote
+            .expect("remote state")
+            .state
+            .as_deref(),
+        Some("migrating")
+    );
+    std::fs::remove_file(&plan_path).expect("remove plan-only test marker");
+    let mut ready = committing;
+    ready.state = OperationState::Ready;
+    ready.blocker = None;
+    service
+        .journal
+        .update(&ready)
+        .expect("restore Ready operation");
+
+    // A matching Local intent and install plan still require one durable journal owner.
+    let mut committing_owner = ready.clone();
+    committing_owner.blocker = Some(BlockerCode::CutoverInProgress);
+    service
+        .save(&mut committing_owner, OperationState::Committing)
+        .expect("persist owned local cutover");
+    let storage = service.connect().await.expect("local cutover storage");
+    let return_cutover = codex_storage_migration::ReturnCutover::new(
+        home.path().to_path_buf(),
+        service.staged_home(returning),
+        codex_storage_migration::Migrator::new(
+            codex_storage_migration::SqliteSource::new(SqliteConfig::new_for_testing(
+                service.staged_home(returning).abs(),
+            ))
+            .relocated_from(home.path().to_path_buf()),
+            storage.pool().clone(),
+        ),
+    );
+    let intent = return_cutover
+        .prepare(run_id)
+        .expect("matching Local intent and install plan");
+    storage.close().await;
+    assert_eq!(intent.run_id, run_id);
+    assert_eq!(intent.target, codex_storage_authority::ActiveBackend::Local);
+    let plan = codex_storage_migration::read_plan(home.path())
+        .expect("owned install plan")
+        .expect("plan exists");
+    assert_eq!(plan.run_id, run_id);
+    assert_eq!(plan.staged_home, service.staged_home(returning));
+
+    let intent_path = home.path().join("storage-cutover.json");
+    let intent_bytes = std::fs::read(&intent_path).expect("owned Local intent bytes");
+    let owned_plan_bytes = std::fs::read(&plan_path).expect("owned install plan bytes");
+    let mut duplicate_owner = committing_owner.clone();
+    duplicate_owner.operation_id = Uuid::new_v4();
+    service
+        .journal
+        .create(&duplicate_owner)
+        .expect("duplicate exact-run journal owner");
+
+    let (remote_before, progress_before) = remote_fence_and_progress(&service, run_id).await;
+    assert!(remote_before.migrating);
+    assert_eq!(remote_before.run_id, Some(run_id));
+
+    let assert_duplicate_owner_evidence = |expected_duplicate: &crate::OperationRecord| {
+        assert_eq!(
+            stored_operation(&service, returning),
+            committing_owner,
+            "the real owner must remain unchanged"
+        );
+        assert_eq!(
+            stored_operation(&service, duplicate_owner.operation_id),
+            *expected_duplicate,
+            "the synthetic duplicate claim must remain unchanged"
+        );
+        assert_eq!(
+            std::fs::read(&intent_path).expect("Local intent remains"),
+            intent_bytes,
+            "duplicate ownership must preserve exact intent bytes"
+        );
+        assert_eq!(
+            std::fs::read(&plan_path).expect("install plan remains"),
+            owned_plan_bytes,
+            "duplicate ownership must preserve exact plan bytes"
+        );
+    };
+    assert_eq!(
+        service.recover().await,
+        Err(StorageError(BlockerCode::OperationConflict)),
+        "public recovery must refuse duplicate exact-run owners before cutover"
+    );
+    assert_duplicate_owner_evidence(&duplicate_owner);
+    let (remote_after_recovery, progress_after_recovery) =
+        remote_fence_and_progress(&service, run_id).await;
+    assert_eq!(
+        remote_after_recovery, remote_before,
+        "public recovery must leave the full activation fence unchanged"
+    );
+    assert_eq!(
+        progress_after_recovery, progress_before,
+        "public recovery must leave remote checkpoints unchanged"
+    );
+    assert_eq!(
+        service.cancel(returning).await,
+        Err(StorageError(BlockerCode::OperationConflict)),
+        "public cancellation must refuse duplicate exact-run owners before cutover"
+    );
+    assert_duplicate_owner_evidence(&duplicate_owner);
+    let (remote_after_cancel, progress_after_cancel) =
+        remote_fence_and_progress(&service, run_id).await;
+    assert_eq!(
+        remote_after_cancel, remote_before,
+        "public cancellation must leave the full activation fence unchanged"
+    );
+    assert_eq!(
+        progress_after_cancel, progress_before,
+        "public cancellation must leave remote checkpoints unchanged"
+    );
+
+    // A terminal journal row still claims the run until its run_id is cleared.
+    let mut terminal_duplicate = duplicate_owner.clone();
+    terminal_duplicate.state = OperationState::Cancelled;
+    terminal_duplicate.blocker = None;
+    service
+        .journal
+        .update(&terminal_duplicate)
+        .expect("mark synthetic duplicate terminal");
+    assert_eq!(
+        service.recover().await,
+        Err(StorageError(BlockerCode::OperationConflict)),
+        "a terminal duplicate still claiming the run must block recovery"
+    );
+    assert_duplicate_owner_evidence(&terminal_duplicate);
+    let (remote_after_terminal_duplicate, progress_after_terminal_duplicate) =
+        remote_fence_and_progress(&service, run_id).await;
+    assert_eq!(
+        remote_after_terminal_duplicate, remote_before,
+        "a terminal duplicate claim must not change the activation fence"
+    );
+    assert_eq!(
+        progress_after_terminal_duplicate, progress_before,
+        "a terminal duplicate claim must not change remote checkpoints"
+    );
+
+    let mut duplicate_without_run_claim = terminal_duplicate.clone();
+    duplicate_without_run_claim.run_id = None;
+    service
+        .journal
+        .update(&duplicate_without_run_claim)
+        .expect("remove synthetic duplicate run claim");
+    assert_eq!(
+        stored_operation(&service, duplicate_owner.operation_id),
+        duplicate_without_run_claim
+    );
+    let recovered = service
+        .recover()
+        .await
+        .expect("recover with the one exact owner");
+    assert_eq!(recovered.outcome, RecoveryKind::RolledBack);
+    assert_eq!(recovered.operations.len(), 1);
+    assert_eq!(recovered.operations[0].operation_id, returning);
+    assert_eq!(recovered.operations[0].state, OperationState::Cancelled);
+    assert_eq!(recovered.operations[0].blocker, None);
+    assert_eq!(
+        codex_storage_authority::read_cutover(home.path()).expect("recovered intent"),
+        None
+    );
+    assert_eq!(
+        codex_storage_migration::read_plan(home.path()).expect("recovered plan"),
+        None
+    );
+    assert!(!intent_path.exists());
+    assert!(!plan_path.exists());
+    assert_eq!(
+        stored_operation(&service, duplicate_owner.operation_id),
+        duplicate_without_run_claim
+    );
+    let (remote_after_rollback, progress_after_rollback) =
+        remote_fence_and_progress(&service, run_id).await;
+    let mut reopened = remote_before;
+    reopened.migrating = false;
+    assert_eq!(
+        remote_after_rollback, reopened,
+        "the exact source run must be open again without retirement"
+    );
+    assert_eq!(
+        progress_after_rollback, progress_before,
+        "rollback preserves the exported domain checkpoints"
     );
 
     // Cancelling reopens the dataset unchanged and a new export can be made.
