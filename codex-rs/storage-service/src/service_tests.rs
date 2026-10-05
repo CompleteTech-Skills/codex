@@ -159,6 +159,277 @@ fn service(
     })
 }
 
+async fn remote_fence_and_progress(
+    service: &StorageService,
+    run_id: Uuid,
+) -> (codex_storage_migration::ActivationState, Vec<(String, u64)>) {
+    let storage = service.connect().await.expect("remote fence connection");
+    let migrator = service.migrator(&storage);
+    let activation = migrator
+        .activation_state()
+        .await
+        .expect("remote activation fence");
+    let progress = migrator
+        .progress(run_id)
+        .await
+        .expect("remote migration checkpoints");
+    storage.close().await;
+    (activation, progress)
+}
+
+fn stored_operation(service: &StorageService, operation_id: Uuid) -> crate::OperationRecord {
+    service
+        .journal
+        .read(operation_id)
+        .expect("read operation journal")
+        .expect("operation record exists")
+}
+
+async fn ready_return_service(
+    state: &Path,
+) -> (tempfile::TempDir, StorageService, crate::OperationRecord) {
+    let home = populated_home().await;
+    let service = service(
+        home.path(),
+        state,
+        Some(profile(state, true)),
+        keyring(state, None),
+    );
+    service
+        .initialize_schema()
+        .await
+        .expect("initialize return recovery schema");
+
+    let confirmed = Confirmation {
+        writers_stopped: true,
+    };
+    let migration_plan = service
+        .plan(PlanAction::Migrate)
+        .await
+        .expect("migration plan");
+    let migration = Uuid::new_v4();
+    let ready_migration = service
+        .start_migration(migration, migration_plan.plan_id, confirmed)
+        .await
+        .expect("start local migration");
+    assert_eq!(ready_migration.state, OperationState::Ready);
+    assert_eq!(
+        service
+            .activate(migration)
+            .await
+            .expect("activate remote dataset")
+            .state,
+        OperationState::Active
+    );
+
+    let return_plan = service.plan(PlanAction::Return).await.expect("return plan");
+    let operation_id = Uuid::new_v4();
+    let ready_return = service
+        .start_return(operation_id, return_plan.plan_id, confirmed)
+        .await
+        .expect("export return");
+    assert_eq!(ready_return.state, OperationState::Ready);
+    (home, service, ready_return)
+}
+
+#[tokio::test]
+async fn failed_markerless_remote_return_can_cancel_exact_unretired_export() {
+    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE") else {
+        return;
+    };
+    let state = Path::new(&state);
+    reset_target(state).await;
+    let (home, service, ready) = ready_return_service(state).await;
+    let operation_id = ready.operation_id;
+    let run_id = ready.run_id.expect("return export run");
+    let staged_home = service.staged_home(operation_id);
+    let displaced_staging = staged_home.with_file_name(format!("{operation_id}-b6-held"));
+    assert!(staged_home.is_dir());
+    assert!(!displaced_staging.exists());
+
+    let (before, progress_before) = remote_fence_and_progress(&service, run_id).await;
+    assert!(before.migrating);
+    assert!(!before.retired);
+    assert_eq!(before.run_id, Some(run_id));
+    let remote_authority = match codex_storage_authority::authority_state(home.path())
+        .expect("read initial authority")
+    {
+        codex_storage_authority::AuthorityState::Remote(authority) => authority,
+        other => panic!("expected Remote authority before preparation failure, got {other:?}"),
+    };
+    assert!(remote_authority.marker.remote_ever_activated);
+    assert_eq!(
+        remote_authority.identity.dataset_id,
+        before.dataset_id.unwrap()
+    );
+    assert_eq!(
+        remote_authority.identity.generation,
+        before.generation as u64
+    );
+
+    // Hide only this operation's staged directory. Activation reaches prepare, records and
+    // abandons its Local intent, then fails while plan_install reads the missing staging path.
+    std::fs::rename(&staged_home, &displaced_staging).expect("hide owned staging directory");
+    let activation = service.activate(operation_id).await;
+    std::fs::rename(&displaced_staging, &staged_home).expect("restore owned staging directory");
+    assert_eq!(
+        activation,
+        Err(StorageError(BlockerCode::AuthorityInvalid)),
+        "the public activation must fail in plan_install after intent cleanup"
+    );
+    let failed = stored_operation(&service, operation_id);
+    assert_eq!(failed.state, OperationState::Failed);
+    assert_eq!(failed.blocker, Some(BlockerCode::AuthorityInvalid));
+    assert_eq!(
+        codex_storage_authority::read_cutover(home.path()).expect("read cleaned intent"),
+        None
+    );
+    assert_eq!(
+        codex_storage_migration::read_plan(home.path()).expect("read cleaned plan"),
+        None
+    );
+    assert!(matches!(
+        codex_storage_authority::authority_state(home.path()),
+        Ok(codex_storage_authority::AuthorityState::Remote(current))
+            if current == remote_authority
+    ));
+    let (after_failure, progress_after_failure) = remote_fence_and_progress(&service, run_id).await;
+    assert_eq!(after_failure, before);
+    assert_eq!(progress_after_failure, progress_before);
+
+    // A foreign-direction row cannot use the Remote cancellation route or change the fence.
+    let storage = service
+        .connect()
+        .await
+        .expect("connect for exact export ownership refusal");
+    let mut connection = storage
+        .pool()
+        .acquire()
+        .await
+        .expect("migration receipt connection");
+    let changed =
+        sqlx::query("UPDATE storage_migration_runs SET direction = 'import' WHERE run_id = $1")
+            .bind(run_id)
+            .execute(&mut *connection)
+            .await
+            .expect("install foreign direction");
+    assert_eq!(changed.rows_affected(), 1);
+    drop(connection);
+    storage.close().await;
+    assert_eq!(
+        service.cancel(operation_id).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    );
+    assert_eq!(stored_operation(&service, operation_id), failed);
+    let (after_refusal, progress_after_refusal) = remote_fence_and_progress(&service, run_id).await;
+    assert_eq!(after_refusal, before);
+    assert_eq!(progress_after_refusal, progress_before);
+
+    let storage = service
+        .connect()
+        .await
+        .expect("connect to restore the exact export row");
+    let mut connection = storage
+        .pool()
+        .acquire()
+        .await
+        .expect("migration receipt connection");
+    sqlx::query("UPDATE storage_migration_runs SET direction = 'export' WHERE run_id = $1")
+        .bind(run_id)
+        .execute(&mut *connection)
+        .await
+        .expect("restore exact export direction");
+    drop(connection);
+    storage.close().await;
+
+    let journal_temporary = home
+        .path()
+        .join("storage-operations")
+        .join(format!("{operation_id}.json.tmp"));
+    std::fs::create_dir_all(&journal_temporary).expect("block the cancellation journal replace");
+    assert_eq!(
+        service.cancel(operation_id).await,
+        Err(StorageError(BlockerCode::Internal)),
+        "the durable SQL abandonment precedes journal acknowledgement"
+    );
+    assert_eq!(stored_operation(&service, operation_id), failed);
+    let (after_journal_failure, progress_after_journal_failure) =
+        remote_fence_and_progress(&service, run_id).await;
+    assert!(!after_journal_failure.migrating);
+    assert!(!after_journal_failure.retired);
+    assert_eq!(after_journal_failure.run_id, Some(run_id));
+    assert_eq!(after_journal_failure.dataset_id, before.dataset_id);
+    assert_eq!(after_journal_failure.generation, before.generation);
+    assert_eq!(progress_after_journal_failure, progress_before);
+    std::fs::remove_dir(&journal_temporary).expect("remove test-owned journal obstruction");
+
+    let cancelled = service
+        .cancel(operation_id)
+        .await
+        .expect("retry cancellation from exact abandoned-run evidence");
+    assert_eq!(cancelled.state, OperationState::Cancelled);
+    assert_eq!(cancelled.blocker, None);
+    assert_eq!(cancelled.run_id, Some(run_id));
+    assert_eq!(stored_operation(&service, operation_id), cancelled);
+    assert_eq!(
+        service
+            .cancel(operation_id)
+            .await
+            .expect("repeat cancelled operation"),
+        cancelled
+    );
+    assert_eq!(
+        codex_storage_authority::read_cutover(home.path()).expect("read final intent"),
+        None
+    );
+    assert_eq!(
+        codex_storage_migration::read_plan(home.path()).expect("read final plan"),
+        None
+    );
+    assert!(matches!(
+        codex_storage_authority::authority_state(home.path()),
+        Ok(codex_storage_authority::AuthorityState::Remote(current))
+            if current == remote_authority
+    ));
+    let (reopened, progress_after_cancel) = remote_fence_and_progress(&service, run_id).await;
+    assert!(!reopened.migrating);
+    assert!(!reopened.retired);
+    assert_eq!(reopened.run_id, Some(run_id));
+    assert_eq!(reopened.dataset_id, before.dataset_id);
+    assert_eq!(reopened.generation, before.generation);
+    assert_eq!(progress_after_cancel, progress_before);
+
+    let credentials = keyring(state, None);
+    let resolver = HostCredentialResolver::new(credentials.as_ref());
+    let remote = RemoteStorage::connect(&profile(state, true), &resolver)
+        .await
+        .expect("connect after unretired cancellation");
+    let mut builder = ThreadMetadataBuilder::new(
+        ThreadId::new(),
+        home.path().join("after-cancel.jsonl"),
+        chrono::Utc::now(),
+        SessionSource::Cli,
+    );
+    builder.model_provider = Some("service-provider".to_string());
+    let written = builder.build("service-provider");
+    remote
+        .thread_catalog()
+        .upsert_thread(&written)
+        .await
+        .expect("a new remote write succeeds after cancellation");
+    assert_eq!(
+        remote
+            .thread_catalog()
+            .get_thread(written.id)
+            .await
+            .expect("read new remote write")
+            .as_ref(),
+        Some(&written)
+    );
+    remote.close().await;
+    reset_target(state).await;
+}
+
 #[tokio::test]
 async fn real_postgres_storage_service() {
     let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE") else {
