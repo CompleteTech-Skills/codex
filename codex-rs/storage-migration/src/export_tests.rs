@@ -84,6 +84,12 @@ pub(super) async fn export_phase(
             .await
             .expect("model an open target with no held export");
     }
+    assert!(matches!(
+        exporter
+            .abandon_existing_export_owned(owned_run, source_identity)
+            .await,
+        Err(MigrationError::TargetBusy)
+    ));
     exporter
         .abandon_export_owned(owned_run, source_identity)
         .await

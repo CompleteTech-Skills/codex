@@ -461,7 +461,8 @@ async fn real_postgres_catalog_migration() {
         return;
     };
     let state = Path::new(&state);
-    bootstrap_codex_storage(&*connect(state, "migrator").await)
+    let default_owner_pool = connect(state, "migrator").await;
+    bootstrap_codex_storage(&default_owner_pool)
         .await
         .expect("bootstrap migration schema");
     let default_pool = Arc::new(
@@ -469,7 +470,13 @@ async fn real_postgres_catalog_migration() {
             .await
             .expect("default namespace pool"),
     );
-    scenario(default_pool).await;
+    scenario(
+        default_pool,
+        default_owner_pool,
+        "codex_storage",
+        "codex_owner",
+    )
+    .await;
 
     // The same scenario runs unchanged in a separate named namespace of the same database.
     let namespace = NamedNamespace::new("codex_storage_isolation").expect("named namespace");
@@ -504,10 +511,21 @@ async fn real_postgres_catalog_migration() {
         .await
         .expect("named namespace pool"),
     );
-    scenario(named_pool).await;
+    scenario(
+        named_pool,
+        Arc::new(migrator),
+        namespace.schema(),
+        "codex_isolation_owner",
+    )
+    .await;
 }
 
-async fn scenario(pool: Arc<PostgresPool>) {
+async fn scenario(
+    pool: Arc<PostgresPool>,
+    owner_pool: Arc<PostgresPool>,
+    schema: &str,
+    owner_role: &str,
+) {
     let home = tempfile::tempdir().expect("source home");
     let threads = populate(home.path()).await;
     let config = SqliteConfig::new_for_testing(home.path().abs());
@@ -703,5 +721,14 @@ async fn scenario(pool: Arc<PostgresPool>) {
     super::gate_tests::gate_phase(&pool, &source, threads[0].id).await;
     super::cutover_tests::cutover_phase(&pool, &source, home.path()).await;
     super::export_tests::export_phase(&pool, &source, &threads).await;
-    super::return_tests::return_phase(&pool, &source, home.path(), &threads).await;
+    super::return_tests::return_phase(
+        &pool,
+        &owner_pool,
+        schema,
+        owner_role,
+        &source,
+        home.path(),
+        &threads,
+    )
+    .await;
 }

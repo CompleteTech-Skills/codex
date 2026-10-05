@@ -425,6 +425,94 @@ impl Migrator {
             .await
     }
 
+    /// Reopen an existing export owned by this source identity. Unlike
+    /// [`Migrator::abandon_export_owned`], a missing run is never treated as an unstarted export.
+    /// A retry accepts only this exact run's open, abandoned receipt; a later fence is foreign.
+    pub async fn abandon_existing_export_owned(
+        &self,
+        run_id: Uuid,
+        expected: ActivationTarget,
+    ) -> Result<(), MigrationError> {
+        let fingerprint = self.source.fingerprint().await.map_err(source)?;
+        let mut connection = self.connection().await?;
+        let mut tx = connection.begin().await.map_err(target)?;
+        let activation = sqlx::query(
+            "SELECT state, run_id, generation, dataset_id FROM storage_activation WHERE singleton FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(target)?;
+        let state: String = activation.try_get("state").map_err(target)?;
+        let held: Option<Uuid> = activation.try_get("run_id").map_err(target)?;
+        let generation: i64 = activation.try_get("generation").map_err(target)?;
+        let dataset: Option<String> = activation.try_get("dataset_id").map_err(target)?;
+        if generation != expected.generation
+            || dataset.as_deref() != Some(expected.dataset_id.to_string().as_str())
+        {
+            return Err(MigrationError::TargetBusy);
+        }
+        let run = sqlx::query(
+            "SELECT direction, source_fingerprint, state FROM storage_migration_runs WHERE run_id = $1 FOR UPDATE",
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(target)?
+        .ok_or(MigrationError::TargetBusy)?;
+        if run.try_get::<String, _>("direction").map_err(target)? != "export"
+            || run
+                .try_get::<String, _>("source_fingerprint")
+                .map_err(target)?
+                != fingerprint
+        {
+            return Err(MigrationError::TargetBusy);
+        }
+        let run_state: String = run.try_get("state").map_err(target)?;
+        if run_state == "abandoned" {
+            if state == "open" && held == Some(run_id) {
+                tx.commit().await.map_err(target)?;
+                return Ok(());
+            }
+            return Err(MigrationError::TargetBusy);
+        }
+        if state != "migrating"
+            || held != Some(run_id)
+            || !matches!(run_state.as_str(), "running" | "verified")
+        {
+            return Err(MigrationError::TargetBusy);
+        }
+
+        let now = chrono::Utc::now().timestamp_millis();
+        let abandoned = sqlx::query(
+            "UPDATE storage_migration_runs SET state = 'abandoned', updated_at_ms = $2 \
+             WHERE run_id = $1 AND direction = 'export' AND source_fingerprint = $3 \
+             AND state IN ('running', 'verified')",
+        )
+        .bind(run_id)
+        .bind(now)
+        .bind(&fingerprint)
+        .execute(&mut *tx)
+        .await
+        .map_err(target)?;
+        let reopened = sqlx::query(
+            "UPDATE storage_activation SET state = 'open', updated_at_ms = $2 \
+             WHERE singleton AND state = 'migrating' AND run_id = $1 \
+             AND generation = $3 AND dataset_id = $4",
+        )
+        .bind(run_id)
+        .bind(now)
+        .bind(expected.generation)
+        .bind(expected.dataset_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(target)?;
+        if abandoned.rows_affected() != 1 || reopened.rows_affected() != 1 {
+            return Err(MigrationError::TargetBusy);
+        }
+        tx.commit().await.map_err(target)?;
+        Ok(())
+    }
+
     /// Abandon the exact export before removing its local recovery markers. Cancellation leaves
     /// the already-authoritative remote dataset in place, so its durable SQL transition must
     /// precede local cleanup.

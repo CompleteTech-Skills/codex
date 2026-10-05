@@ -23,6 +23,7 @@ use codex_storage_authority::load_authority;
 use codex_storage_authority::read_cutover;
 use codex_thread_store::QueueStore;
 use codex_utils_absolute_path::test_support::PathExt;
+use sqlx::Acquire;
 use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -33,6 +34,138 @@ const CONTROL_FILES: [&str; 4] = [
     "storage-cutover.json",
     "storage-install.json",
 ];
+
+struct ForeignOwnerFaultObjects {
+    schema: String,
+    owner_role: String,
+    function: String,
+    trigger: String,
+}
+
+struct ReturnTestFixture<'a> {
+    pool: &'a Arc<PostgresPool>,
+    owner_pool: &'a Arc<PostgresPool>,
+    schema: &'a str,
+    owner_role: &'a str,
+    source: &'a SqliteSource,
+    home: &'a Path,
+    threads: &'a [ThreadMetadata],
+}
+
+struct PreparedReturn {
+    returning: ReturnCutover,
+    run_id: Uuid,
+    staged_home: PathBuf,
+    intent: codex_storage_authority::CutoverIntent,
+    plan: InstallPlan,
+    intent_bytes: Vec<u8>,
+    plan_bytes: Vec<u8>,
+}
+
+fn quote_test_identifier(identifier: &str) -> String {
+    assert!(
+        !identifier.is_empty()
+            && identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+        "test SQL identifier must be a lowercase ASCII identifier"
+    );
+    format!("\"{identifier}\"")
+}
+
+async fn owner_ddl(
+    owner_pool: &Arc<PostgresPool>,
+    schema: &str,
+    owner_role: &str,
+    statements: &[String],
+) {
+    let quoted_schema = quote_test_identifier(schema);
+    let quoted_owner = quote_test_identifier(owner_role);
+    let mut connection = owner_pool.acquire().await.expect("owner connection");
+    let mut transaction = connection.begin().await.expect("owner transaction");
+    for statement in [
+        format!("SET LOCAL ROLE {quoted_owner}"),
+        format!("SET LOCAL search_path TO pg_catalog, {quoted_schema}"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement.clone()))
+            .execute(&mut *transaction)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    let current_user: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(&mut *transaction)
+        .await
+        .expect("scoped owner role");
+    assert_eq!(
+        current_user, owner_role,
+        "test DDL uses the namespace owner"
+    );
+    let resolved_schema: Option<String> = sqlx::query_scalar(
+        "SELECT n.nspname FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE c.oid = to_regclass('storage_migration_runs')",
+    )
+    .fetch_optional(&mut *transaction)
+    .await
+    .expect("resolve the migration table through the scoped search_path");
+    assert_eq!(
+        resolved_schema.as_deref(),
+        Some(schema),
+        "test DDL search_path resolves to the selected owned namespace"
+    );
+    for statement in statements {
+        sqlx::query(sqlx::AssertSqlSafe(statement.clone()))
+            .execute(&mut *transaction)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    transaction.commit().await.expect("owner DDL commit");
+}
+
+async fn install_foreign_owner_fault(
+    owner_pool: &Arc<PostgresPool>,
+    schema: &str,
+    owner_role: &str,
+    run_id: Uuid,
+    foreign_run_id: Uuid,
+) -> ForeignOwnerFaultObjects {
+    let token = Uuid::new_v4().simple().to_string();
+    let function = format!("rfo_fn_{token}");
+    let trigger = format!("rfo_tr_{token}");
+    let quoted_schema = quote_test_identifier(schema);
+    let quoted_function = quote_test_identifier(&function);
+    let quoted_trigger = quote_test_identifier(&trigger);
+    let function_sql = format!(
+        "CREATE FUNCTION {quoted_schema}.{quoted_function}() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN IF OLD.run_id = '{run_id}'::uuid AND OLD.state = 'migrating' AND NEW.state = 'open' THEN NEW.run_id := '{foreign_run_id}'::uuid; END IF; RETURN NEW; END $body$"
+    );
+    let trigger_sql = format!(
+        "CREATE TRIGGER {quoted_trigger} BEFORE UPDATE OF state ON {quoted_schema}.\"storage_activation\" FOR EACH ROW EXECUTE FUNCTION {quoted_schema}.{quoted_function}()"
+    );
+    owner_ddl(owner_pool, schema, owner_role, &[function_sql, trigger_sql]).await;
+    ForeignOwnerFaultObjects {
+        schema: schema.to_string(),
+        owner_role: owner_role.to_string(),
+        function,
+        trigger,
+    }
+}
+
+async fn remove_foreign_owner_fault(
+    owner_pool: &Arc<PostgresPool>,
+    objects: &ForeignOwnerFaultObjects,
+) {
+    let quoted_schema = quote_test_identifier(&objects.schema);
+    let quoted_function = quote_test_identifier(&objects.function);
+    let quoted_trigger = quote_test_identifier(&objects.trigger);
+    owner_ddl(
+        owner_pool,
+        &objects.schema,
+        &objects.owner_role,
+        &[
+            format!("DROP TRIGGER {quoted_trigger} ON {quoted_schema}.\"storage_activation\""),
+            format!("DROP FUNCTION {quoted_schema}.{quoted_function}()"),
+        ],
+    )
+    .await;
+}
 
 /// Put the home and the store in the state a finished forward cutover leaves them in.
 async fn remote_authority(pool: &Arc<PostgresPool>, source: &SqliteSource, home: &Path) {
@@ -402,12 +535,232 @@ async fn completed_finish_is_repeatable(
     assert!(staged_home.exists());
 }
 
+async fn prepare_remote_return(fixture: &ReturnTestFixture<'_>, name: &str) -> PreparedReturn {
+    remote_authority(fixture.pool, fixture.source, fixture.home).await;
+    let (returning, run_id, staged_home) =
+        staged_return(fixture.pool, fixture.home, name, true).await;
+    let intent = returning.prepare(run_id).expect("prepare return");
+    let plan = install::read_plan(fixture.home)
+        .expect("read install plan")
+        .expect("install plan exists");
+    let intent_bytes =
+        std::fs::read(fixture.home.join("storage-cutover.json")).expect("cutover intent bytes");
+    let plan_bytes =
+        std::fs::read(fixture.home.join("storage-install.json")).expect("install plan bytes");
+    PreparedReturn {
+        returning,
+        run_id,
+        staged_home,
+        intent,
+        plan,
+        intent_bytes,
+        plan_bytes,
+    }
+}
+
+async fn assert_remote_open(fixture: &ReturnTestFixture<'_>, run_id: Uuid, message: &str) {
+    let authority = load_authority(fixture.home).expect("remote authority");
+    assert_eq!(authority.marker.active_backend, ActiveBackend::Remote);
+    let state = dataset_state(fixture.pool, fixture.source).await;
+    assert!(!state.migrating && !state.retired);
+    assert_eq!(state.run_id, Some(run_id));
+    assert_eq!(
+        state.generation,
+        i64::try_from(authority.identity.generation).expect("remote generation")
+    );
+    assert_eq!(state.dataset_id, Some(authority.identity.dataset_id));
+    PostgresQueueStore::new(fixture.pool.clone())
+        .enqueue(fixture.threads[0].id, message.to_string())
+        .await
+        .expect("remote writes resume after return recovery");
+}
+
+async fn plan_only_remote_is_preserved_until_exact_recovery(fixture: &ReturnTestFixture<'_>) {
+    let prepared = prepare_remote_return(fixture, "plan-only").await;
+    let generation = i64::try_from(prepared.intent.from_generation).expect("source generation");
+    let staged_source =
+        SqliteSource::new(SqliteConfig::new_for_testing(prepared.staged_home.abs()))
+            .relocated_from(fixture.home.to_path_buf());
+    let cleanup = Migrator::new(staged_source, fixture.pool.clone())
+        .abandon_export_after(
+            prepared.run_id,
+            ActivationTarget {
+                dataset_id: prepared.intent.dataset_id,
+                generation,
+            },
+            false,
+            || {
+                codex_storage_authority::abandon_cutover(fixture.home, &prepared.intent)
+                    .map_err(|error| MigrationError::Staging(error.to_string()))?;
+                Err(MigrationError::Staging(
+                    "injected install-plan cleanup failure".to_string(),
+                ))
+            },
+        )
+        .await;
+    assert!(matches!(cleanup, Err(MigrationError::Staging(_))));
+
+    assert_eq!(read_cutover(fixture.home).expect("intent"), None);
+    assert!(prepared.staged_home.exists());
+    assert!(!prepared.plan.backup_dir.exists());
+    assert!(matches!(
+        prepared.returning.recover().await,
+        Err(CutoverError::Conflict)
+    ));
+    assert!(matches!(
+        prepared.returning.abort().await,
+        Err(CutoverError::Conflict)
+    ));
+    assert_eq!(
+        std::fs::read(fixture.home.join("storage-install.json")).expect("plan bytes retained"),
+        prepared.plan_bytes
+    );
+    assert_eq!(
+        install::read_plan(fixture.home).expect("plan"),
+        Some(prepared.plan.clone())
+    );
+    assert!(prepared.staged_home.exists());
+    assert!(!prepared.plan.backup_dir.exists());
+    assert_remote_open(fixture, prepared.run_id, "write after plan-only refusal").await;
+}
+
+async fn intent_only_remote_recovery(fixture: &ReturnTestFixture<'_>) {
+    let prepared = prepare_remote_return(fixture, "intent-only").await;
+    install::discard_plan(fixture.home).expect("simulate a missing plan before local installation");
+    assert!(read_cutover(fixture.home).expect("intent").is_some());
+    assert_eq!(install::read_plan(fixture.home).expect("plan"), None);
+
+    assert!(matches!(
+        prepared.returning.recover().await,
+        Ok(RecoveryOutcome::RolledBack)
+    ));
+    assert_eq!(read_cutover(fixture.home).expect("intent"), None);
+    assert_eq!(install::read_plan(fixture.home).expect("plan"), None);
+    assert_remote_open(fixture, prepared.run_id, "write after intent-only recovery").await;
+}
+
+async fn retired_intent_without_plan_is_refused(fixture: &ReturnTestFixture<'_>) {
+    let prepared = prepare_remote_return(fixture, "retired-intent-only").await;
+    prepared
+        .returning
+        .publish(&prepared.intent)
+        .await
+        .expect("retire exact export");
+    install::discard_plan(fixture.home).expect("simulate missing install plan");
+
+    assert!(matches!(
+        prepared.returning.recover().await,
+        Err(CutoverError::Conflict)
+    ));
+    assert_eq!(
+        std::fs::read(fixture.home.join("storage-cutover.json")).expect("intent retained"),
+        prepared.intent_bytes
+    );
+    assert_eq!(install::read_plan(fixture.home).expect("plan"), None);
+    assert_eq!(
+        codex_storage_authority::authority_state(fixture.home).expect("cutover state"),
+        codex_storage_authority::AuthorityState::CutoverInProgress(prepared.intent.clone())
+    );
+    assert!(dataset_state(fixture.pool, fixture.source).await.retired);
+    assert!(prepared.staged_home.exists());
+
+    std::fs::write(
+        fixture.home.join("storage-install.json"),
+        &prepared.plan_bytes,
+    )
+    .expect("restore exact install plan");
+    assert!(matches!(
+        prepared.returning.recover().await,
+        Ok(RecoveryOutcome::RolledForward { generation: 3 })
+    ));
+    assert_eq!(read_cutover(fixture.home).expect("intent"), None);
+    assert_eq!(install::read_plan(fixture.home).expect("plan"), None);
+    assert_eq!(backend(fixture.home), ActiveBackend::Local);
+}
+
+async fn second_lock_foreign_owner_refusal(fixture: &ReturnTestFixture<'_>) {
+    let prepared = prepare_remote_return(fixture, "second-lock-owner").await;
+    let foreign_run_id = Uuid::new_v4();
+    let objects = install_foreign_owner_fault(
+        fixture.owner_pool,
+        fixture.schema,
+        fixture.owner_role,
+        prepared.run_id,
+        foreign_run_id,
+    )
+    .await;
+    let recovery = prepared.returning.recover().await;
+    remove_foreign_owner_fault(fixture.owner_pool, &objects).await;
+    eprintln!(
+        "fault_kind=second-lock-foreign-owner original_run={} substituted_run={} recovery_result={recovery:?}",
+        prepared.run_id, foreign_run_id
+    );
+
+    assert!(matches!(
+        recovery,
+        Err(CutoverError::Destination(MigrationError::TargetBusy))
+    ));
+    assert_eq!(
+        std::fs::read(fixture.home.join("storage-cutover.json")).expect("intent remains"),
+        prepared.intent_bytes
+    );
+    assert_eq!(
+        std::fs::read(fixture.home.join("storage-install.json")).expect("plan remains"),
+        prepared.plan_bytes
+    );
+    let substituted = dataset_state(fixture.pool, fixture.source).await;
+    assert!(!substituted.migrating && !substituted.retired);
+    assert_eq!(substituted.run_id, Some(foreign_run_id));
+
+    let quoted_schema = quote_test_identifier(fixture.schema);
+    owner_ddl(
+        fixture.owner_pool,
+        fixture.schema,
+        fixture.owner_role,
+        &[
+            format!(
+                "UPDATE {quoted_schema}.\"storage_migration_runs\" SET state = 'verified' WHERE run_id = '{}'::uuid",
+                prepared.run_id
+            ),
+            format!(
+                "UPDATE {quoted_schema}.\"storage_activation\" SET state = 'migrating', run_id = '{}'::uuid WHERE singleton",
+                prepared.run_id
+            ),
+        ],
+    )
+    .await;
+    assert!(matches!(
+        prepared.returning.recover().await,
+        Ok(RecoveryOutcome::RolledBack)
+    ));
+    assert_eq!(read_cutover(fixture.home).expect("intent"), None);
+    assert_eq!(install::read_plan(fixture.home).expect("plan"), None);
+    assert_remote_open(
+        fixture,
+        prepared.run_id,
+        "write after ownership revalidation",
+    )
+    .await;
+}
+
 pub(super) async fn return_phase(
     pool: &Arc<PostgresPool>,
+    owner_pool: &Arc<PostgresPool>,
+    schema: &str,
+    owner_role: &str,
     source: &SqliteSource,
     home: &Path,
     threads: &[ThreadMetadata],
 ) {
+    let fixture = ReturnTestFixture {
+        pool,
+        owner_pool,
+        schema,
+        owner_role,
+        source,
+        home,
+        threads,
+    };
     // Writes made while PostgreSQL was authoritative must come back with the return.
     remote_authority(pool, source, home).await;
     let remote_only = metadata(700, Utc::now(), SessionSource::Cli);
@@ -574,8 +927,6 @@ pub(super) async fn return_phase(
     assert_eq!(backend(home), ActiveBackend::Remote);
     assert!(!dataset_state(pool, source).await.migrating);
 
-    // An export that was never verified cannot retire the dataset, and the refusal undoes the
-    // intent.
     remote_authority(pool, source, home).await;
     let (returning, run_id, _) = staged_return(pool, home, "unverified", false).await;
     let refused = returning.execute(run_id).await;
@@ -586,8 +937,26 @@ pub(super) async fn return_phase(
         ),
         "{refused:?}"
     );
+    let refused_intent = read_cutover(home)
+        .expect("intent")
+        .expect("failed activation keeps its intent");
+    assert!(install::read_plan(home).expect("plan").is_some());
+    assert_eq!(
+        codex_storage_authority::authority_state(home).expect("cutover state"),
+        codex_storage_authority::AuthorityState::CutoverInProgress(refused_intent)
+    );
+    assert!(matches!(
+        returning.recover().await,
+        Ok(RecoveryOutcome::RolledBack)
+    ));
     assert_eq!(read_cutover(home).expect("intent"), None);
+    assert_eq!(install::read_plan(home).expect("plan"), None);
     assert_eq!(backend(home), ActiveBackend::Remote);
     completed_finish_is_repeatable(pool, source, home).await;
+
+    plan_only_remote_is_preserved_until_exact_recovery(&fixture).await;
+    intent_only_remote_recovery(&fixture).await;
+    retired_intent_without_plan_is_refused(&fixture).await;
+    second_lock_foreign_owner_refusal(&fixture).await;
     reset_target(pool).await;
 }
