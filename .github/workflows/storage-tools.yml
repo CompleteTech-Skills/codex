@@ -266,6 +266,22 @@ jobs:
           sql(Path(os.environ["CODEX_TEST_POSTGRES_STATE"]), "TRUNCATE codex_storage.project_idempotency_keys, codex_storage.queued_thread_revisions, codex_storage.agent_board_deleted, codex_storage.external_agent_config_imports, codex_storage.threads, codex_storage.projects CASCADE")
           PY
           CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-storage-service real_postgres_storage_service
+      - name: Require public service journal settlement after Local finish failure
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CODEX_TEST_POSTGRES_STATE:?owned service fixture state is required}"
+          export CODEX_TEST_RETURN_FINISH_MOUNT_PARENT="$(readlink /proc/self/ns/mnt)"
+          timeout --signal=TERM --kill-after=10s 10m \
+            unshare --user --map-root-user --mount --propagation private --fork \
+            setpriv --bounding-set=-dac_override,-dac_read_search,-fowner \
+            env CODEX_TEST_POSTGRES_REQUIRED=1 \
+                CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE="$CODEX_TEST_POSTGRES_STATE" \
+                CODEX_TEST_RETURN_FINISH_MOUNT_REQUIRED=1 \
+            just test --locked -p codex-storage-service --run-ignored only \
+              -E 'test(=tests::finish_journal_control::real_postgres_storage_service_return_finish_journal)' \
+              --retries 0 --test-threads 1 --success-output=final
       - name: Serve threads from PostgreSQL through a real app-server
         working-directory: codex-rs
         run: |

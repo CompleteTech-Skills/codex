@@ -938,3 +938,464 @@ fn unknown_target_emptiness_still_blocks_migration() {
     assert!(!plan.is_startable());
     assert_eq!(plan.blockers, vec![BlockerCode::TargetNotEmpty]);
 }
+
+mod finish_journal_control {
+    use super::*;
+    use codex_storage_authority::ActiveBackend;
+    use codex_storage_authority::load_authority;
+    use codex_storage_authority::read_cutover;
+    use codex_storage_migration::InstallPlan;
+    use codex_storage_migration::read_plan;
+    use codex_storage_migration::verify_backup;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+
+    type Files = BTreeMap<PathBuf, (bool, Vec<u8>)>;
+    const SQL: &str = "SELECT jsonb_build_object('activation', (SELECT to_jsonb(a) FROM storage_activation a WHERE singleton), 'runs', (SELECT jsonb_agg(to_jsonb(r) ORDER BY run_id) FROM storage_migration_runs r), 'domains', (SELECT jsonb_agg(to_jsonb(d) ORDER BY run_id, domain) FROM storage_migration_domains d))::text";
+
+    async fn bounded<F: std::future::Future>(future: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .expect("bounded service finish control")
+    }
+
+    async fn sql(connection: &mut sqlx::PgConnection) -> serde_json::Value {
+        bounded(async {
+            let mut tx = sqlx::Connection::begin(connection).await.unwrap();
+            for statement in [
+                "SET LOCAL ROLE codex_owner",
+                "SET LOCAL search_path TO codex_storage, pg_catalog",
+                "SET LOCAL statement_timeout = '5s'",
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            let text: String = sqlx::query_scalar(SQL).fetch_one(&mut *tx).await.unwrap();
+            tx.commit().await.unwrap();
+            serde_json::from_str(&text).unwrap()
+        })
+        .await
+    }
+
+    fn files(home: &Path) -> Files {
+        return_files(home)
+            .into_iter()
+            .map(|(p, d, b)| (p, (d, b)))
+            .collect()
+    }
+
+    fn stable(mut all: Files, home: &Path, id: Uuid) -> Files {
+        for name in [
+            "storage-identity.json",
+            "storage-activation.json",
+            "storage-cutover.json",
+        ] {
+            all.remove(&home.join(name));
+        }
+        all.remove(&home.join("storage-operations").join(format!("{id}.json")));
+        all
+    }
+
+    fn installed(before: Files, home: &Path, id: Uuid, plan: &InstallPlan) -> Files {
+        let mut expected = Files::new();
+        for (path, value) in stable(before.clone(), home, id) {
+            let mut destination = path.clone();
+            for unit in &plan.units {
+                let live = home.join(&unit.name);
+                let staged = plan.staged_home.join(&unit.name);
+                if !unit.backup_only && path.starts_with(&staged) {
+                    destination = live.join(path.strip_prefix(&staged).unwrap());
+                } else if path.starts_with(&live)
+                    && (unit.backup_only || before.contains_key(&staged))
+                {
+                    destination = plan
+                        .backup_dir
+                        .join(&unit.name)
+                        .join(path.strip_prefix(&live).unwrap());
+                }
+            }
+            assert!(
+                expected.insert(destination, value).is_none(),
+                "unique swap path"
+            );
+        }
+        expected.insert(home.join("storage-backups"), (true, Vec::new()));
+        expected.insert(plan.backup_dir.clone(), (true, Vec::new()));
+        expected.insert(
+            plan.backup_dir.join("manifest.json"),
+            (false, serde_json::to_vec_pretty(plan).unwrap()),
+        );
+        expected
+    }
+
+    #[cfg(target_os = "linux")]
+    struct PlanMount(PathBuf);
+    #[cfg(target_os = "linux")]
+    impl Drop for PlanMount {
+        fn drop(&mut self) {
+            let ok = std::process::Command::new("umount")
+                .arg(&self.0)
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(
+                ok || std::thread::panicking(),
+                "release only owned plan mount"
+            );
+        }
+    }
+
+    fn fault(control: &Path) -> Box<dyn std::any::Any> {
+        assert!(control.is_absolute() && fs::symlink_metadata(control).unwrap().is_file());
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                std::env::var("CODEX_TEST_RETURN_FINISH_MOUNT_REQUIRED").as_deref(),
+                Ok("1")
+            );
+            let parent = std::env::var("CODEX_TEST_RETURN_FINISH_MOUNT_PARENT")
+                .expect("actual mount parent");
+            assert!(!parent.trim().is_empty());
+            assert_ne!(
+                fs::read_link("/proc/self/ns/mnt").unwrap(),
+                PathBuf::from(parent)
+            );
+            let mapping = fs::read_to_string("/proc/self/uid_map").unwrap();
+            let ids: Vec<_> = mapping.split_whitespace().collect();
+            assert!(matches!(ids.as_slice(), ["0", _, "1"]));
+            let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap();
+            assert!(!mounts.contains(" shared:") && !mounts.contains(" master:"));
+            let status = fs::read_to_string("/proc/self/status").unwrap();
+            let caps = status
+                .lines()
+                .find_map(|l| l.strip_prefix("CapBnd:"))
+                .unwrap();
+            assert_eq!(u64::from_str_radix(caps.trim(), 16).unwrap() & 0xe, 0);
+            assert!(
+                std::process::Command::new("mount")
+                    .arg("--bind")
+                    .arg(control)
+                    .arg(control)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            Box::new(PlanMount(control.to_path_buf()))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            Box::new(
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0x1 | 0x2)
+                    .open(control)
+                    .unwrap(),
+            )
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            panic!("unsupported required service finish fault platform");
+        }
+    }
+
+    fn run(sql: &serde_json::Value, id: Uuid) -> serde_json::Value {
+        sql["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["run_id"].as_str() == Some(id.to_string().as_str()))
+            .unwrap()
+            .clone()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires owned real PostgreSQL and a native plan-unlink fault"]
+    async fn real_postgres_storage_service_return_finish_journal() {
+        tokio::time::timeout(Duration::from_secs(50), scenario())
+            .await
+            .expect("whole service finish bound");
+    }
+
+    async fn scenario() {
+        assert_eq!(
+            std::env::var("CODEX_TEST_POSTGRES_REQUIRED").as_deref(),
+            Ok("1")
+        );
+        let state = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE")
+            .expect("required private fixture");
+        assert!(!state.trim().is_empty());
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                std::env::var("CODEX_TEST_RETURN_FINISH_MOUNT_REQUIRED").as_deref(),
+                Ok("1")
+            );
+        }
+        let (home, svc, ready, (plan_id, prepared)) =
+            bounded(ready_return(Path::new(&state))).await;
+        let home = home.path();
+        let (id, run_id) = (ready.operation_id, ready.run_id.unwrap());
+        let staged = home.join("storage-staging").join(id.to_string());
+        let owner_path = home.join("storage-operations").join(format!("{id}.json"));
+        let control = home.join("storage-install.json");
+        let remote = load_authority(home).unwrap();
+        assert_eq!(remote.marker.active_backend, ActiveBackend::Remote);
+        assert_eq!(read_cutover(home).unwrap(), None);
+        assert_eq!(read_plan(home).unwrap(), None);
+        let stage_before = return_files(&staged);
+        // A synthetic foreign journal sentinel tests filtering, never the causal handoff.
+        let mut foreign = ready.clone();
+        foreign.operation_id = Uuid::new_v4();
+        foreign.run_id = Some(Uuid::new_v4());
+        foreign.state = OperationState::Committing;
+        svc.journal.create(&foreign).unwrap();
+        let others = || {
+            svc.operations()
+                .into_iter()
+                .filter(|r| r.operation_id != id)
+                .collect::<Vec<_>>()
+        };
+        let journals_before = others();
+        let pool = bounded(fixture_pool(Path::new(&state))).await;
+        let mut locker = bounded(pool.acquire()).await.unwrap();
+        let mut observer = bounded(pool.acquire()).await.unwrap();
+        let sql_before = sql(&mut observer).await;
+        assert_eq!(run(&sql_before, run_id)["state"], "verified");
+        assert_eq!(run(&sql_before, run_id)["direction"], "export");
+        assert!(
+            !run(&sql_before, run_id)["source_fingerprint"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(sql_before["activation"]["state"], "migrating");
+        assert_eq!(sql_before["activation"]["run_id"], run_id.to_string());
+        assert_eq!(
+            sql_before["activation"]["dataset_id"],
+            remote.identity.dataset_id.to_string()
+        );
+        assert_eq!(
+            sql_before["activation"]["generation"].as_u64(),
+            Some(remote.identity.generation)
+        );
+        let mut tx = bounded(sqlx::Acquire::begin(&mut *locker)).await.unwrap();
+        for statement in [
+            "SET LOCAL ROLE codex_owner",
+            "SET LOCAL search_path TO codex_storage, pg_catalog",
+            "SET LOCAL statement_timeout = '5s'",
+        ] {
+            bounded(sqlx::query(sqlx::AssertSqlSafe(statement)).execute(&mut *tx))
+                .await
+                .unwrap();
+        }
+        let pid: i32 = bounded(sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *tx))
+            .await
+            .unwrap();
+        let locked: (Uuid, String, String) = bounded(sqlx::query_as("SELECT run_id, direction, state FROM storage_migration_runs WHERE run_id=$1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx)).await.unwrap();
+        assert_eq!(locked, (run_id, "export".to_owned(), "verified".to_owned()));
+        let inject = async {
+            bounded(async {
+                loop {
+                    let blocked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_locks l WHERE NOT l.granted AND l.pid <> pg_backend_pid() AND l.pid <> $1 AND $1 = ANY(pg_blocking_pids(l.pid)) AND (l.database IS NULL OR l.database = (SELECT oid FROM pg_database WHERE datname = current_database())))")
+                        .bind(pid).fetch_one(&mut *observer).await.unwrap();
+                    if blocked { break; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await;
+            let intent = read_cutover(home)
+                .unwrap()
+                .expect("public prepare before retire wait");
+            let plan = read_plan(home).unwrap().expect("public owned plan");
+            assert_eq!(intent.run_id, run_id);
+            assert_eq!(intent.target, ActiveBackend::Local);
+            assert_eq!(intent.dataset_id, remote.identity.dataset_id);
+            assert_eq!(intent.from_generation, remote.identity.generation);
+            assert_eq!(
+                intent.to_generation,
+                intent.from_generation.checked_add(1).unwrap()
+            );
+            assert_eq!(intent.format_version, remote.identity.format_version);
+            assert_eq!(plan.run_id, run_id);
+            assert!(!plan.units.is_empty());
+            assert_eq!(plan.staged_home, staged);
+            assert_eq!(
+                plan.backup_dir,
+                home.join("storage-backups")
+                    .join(format!("{run_id}-before-return"))
+            );
+            assert!(!plan.backup_dir.exists());
+            assert_eq!(load_authority(home).unwrap(), remote);
+            assert_eq!(return_files(&staged), stage_before);
+            assert_eq!(sql(&mut observer).await, sql_before);
+            let committing = svc.operation(id).unwrap();
+            let mut expected = ready.clone();
+            expected.state = OperationState::Committing;
+            expected.updated_at_ms = committing.updated_at_ms;
+            assert_eq!(committing, expected);
+            assert_eq!(others(), journals_before);
+            let before = files(home);
+            let plan_bytes = fs::read(&control).unwrap();
+            let held = fault(&control);
+            assert_eq!(fs::read(&control).unwrap(), plan_bytes);
+            assert_eq!(
+                fs::remove_file(&control)
+                    .expect_err("mandatory native unlink refusal")
+                    .raw_os_error(),
+                Some(if cfg!(windows) { 32 } else { 16 })
+            );
+            bounded(tx.commit()).await.unwrap();
+            (held, intent, plan, plan_bytes, before)
+        };
+        let (result, (held, intent, plan, plan_bytes, before)) =
+            tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::join!(svc.activate(id), inject)
+            })
+            .await
+            .expect("activate/inject join");
+        drop(locker);
+        // Prove the phase before expecting the new journal/error policy on BEFORE or AFTER.
+        let local = load_authority(home).unwrap();
+        let mut expected_local = remote;
+        expected_local.identity.generation = intent.to_generation;
+        expected_local.marker.generation = intent.to_generation;
+        expected_local.marker.active_backend = ActiveBackend::Local;
+        assert_eq!(local, expected_local);
+        assert_eq!(read_cutover(home).unwrap(), None);
+        assert_eq!(read_plan(home).unwrap(), Some(plan.clone()));
+        assert_eq!(fs::read(&control).unwrap(), plan_bytes);
+        for path in [
+            home.join("storage-backups"),
+            plan.backup_dir.clone(),
+            plan.backup_dir.join("manifest.json"),
+        ] {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            assert_eq!(
+                metadata.is_dir(),
+                path.file_name().unwrap() != "manifest.json"
+            );
+        }
+        assert!(verify_backup(&plan).unwrap());
+        assert_eq!(
+            stable(files(home), home, id),
+            installed(before, home, id, &plan)
+        );
+        let retired = sql(&mut observer).await;
+        assert_eq!(retired["activation"]["state"], "retired");
+        assert_eq!(retired["activation"]["run_id"], run_id.to_string());
+        assert_eq!(
+            retired["activation"]["dataset_id"],
+            intent.dataset_id.to_string()
+        );
+        assert_eq!(
+            retired["activation"]["generation"].as_u64(),
+            Some(intent.to_generation)
+        );
+        assert_eq!(run(&retired, run_id)["state"], "activated");
+        assert_eq!(
+            retired["activation"]["activated_at_ms"],
+            run(&retired, run_id)["updated_at_ms"]
+        );
+        assert_eq!(
+            retired["activation"]["updated_at_ms"],
+            run(&retired, run_id)["updated_at_ms"]
+        );
+        assert_eq!(retired["domains"], sql_before["domains"]);
+        let unchanged = |mut value: serde_json::Value, fields: &[&str]| {
+            for field in fields {
+                value.as_object_mut().unwrap().remove(*field);
+            }
+            value
+        };
+        assert_eq!(
+            unchanged(
+                retired["activation"].clone(),
+                &["state", "generation", "activated_at_ms", "updated_at_ms"]
+            ),
+            unchanged(
+                sql_before["activation"].clone(),
+                &["state", "generation", "activated_at_ms", "updated_at_ms"]
+            )
+        );
+        assert_eq!(
+            unchanged(run(&retired, run_id), &["state", "updated_at_ms"]),
+            unchanged(run(&sql_before, run_id), &["state", "updated_at_ms"])
+        );
+        let other_runs = |value: &serde_json::Value| {
+            value["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["run_id"] != run_id.to_string())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(other_runs(&retired), other_runs(&sql_before));
+        assert_eq!(others(), journals_before);
+        eprintln!("service-return-finish-local-observed operation={id} run={run_id}");
+        let committing = svc.operation(id).unwrap();
+        assert_eq!(committing.state, OperationState::Committing);
+        assert_eq!(committing.blocker, Some(BlockerCode::CutoverInProgress));
+        let mut expected = ready.clone();
+        expected.state = committing.state;
+        expected.blocker = committing.blocker;
+        expected.updated_at_ms = committing.updated_at_ms;
+        assert_eq!(committing, expected);
+        assert!(committing.updated_at_ms >= ready.updated_at_ms);
+        assert_eq!(result, Err(StorageError(BlockerCode::CutoverInProgress)));
+        let retained = files(home);
+        assert_eq!(
+            serde_json::from_slice::<OperationRecord>(&fs::read(&owner_path).unwrap()).unwrap(),
+            committing
+        );
+        assert_eq!(
+            bounded(svc.run_return(prepared)).await,
+            Err(StorageError(BlockerCode::OperationConflict))
+        );
+        assert_eq!(files(home), retained);
+        assert_eq!(sql(&mut observer).await, retired);
+        assert_eq!(
+            bounded(svc.start_return(id, plan_id, CONFIRMED))
+                .await
+                .unwrap(),
+            committing
+        );
+        assert_eq!(files(home), retained);
+        assert_eq!(sql(&mut observer).await, retired);
+        assert_eq!(
+            bounded(svc.recover()).await,
+            Err(StorageError(BlockerCode::AuthorityInvalid))
+        );
+        assert_eq!(svc.operation(id).unwrap(), committing);
+        assert_eq!(files(home), retained);
+        assert_eq!(sql(&mut observer).await, retired);
+        drop(held);
+        let recovered = bounded(svc.recover()).await.unwrap();
+        let active = svc.operation(id).unwrap();
+        assert_eq!(recovered.outcome, RecoveryKind::RolledForward);
+        assert_eq!(recovered.operations, vec![active.clone()]);
+        expected.state = OperationState::Active;
+        expected.blocker = None;
+        expected.updated_at_ms = active.updated_at_ms;
+        assert_eq!(active, expected);
+        assert!(active.updated_at_ms >= committing.updated_at_ms);
+        assert_eq!(others(), journals_before);
+        assert_eq!(load_authority(home).unwrap(), local);
+        assert_eq!(read_cutover(home).unwrap(), None);
+        assert_eq!(read_plan(home).unwrap(), None);
+        assert!(verify_backup(&plan).unwrap());
+        assert_eq!(sql(&mut observer).await, retired);
+        let mut remaining = stable(retained, home, id);
+        remaining.remove(&control);
+        assert_eq!(stable(files(home), home, id), remaining);
+        let settled = files(home);
+        assert_eq!(bounded(svc.cancel(id)).await.unwrap(), active);
+        assert_eq!(files(home), settled);
+        assert_eq!(sql(&mut observer).await, retired);
+        drop(observer);
+        bounded(pool.close()).await.unwrap();
+        eprintln!("service-return-finish-journal-qualified operation={id} run={run_id}");
+    }
+}
