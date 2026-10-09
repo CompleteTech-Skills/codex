@@ -71,7 +71,7 @@ fn keyring(state: &Path, runtime_password: Option<&str>) -> Arc<MockKeyringStore
     Arc::new(keyring)
 }
 
-async fn reset_target(state: &Path) {
+async fn fixture_pool(state: &Path) -> PostgresPool {
     let pool = PostgresPool::connect(ConnectionSettings {
         host: "localhost".to_string(),
         port: receipt(state)["port"].as_u64().expect("port") as u16,
@@ -87,6 +87,26 @@ async fn reset_target(state: &Path) {
     })
     .await
     .expect("reset pool");
+    let mut connection = pool.acquire().await.expect("fixture identity");
+    let identity: (String, i32, String) =
+        sqlx::query_as("SELECT current_database(), inet_server_port(), current_user")
+            .fetch_one(&mut *connection)
+            .await
+            .expect("bound fixture identity");
+    assert_eq!(
+        identity,
+        (
+            "codex".to_owned(),
+            receipt(state)["port"].as_u64().unwrap() as i32,
+            "codex_migrator".to_owned()
+        )
+    );
+    drop(connection);
+    pool
+}
+
+async fn reset_target(state: &Path) {
+    let pool = fixture_pool(state).await;
     codex_postgres_runtime::bootstrap_codex_storage(&pool)
         .await
         .expect("bootstrap disposable service fixture");
@@ -105,11 +125,22 @@ async fn reset_target(state: &Path) {
     for statement in [
         "UPDATE storage_activation SET state = 'open', run_id = NULL, generation = 0, dataset_id = NULL",
         "DELETE FROM storage_migration_runs",
+        "DELETE FROM thread_spawn_edges",
         "DELETE FROM threads",
         "DELETE FROM projects",
+        "DELETE FROM thread_sections WHERE id <> '01984de2-8f74-7c91-a3b2-5c5e937cf318'",
         "DELETE FROM logs",
         "DELETE FROM agent_board_posts",
         "DELETE FROM memory_stage1_outputs",
+        "DELETE FROM memory_jobs",
+        "UPDATE memory_consolidation_progress SET max_thread_count = 0",
+        "DELETE FROM agent_board_channels",
+        "DELETE FROM agent_board_subscriptions",
+        "DELETE FROM agent_board_opt_outs",
+        "UPDATE log_id_counter SET last_id = 0",
+        "UPDATE queue_change_counter SET version = 0",
+        "UPDATE agent_board_post_counter SET last_seq = 0",
+        "UPDATE thread_timestamp_marks SET updated_at_ms = 0, recency_at_ms = 0",
     ] {
         sqlx::query(sqlx::AssertSqlSafe(statement))
             .execute(&mut *transaction)
@@ -119,6 +150,50 @@ async fn reset_target(state: &Path) {
     transaction.commit().await.expect("commit fixture reset");
     drop(connection);
     pool.close().await.expect("close fixture reset pool");
+}
+
+// Actual row counts and durable counters, including a spawn edge without a parent thread.
+const RESIDUE_STATE_SQL: &str = "SELECT ARRAY[(SELECT count(*) FROM codex_storage.thread_spawn_edges), (SELECT count(*) FROM codex_storage.threads), (SELECT count(*) FROM codex_storage.thread_sections WHERE id <> '01984de2-8f74-7c91-a3b2-5c5e937cf318'), (SELECT count(*) FROM codex_storage.thread_sections WHERE id = '01984de2-8f74-7c91-a3b2-5c5e937cf318'), (SELECT last_id FROM codex_storage.log_id_counter WHERE singleton), (SELECT version FROM codex_storage.queue_change_counter WHERE singleton), (SELECT last_seq FROM codex_storage.agent_board_post_counter WHERE singleton), (SELECT updated_at_ms FROM codex_storage.thread_timestamp_marks WHERE singleton), (SELECT recency_at_ms FROM codex_storage.thread_timestamp_marks WHERE singleton)]";
+
+async fn fixture_residue_control(state: &Path) {
+    let pool = fixture_pool(state).await;
+    let mut connection = pool.acquire().await.expect("residue connection");
+    let mut transaction = sqlx::Acquire::begin(&mut *connection)
+        .await
+        .expect("seed transaction");
+    for statement in [
+        "SET LOCAL ROLE codex_owner",
+        "SET LOCAL search_path TO codex_storage, pg_catalog",
+        "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES ('00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002', 'open')",
+        "INSERT INTO thread_sections (id, name) VALUES ('fixture-residue-section', 'Fixture residue')",
+        "UPDATE log_id_counter SET last_id = 9",
+        "UPDATE queue_change_counter SET version = 9",
+        "UPDATE agent_board_post_counter SET last_seq = 9",
+        "UPDATE thread_timestamp_marks SET updated_at_ms = 9, recency_at_ms = 9",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut *transaction)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    transaction.commit().await.expect("commit genuine residue");
+    let seeded: Vec<i64> = sqlx::query_scalar(RESIDUE_STATE_SQL)
+        .fetch_one(&mut *connection)
+        .await
+        .expect("committed residue rows");
+    assert_eq!(seeded, vec![1, 0, 1, 1, 9, 9, 9, 9, 9]);
+    drop(connection);
+    pool.close().await.expect("close residue seed pool");
+    reset_target(state).await;
+    let pool = fixture_pool(state).await;
+    let mut connection = pool.acquire().await.expect("reset evidence");
+    let cleaned: Vec<i64> = sqlx::query_scalar(RESIDUE_STATE_SQL)
+        .fetch_one(&mut *connection)
+        .await
+        .expect("reset rows and counters");
+    assert_eq!(cleaned, vec![0, 0, 0, 1, 0, 0, 0, 0, 0]);
+    drop(connection);
+    pool.close().await.expect("close reset evidence pool");
 }
 
 async fn populated_home() -> tempfile::TempDir {
@@ -161,11 +236,19 @@ fn service(
 
 #[tokio::test]
 async fn real_postgres_storage_service() {
-    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE") else {
+    let state = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE");
+    if std::env::var("CODEX_TEST_POSTGRES_REQUIRED").as_deref() == Ok("1") {
+        assert!(
+            state.as_ref().is_ok_and(|path| !path.trim().is_empty()),
+            "required service fixture"
+        );
+    }
+    let Ok(state) = state else {
         return;
     };
     let state = Path::new(&state);
     reset_target(state).await;
+    fixture_residue_control(state).await;
     let home = populated_home().await;
 
     // Without a saved profile nothing can be tested or planned, and the home is plainly local.

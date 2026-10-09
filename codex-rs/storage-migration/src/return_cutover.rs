@@ -13,9 +13,11 @@ use crate::Migrator;
 use crate::RecoveryOutcome;
 use crate::install;
 use codex_storage_authority::ActiveBackend;
+use codex_storage_authority::AuthorityState;
 use codex_storage_authority::CutoverIntent;
 use codex_storage_authority::LocalAuthority;
 use codex_storage_authority::abandon_cutover;
+use codex_storage_authority::authority_state;
 use codex_storage_authority::begin_cutover;
 use codex_storage_authority::complete_cutover;
 use codex_storage_authority::load_authority;
@@ -181,9 +183,53 @@ impl ReturnCutover {
         Ok(moved)
     }
 
+    /// Marker-less completion: `None` before retirement, otherwise exact owned backup proof.
+    pub async fn completed(&self, run_id: Uuid) -> Result<Option<u64>, CutoverError> {
+        let remote = self.migrator.activation_state().await?;
+        if !remote.retired {
+            return Ok(None);
+        }
+        if read_cutover(&self.home).map_err(authority)?.is_some()
+            || install::read_plan(&self.home).map_err(io_error)?.is_some()
+        {
+            return Err(CutoverError::Conflict);
+        }
+        let AuthorityState::Local(local) = authority_state(&self.home).map_err(authority)? else {
+            return Err(CutoverError::Conflict);
+        };
+        self.installed(&remote, run_id, &local, None).map(Some)
+    }
+
+    /// Require exact SQL/Local identity, owned backup integrity and any leftover plan equality.
+    fn installed(
+        &self,
+        remote: &crate::ActivationState,
+        run_id: Uuid,
+        local: &LocalAuthority,
+        leftover: Option<&install::InstallPlan>,
+    ) -> Result<u64, CutoverError> {
+        if !remote.retired
+            || remote.run_id != Some(run_id)
+            || remote.dataset_id != Some(local.identity.dataset_id)
+            || u64::try_from(remote.generation).ok() != Some(local.identity.generation)
+        {
+            return Err(CutoverError::Conflict);
+        }
+        let backup = install::read_backup_plan(&self.home, run_id).map_err(io_error)?;
+        if leftover.is_some_and(|plan| plan != &backup)
+            || install::validate_plan_identity(&self.home, &self.staged_home, run_id, &backup)
+                .is_err()
+            || !install::verify_backup(&backup).map_err(io_error)?
+        {
+            return Err(CutoverError::Conflict);
+        }
+        Ok(local.identity.generation)
+    }
+
     /// Run the whole protocol for a verified export.
     pub async fn execute(&self, run_id: Uuid) -> Result<LocalAuthority, CutoverError> {
         let intent = self.prepare(run_id)?;
+        let plan = self.matching_plan(run_id)?;
         match self.publish(&intent).await {
             Ok(()) => {}
             Err(CutoverError::Destination(
@@ -191,7 +237,11 @@ impl ReturnCutover {
                 | MigrationError::TargetBusy
                 | MigrationError::GenerationNotAdvancing),
             )) => {
+                self.ensure_current_intent(Some(&intent))?;
+                self.ensure_current_plan(Some(&plan))?;
                 abandon_cutover(&self.home, &intent).map_err(authority)?;
+                self.ensure_current_intent(None)?;
+                self.ensure_current_plan(Some(&plan))?;
                 install::discard_plan(&self.home).map_err(io_error)?;
                 return Err(CutoverError::Destination(refusal));
             }
@@ -204,33 +254,62 @@ impl ReturnCutover {
     /// Settle an interrupted return from the evidence on both sides.
     pub async fn recover(&self) -> Result<RecoveryOutcome, CutoverError> {
         let Some(intent) = read_cutover(&self.home).map_err(authority)? else {
-            // A plan without an intent belongs to a return that already completed.
-            install::discard_plan(&self.home).map_err(io_error)?;
+            // Without an owner-bound service result, retain any leftover evidence.
+            if install::read_plan(&self.home).map_err(io_error)?.is_some() {
+                return Err(CutoverError::Conflict);
+            }
             return Ok(RecoveryOutcome::Idle);
         };
         if intent.target != ActiveBackend::Local {
             return Err(CutoverError::Conflict);
         }
+        let plan = self.matching_plan(intent.run_id)?;
         let remote = self.migrator.activation_state().await?;
         let to_generation =
             i64::try_from(intent.to_generation).map_err(|_| CutoverError::Conflict)?;
         if remote.retired
+            && remote.run_id == Some(intent.run_id)
             && remote.generation == to_generation
             && remote.dataset_id == Some(intent.dataset_id)
         {
+            self.ensure_current_intent(Some(&intent))?;
+            self.ensure_current_plan(Some(&plan))?;
             self.install()?;
             let moved = self.finish(&intent)?;
             return Ok(RecoveryOutcome::RolledForward {
                 generation: moved.identity.generation,
             });
         }
-        if remote.generation >= to_generation || remote.retired {
+        let from_generation =
+            i64::try_from(intent.from_generation).map_err(|_| CutoverError::Conflict)?;
+        if remote.retired
+            || remote.generation != from_generation
+            || remote.run_id != Some(intent.run_id)
+            || remote.dataset_id != Some(intent.dataset_id)
+        {
             return Err(CutoverError::Conflict);
         }
-        abandon_cutover(&self.home, &intent).map_err(authority)?;
-        install::discard_plan(&self.home).map_err(io_error)?;
         // The export only read the dataset while it was closed, so hand it back unchanged.
-        self.migrator.abandon(intent.run_id).await?;
+        self.migrator
+            .abandon_export_after(
+                intent.run_id,
+                ActivationTarget {
+                    dataset_id: intent.dataset_id,
+                    generation: from_generation,
+                },
+                false,
+                || {
+                    self.ensure_current_intent(Some(&intent))?;
+                    self.ensure_current_plan(Some(&plan))?;
+                    abandon_cutover(&self.home, &intent)
+                        .map_err(|error| MigrationError::Staging(error.to_string()))?;
+                    self.ensure_current_intent(None)?;
+                    self.ensure_current_plan(Some(&plan))?;
+                    install::discard_plan(&self.home)
+                        .map_err(|error| MigrationError::Staging(error.to_string()))
+                },
+            )
+            .await?;
         Ok(RecoveryOutcome::RolledBack)
     }
 
