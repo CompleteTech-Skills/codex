@@ -42,7 +42,7 @@ jobs:
   postgres-rust-pool:
     name: PostgreSQL Rust pool (Linux)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -85,6 +85,13 @@ jobs:
       - name: Test PostgreSQL connection pool against real server
         working-directory: codex-rs
         run: just test -p codex-postgres-runtime
+      - name: Require the real default namespace bootstrap fixture
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CODEX_TEST_POSTGRES_STATE:?owned bootstrap fixture state is required}"
+          CODEX_TEST_POSTGRES_REQUIRED=1 just test --locked -p codex-postgres-runtime real_postgres_bootstrap_is_atomic_role_scoped_and_idempotent --retries 0
       - name: Verify bootstrap and preflight serialize with restore
         working-directory: codex-rs
         run: CODEX_TEST_POSTGRES_LOCK_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-postgres-runtime real_restore_lock_serializes_bootstrap_and_preflight
@@ -144,6 +151,27 @@ jobs:
           from restore_qualification import qualify_restore_access
           qualify_restore_access(Path(os.environ["CODEX_TEST_POSTGRES_STATE"]), Path(os.environ["RESTORE_STATE"]))
           PY
+      - name: Provision integration-test roles on the restored PostgreSQL fixture
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, "scripts/postgres")
+          from qualification_checks import sql
+
+          state = Path(os.environ["CODEX_TEST_POSTGRES_RESTORE_STATE"])
+          sql(state, Path("scripts/postgres/container/real-bootstrap-test-roles.sql").read_text())
+          PY
+      - name: Require real bootstrap against restored PostgreSQL metadata
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CODEX_TEST_POSTGRES_RESTORE_STATE:?owned restored fixture state is required}"
+          CODEX_TEST_POSTGRES_STATE="$CODEX_TEST_POSTGRES_RESTORE_STATE" CODEX_TEST_POSTGRES_REQUIRED=1 just test --locked -p codex-postgres-runtime real_postgres_bootstrap_is_atomic_role_scoped_and_idempotent --retries 0
       - name: Test serializable transaction outcomes against real server
         working-directory: codex-rs
         run: CODEX_TEST_POSTGRES_TRANSACTION_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-postgres-runtime real_serializable_conflict_deadlock_and_cancelled_write
@@ -154,7 +182,11 @@ jobs:
         run: python scripts/postgres/isolation_fixture.py --state "$CODEX_TEST_POSTGRES_STATE"
       - name: Test named namespace bootstrap against real server
         working-directory: codex-rs
-        run: CODEX_TEST_POSTGRES_ISOLATION_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-postgres-runtime real_named_namespace_bootstrap_is_isolated_and_rejects_wrong_roles
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CODEX_TEST_POSTGRES_STATE:?owned named bootstrap fixture state is required}"
+          CODEX_TEST_POSTGRES_ISOLATION_REQUIRED=1 CODEX_TEST_POSTGRES_ISOLATION_STATE="$CODEX_TEST_POSTGRES_STATE" just test --locked -p codex-postgres-runtime real_named_namespace_bootstrap_is_isolated_and_rejects_wrong_roles --retries 0
       - name: Test named thread ownership against real server
         working-directory: codex-rs
         run: CODEX_TEST_POSTGRES_ISOLATION_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-postgres-runtime real_named_thread_ownership_is_namespace_scoped
@@ -202,7 +234,7 @@ jobs:
           # Earlier steps leave project keys behind and the runtime role cannot delete them.
           sql(Path(os.environ["CODEX_TEST_POSTGRES_STATE"]), "TRUNCATE codex_storage.project_idempotency_keys, codex_storage.queued_thread_revisions, codex_storage.agent_board_deleted, codex_storage.external_agent_config_imports, codex_storage.threads, codex_storage.projects CASCADE")
           PY
-          CODEX_TEST_POSTGRES_MIGRATION_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-storage-migration real_postgres_catalog_migration
+          CODEX_TEST_POSTGRES_REQUIRED=1 CODEX_TEST_POSTGRES_MIGRATION_STATE="$CODEX_TEST_POSTGRES_STATE" just test --locked -p codex-storage-migration real_postgres_catalog_migration --retries 0
       - name: Connect through a storage profile in the default and a named namespace
         working-directory: codex-rs
         run: CODEX_TEST_POSTGRES_REMOTE_STORAGE_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-remote-storage real_postgres_remote_storage

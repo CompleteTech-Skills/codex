@@ -71,40 +71,129 @@ fn keyring(state: &Path, runtime_password: Option<&str>) -> Arc<MockKeyringStore
     Arc::new(keyring)
 }
 
-async fn reset_target(state: &Path) {
-    let pool = PostgresPool::connect_in_namespace(
-        ConnectionSettings {
-            host: "localhost".to_string(),
-            port: receipt(state)["port"].as_u64().expect("port") as u16,
-            database: "codex".to_string(),
-            username: "codex_runtime".to_string(),
-            password: password(state, "runtime").into(),
-            ca_certificate: state.join("secrets/ca.crt"),
-            limits: PoolLimits {
-                connect_timeout: Duration::from_secs(5),
-                acquire_timeout: Duration::from_secs(20),
-                max_connections: 2,
-            },
+async fn fixture_pool(state: &Path) -> PostgresPool {
+    let pool = PostgresPool::connect(ConnectionSettings {
+        host: "localhost".to_string(),
+        port: receipt(state)["port"].as_u64().expect("port") as u16,
+        database: "codex".to_string(),
+        username: "codex_migrator".to_string(),
+        password: password(state, "migrator").into(),
+        ca_certificate: state.join("secrets/ca.crt"),
+        limits: PoolLimits {
+            connect_timeout: Duration::from_secs(5),
+            acquire_timeout: Duration::from_secs(20),
+            max_connections: 2,
         },
-        /*namespace*/ None,
-    )
+    })
     .await
     .expect("reset pool");
+    let mut connection = pool.acquire().await.expect("fixture identity");
+    let identity: (String, i32, String) =
+        sqlx::query_as("SELECT current_database(), inet_server_port(), current_user")
+            .fetch_one(&mut *connection)
+            .await
+            .expect("bound fixture identity");
+    let port = receipt(state)["port"].as_u64().unwrap() as i32;
+    let login = "codex_migrator".to_owned();
+    assert_eq!(identity, ("codex".to_owned(), port, login));
+    drop(connection);
+    pool
+}
+
+async fn reset_target(state: &Path) {
+    let pool = fixture_pool(state).await;
+    codex_postgres_runtime::bootstrap_codex_storage(&pool)
+        .await
+        .expect("bootstrap disposable service fixture");
     let mut connection = pool.acquire().await.expect("connection");
+    let mut transaction = sqlx::Acquire::begin(&mut *connection)
+        .await
+        .expect("fixture reset transaction");
+    sqlx::query("SET LOCAL ROLE codex_owner")
+        .execute(&mut *transaction)
+        .await
+        .expect("fixture owner role");
+    sqlx::query("SET LOCAL search_path TO codex_storage, pg_catalog")
+        .execute(&mut *transaction)
+        .await
+        .expect("fixture namespace");
     for statement in [
         "UPDATE storage_activation SET state = 'open', run_id = NULL, generation = 0, dataset_id = NULL",
         "DELETE FROM storage_migration_runs",
+        "DELETE FROM thread_spawn_edges",
+        "TRUNCATE project_idempotency_keys, queued_thread_revisions, agent_board_deleted, external_agent_config_imports, threads, projects CASCADE",
         "DELETE FROM threads",
         "DELETE FROM projects",
+        "DELETE FROM thread_sections WHERE id <> '01984de2-8f74-7c91-a3b2-5c5e937cf318'",
         "DELETE FROM logs",
         "DELETE FROM agent_board_posts",
         "DELETE FROM memory_stage1_outputs",
+        "DELETE FROM memory_jobs",
+        "UPDATE memory_consolidation_progress SET max_thread_count = 0",
+        "DELETE FROM agent_board_channels",
+        "DELETE FROM agent_board_subscriptions",
+        "DELETE FROM agent_board_opt_outs",
+        "UPDATE log_id_counter SET last_id = 0",
+        "UPDATE queue_change_counter SET version = 0",
+        "UPDATE agent_board_post_counter SET last_seq = 0",
+        "UPDATE thread_timestamp_marks SET updated_at_ms = 0, recency_at_ms = 0",
     ] {
         sqlx::query(sqlx::AssertSqlSafe(statement))
-            .execute(&mut *connection)
+            .execute(&mut *transaction)
             .await
             .unwrap_or_else(|error| panic!("{statement}: {error}"));
     }
+    transaction.commit().await.expect("commit fixture reset");
+    drop(connection);
+    pool.close().await.expect("close fixture reset pool");
+}
+
+// Actual row counts and durable counters, including a spawn edge without a parent thread.
+const RESIDUE_STATE_SQL: &str = "SELECT ARRAY[(SELECT count(*) FROM codex_storage.thread_spawn_edges), (SELECT count(*) FROM codex_storage.threads), (SELECT count(*) FROM codex_storage.thread_sections WHERE id <> '01984de2-8f74-7c91-a3b2-5c5e937cf318'), (SELECT count(*) FROM codex_storage.thread_sections WHERE id = '01984de2-8f74-7c91-a3b2-5c5e937cf318'), (SELECT last_id FROM codex_storage.log_id_counter WHERE singleton), (SELECT version FROM codex_storage.queue_change_counter WHERE singleton), (SELECT last_seq FROM codex_storage.agent_board_post_counter WHERE singleton), (SELECT updated_at_ms FROM codex_storage.thread_timestamp_marks WHERE singleton), (SELECT recency_at_ms FROM codex_storage.thread_timestamp_marks WHERE singleton)]";
+
+async fn fixture_residue_control(state: &Path) {
+    let pool = fixture_pool(state).await;
+    let mut connection = pool.acquire().await.expect("residue connection");
+    let mut transaction = sqlx::Acquire::begin(&mut *connection)
+        .await
+        .expect("seed transaction");
+    for statement in [
+        "SET LOCAL ROLE codex_owner",
+        "SET LOCAL search_path TO codex_storage, pg_catalog",
+        "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES ('00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002', 'open')",
+        "INSERT INTO thread_sections (id, name) VALUES ('fixture-residue-section', 'Fixture residue')",
+        "UPDATE log_id_counter SET last_id = 9",
+        "UPDATE queue_change_counter SET version = 9",
+        "UPDATE agent_board_post_counter SET last_seq = 9",
+        "UPDATE thread_timestamp_marks SET updated_at_ms = 9, recency_at_ms = 9",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut *transaction)
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    transaction.commit().await.expect("commit genuine residue");
+    let owner = sqlx::query("SET ROLE codex_owner");
+    owner.execute(&mut *connection).await.expect("role");
+    let seeded: Vec<i64> = sqlx::query_scalar(RESIDUE_STATE_SQL)
+        .fetch_one(&mut *connection)
+        .await
+        .expect("committed residue rows");
+    assert_eq!(seeded, vec![1, 0, 1, 1, 9, 9, 9, 9, 9]);
+    drop(connection);
+    pool.close().await.expect("close residue seed pool");
+    reset_target(state).await;
+    let pool = fixture_pool(state).await;
+    let mut connection = pool.acquire().await.expect("reset evidence");
+    let owner = sqlx::query("SET ROLE codex_owner");
+    owner.execute(&mut *connection).await.expect("role");
+    let cleaned: Vec<i64> = sqlx::query_scalar(RESIDUE_STATE_SQL)
+        .fetch_one(&mut *connection)
+        .await
+        .expect("reset rows and counters");
+    assert_eq!(cleaned, vec![0, 0, 0, 1, 0, 0, 0, 0, 0]);
+    drop(connection);
+    pool.close().await.expect("close reset evidence pool");
 }
 
 async fn populated_home() -> tempfile::TempDir {
@@ -147,11 +236,19 @@ fn service(
 
 #[tokio::test]
 async fn real_postgres_storage_service() {
-    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE") else {
+    let state = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE");
+    if std::env::var("CODEX_TEST_POSTGRES_REQUIRED").as_deref() == Ok("1") {
+        assert!(
+            state.as_ref().is_ok_and(|path| !path.trim().is_empty()),
+            "required service fixture"
+        );
+    }
+    let Ok(state) = state else {
         return;
     };
     let state = Path::new(&state);
     reset_target(state).await;
+    fixture_residue_control(state).await;
     let home = populated_home().await;
 
     // Without a saved profile nothing can be tested or planned, and the home is plainly local.
@@ -566,7 +663,209 @@ async fn real_postgres_storage_service() {
     // The host that joined is told plainly, not left writing a history nobody reads.
     let stranded = second.status(true).await;
     assert!(stranded.blockers.contains(&BlockerCode::DatasetRetired));
+    return_fault_cases(state).await;
     reset_target(state).await;
+}
+
+const CONFIRMED: Confirmation = Confirmation {
+    writers_stopped: true,
+};
+
+/// A remote home with a verified export of its dataset waiting in `Ready`.
+async fn ready_return(
+    state: &Path,
+) -> (
+    tempfile::TempDir,
+    StorageService,
+    OperationRecord,
+    (Uuid, OperationRecord),
+) {
+    reset_target(state).await;
+    let home = populated_home().await;
+    let profile = Some(profile(state, true));
+    let svc = service(home.path(), state, profile, keyring(state, None));
+    svc.initialize_schema().await.expect("initialize schema");
+    let plan = svc.plan(PlanAction::Migrate).await.expect("migrate plan");
+    let migration = Uuid::new_v4();
+    let started = svc
+        .start_migration(migration, plan.plan_id, CONFIRMED)
+        .await;
+    started.expect("migrate");
+    svc.activate(migration).await.expect("activate");
+    let plan = svc.plan(PlanAction::Return).await.expect("return plan");
+    let (prepared, created) = svc
+        .prepare_return(Uuid::new_v4(), plan.plan_id, CONFIRMED)
+        .await
+        .expect("prepare");
+    assert!(created);
+    let ready = svc.run_return(prepared.clone()).await.expect("export");
+    assert_eq!(ready.state, OperationState::Ready);
+    (home, svc, ready, (plan.plan_id, prepared))
+}
+
+/// Record the cutover intent and retire the exact exported run, as an interrupted return would.
+async fn retire_export(svc: &StorageService, home: &Path, ready: &OperationRecord, finish: bool) {
+    use codex_storage_migration::Migrator;
+    use codex_storage_migration::ReturnCutover;
+    use codex_storage_migration::SqliteSource;
+    let remote = svc.connect().await.expect("remote before retirement");
+    let staged = svc.staged_home(ready.operation_id);
+    let source = SqliteSource::new(SqliteConfig::new_for_testing(staged.abs()))
+        .relocated_from(home.to_path_buf());
+    let migrator = Migrator::new(source, remote.pool().clone());
+    let returning = ReturnCutover::new(home.to_path_buf(), staged, migrator);
+    let intent = returning
+        .prepare(ready.run_id.expect("run"))
+        .expect("prepare");
+    returning.publish(&intent).await.expect("retire exact run");
+    if finish {
+        returning.install().expect("install");
+        codex_storage_authority::complete_cutover(home, &intent).expect("authority");
+    }
+    remote.close().await;
+}
+
+fn saved(svc: &StorageService, record: &OperationRecord, state: OperationState) -> OperationRecord {
+    let mut record = record.clone();
+    svc.save(&mut record, state).expect("journal state");
+    record
+}
+
+fn markers(home: &Path) -> bool {
+    let intent = codex_storage_authority::read_cutover(home).expect("intent");
+    intent.is_some()
+        || codex_storage_migration::read_plan(home)
+            .expect("plan")
+            .is_some()
+}
+
+fn settled(home: &Path) -> bool {
+    let local = codex_storage_authority::authority_state(home);
+    !markers(home) && matches!(local, Ok(codex_storage_authority::AuthorityState::Local(_)))
+}
+
+fn return_files(path: &Path) -> Vec<(std::path::PathBuf, bool, Vec<u8>)> {
+    let directory = path.is_dir();
+    let bytes = if directory {
+        Vec::new()
+    } else {
+        std::fs::read(path).expect("file evidence")
+    };
+    let mut files = vec![(path.to_path_buf(), directory, bytes)];
+    if directory {
+        for entry in std::fs::read_dir(path).expect("directory evidence") {
+            files.extend(return_files(&entry.expect("entry").path()));
+        }
+    }
+    files.sort();
+    files
+}
+
+async fn return_evidence(
+    svc: &StorageService,
+) -> (Vec<(std::path::PathBuf, bool, Vec<u8>)>, String) {
+    let storage = svc.connect().await.expect("evidence pool");
+    let mut connection = storage.pool().acquire().await.expect("evidence connection");
+    let sql = sqlx::query_scalar("SELECT jsonb_build_object('activation', (SELECT to_jsonb(a) FROM storage_activation a WHERE singleton), 'runs', (SELECT jsonb_agg(to_jsonb(r) ORDER BY run_id) FROM storage_migration_runs r), 'domains', (SELECT jsonb_agg(to_jsonb(d) ORDER BY run_id, domain) FROM storage_migration_domains d))::text")
+        .fetch_one(&mut *connection).await.expect("SQL evidence");
+    drop(connection);
+    storage.close().await;
+    (return_files(&svc.inputs.codex_home), sql)
+}
+
+async fn return_fault_cases(state: &Path) {
+    // A real install fault after retirement keeps the owner Committing, and the legacy Failed
+    // owner the old code left for the same fault recovers too; evidence survives the fault.
+    let (home, svc, ready, (plan_id, prepared)) = ready_return(state).await;
+    let id = ready.operation_id;
+    let backup = format!("{}-before-return", ready.run_id.expect("run"));
+    let fault = home.path().join("storage-backups").join(backup);
+    std::fs::create_dir_all(fault.parent().expect("root")).expect("backup root");
+    std::fs::write(&fault, b"fault").expect("install fault");
+    assert!(svc.activate(id).await.is_err());
+    let held = svc.operation(id).expect("held owner");
+    assert_eq!(held.state, OperationState::Committing);
+    assert_eq!(held.blocker, Some(BlockerCode::CutoverInProgress));
+    let remote = svc.connect().await.expect("remote");
+    assert!(remote.activation().await.expect("activation").retired);
+    remote.close().await;
+    let before = return_evidence(&svc).await;
+    assert!(matches!(
+        svc.run_return(prepared).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    ));
+    assert_eq!(return_evidence(&svc).await, before);
+    assert_eq!(svc.operation(id).expect("same owner"), held);
+    let retry = svc.start_return(id, plan_id, CONFIRMED).await;
+    assert_eq!(retry.expect("retry"), held);
+    let legacy = saved(&svc, &held, OperationState::Failed);
+    let retry = svc.start_return(id, plan_id, CONFIRMED).await;
+    assert_eq!(retry.expect("no restart"), legacy);
+    let before = return_evidence(&svc).await;
+    assert!(svc.run_return(legacy.clone()).await.is_err());
+    assert!(svc.recover().await.is_err());
+    assert_eq!(svc.operation(id).expect("kept"), legacy);
+    assert_eq!(return_evidence(&svc).await, before);
+    assert!(markers(home.path()));
+    std::fs::remove_file(&fault).expect("clear fault");
+    let recovered = svc.recover().await.expect("recover");
+    assert_eq!(recovered.outcome, RecoveryKind::RolledForward);
+    let done = svc.operation(id).expect("settled");
+    assert_eq!(done.state, OperationState::Active);
+    assert!(settled(home.path()));
+    assert_eq!(svc.activate(id).await.expect("repeat"), done);
+
+    // Cancelling after retirement finishes the return and settles Active, never Cancelled.
+    let (home, svc, ready, _) = ready_return(state).await;
+    let id = ready.operation_id;
+    retire_export(&svc, home.path(), &ready, false).await;
+    let mut foreign = ready.clone();
+    foreign.run_id = Some(Uuid::new_v4());
+    let foreign = saved(&svc, &foreign, OperationState::Committing);
+    let before = return_evidence(&svc).await;
+    assert!(matches!(
+        svc.activate(id).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    ));
+    assert_eq!(svc.operation(id).expect("foreign owner retained"), foreign);
+    assert_eq!(return_evidence(&svc).await, before);
+    saved(&svc, &ready, OperationState::Committing);
+    let done = svc.cancel(id).await.expect("cancel finishes the return");
+    assert_eq!(done.state, OperationState::Active);
+    assert_eq!(svc.operation(id).expect("journal"), done);
+    assert!(settled(home.path()));
+    assert_eq!(svc.cancel(id).await.expect("repeat"), done);
+    // A lost acknowledgement with no markers needs the exact retired run.
+    saved(&svc, &done, OperationState::Committing);
+    let marker_less = svc.cancel(id).await.expect("marker-less");
+    assert_eq!(marker_less.state, OperationState::Active);
+    let mut foreign = done.clone();
+    foreign.run_id = Some(Uuid::new_v4());
+    saved(&svc, &foreign, OperationState::Committing);
+    assert!(svc.cancel(id).await.is_err());
+    assert_eq!(
+        svc.operation(id).expect("kept").state,
+        OperationState::Committing
+    );
+
+    // A plan left after authority published is discarded only for the exact retired run.
+    let (home, svc, ready, _) = ready_return(state).await;
+    retire_export(&svc, home.path(), &ready, true).await;
+    assert!(markers(home.path()));
+    saved(&svc, &ready, OperationState::Committing);
+    let leftover = svc.cancel(ready.operation_id).await.expect("leftover plan");
+    assert_eq!(leftover.state, OperationState::Active);
+    assert!(settled(home.path()));
+
+    // A Failed owner without recovery evidence stays cancel-safe.
+    let (_home, svc, ready, _) = ready_return(state).await;
+    let failed = saved(&svc, &ready, OperationState::Failed);
+    assert_eq!(
+        svc.recover().await.expect("recover").outcome,
+        RecoveryKind::Idle
+    );
+    let cancelled = svc.cancel(failed.operation_id).await.expect("cancel");
+    assert_eq!(cancelled.state, OperationState::Cancelled);
 }
 
 fn dataset_report() -> ConnectionReport {

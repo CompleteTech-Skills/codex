@@ -4379,7 +4379,6 @@ dependencies = [
  "chrono",
  "codex-postgres-runtime",
  "codex-protocol",
- "codex-rollout",
  "codex-state",
  "codex-thread-store",
  "codex-utils-absolute-path",
@@ -4398,12 +4397,9 @@ dependencies = [
  "codex-postgres-runtime",
  "codex-postgres-thread-catalog",
  "codex-protocol",
- "codex-state",
- "codex-utils-absolute-path",
  "pretty_assertions",
  "serde_json",
  "sqlx",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -4616,7 +4612,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -5016,7 +5011,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -5024,7 +5018,6 @@ dependencies = [
 name = "codex-storage-service"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "chrono",
  "codex-keyring-store",
  "codex-postgres-runtime",
