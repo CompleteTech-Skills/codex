@@ -374,6 +374,8 @@ impl StorageService {
         let mut record = self.operation(operation_id)?;
         match record.state {
             OperationState::Cancelled => return Ok(record),
+            // A return that already finished is reported as it is, not as a remote home.
+            OperationState::Active if record.action == PlanAction::Return => return Ok(record),
             OperationState::Active => return Err(StorageError(BlockerCode::AlreadyRemote)),
             OperationState::Planned
             | OperationState::Copying

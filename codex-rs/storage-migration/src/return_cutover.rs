@@ -254,11 +254,7 @@ impl ReturnCutover {
     /// Settle an interrupted return from the evidence on both sides.
     pub async fn recover(&self) -> Result<RecoveryOutcome, CutoverError> {
         let Some(intent) = read_cutover(&self.home).map_err(authority)? else {
-            // Without an owner-bound service result, retain any leftover evidence.
-            if install::read_plan(&self.home).map_err(io_error)?.is_some() {
-                return Err(CutoverError::Conflict);
-            }
-            return Ok(RecoveryOutcome::Idle);
+            return self.recover_plan_only().await;
         };
         if intent.target != ActiveBackend::Local {
             return Err(CutoverError::Conflict);
@@ -313,17 +309,44 @@ impl ReturnCutover {
         Ok(RecoveryOutcome::RolledBack)
     }
 
-    /// Cancel before the dataset was retired. Afterwards the return can only finish.
-    pub async fn abort(&self) -> Result<RecoveryOutcome, CutoverError> {
-        let Some(intent) = read_cutover(&self.home).map_err(authority)? else {
+    /// Discard an owned plan only after proving completion or durable export abandonment.
+    async fn recover_plan_only(&self) -> Result<RecoveryOutcome, CutoverError> {
+        let Some(plan) = install::read_plan(&self.home).map_err(io_error)? else {
             return Ok(RecoveryOutcome::Idle);
         };
-        match self.recover().await? {
-            RecoveryOutcome::RolledForward { .. } => Err(CutoverError::AlreadyActivated),
-            outcome @ (RecoveryOutcome::RolledBack | RecoveryOutcome::Idle) => {
-                let _ = intent;
-                Ok(outcome)
+        install::validate_plan_identity(&self.home, &self.staged_home, plan.run_id, &plan)
+            .map_err(|_| CutoverError::Conflict)?;
+        match authority_state(&self.home).map_err(authority)? {
+            AuthorityState::Local(local) => {
+                let remote = self.migrator.activation_state().await?;
+                let generation = self.installed(&remote, plan.run_id, &local, Some(&plan))?;
+                self.ensure_current_intent(None)?;
+                self.ensure_current_plan(Some(&plan))?;
+                install::discard_plan(&self.home).map_err(io_error)?;
+                Ok(RecoveryOutcome::RolledForward { generation })
             }
+            AuthorityState::Remote(local) => {
+                let source = ActivationTarget {
+                    dataset_id: local.identity.dataset_id,
+                    generation: i64::try_from(local.identity.generation)
+                        .map_err(|_| CutoverError::Conflict)?,
+                };
+                self.migrator
+                    .abandon_export_after(plan.run_id, source, false, || {
+                        self.ensure_current_intent(None)?;
+                        self.ensure_current_plan(Some(&plan))?;
+                        install::discard_plan(&self.home)
+                            .map_err(|error| MigrationError::Staging(error.to_string()))
+                    })
+                    .await?;
+                Ok(RecoveryOutcome::RolledBack)
+            }
+            _ => Err(CutoverError::Conflict),
         }
+    }
+
+    /// Cancel before retirement; afterwards the return can only finish, and that is reported.
+    pub async fn abort(&self) -> Result<RecoveryOutcome, CutoverError> {
+        self.recover().await
     }
 }

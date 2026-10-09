@@ -5,7 +5,6 @@ use super::tests::reset_target;
 use super::*;
 use crate::Cutover;
 use crate::CutoverError;
-use crate::CutoverError::AlreadyActivated;
 use crate::CutoverError::Authority;
 use crate::CutoverError::Conflict;
 use crate::InstallPlan;
@@ -600,12 +599,15 @@ async fn abandoned(pool: &Arc<PostgresPool>, source: &SqliteSource, expected: &A
 }
 
 async fn retired_return_cases(pool: &Arc<PostgresPool>, source: &SqliteSource, home: &Path) {
-    // Retired abort keeps the legacy AlreadyActivated contract after finishing the files.
+    // Retired abort reports the completed Local handoff, never cancellation.
     remote_authority(pool, source, home).await;
     let (returning, run_id, _) = staged_return(pool, home, "abort-retired", true).await;
     let intent = returning.prepare(run_id).expect("prepare");
     returning.publish(&intent).await.expect("retire");
-    assert!(matches!(returning.abort().await, Err(AlreadyActivated)));
+    assert!(matches!(
+        returning.abort().await,
+        Ok(RolledForward { generation: 3 })
+    ));
     assert_eq!(backend(home), ActiveBackend::Local);
     assert_eq!(read_cutover(home).expect("intent"), None);
     assert_eq!(install::read_plan(home).expect("plan"), None);
@@ -708,19 +710,73 @@ async fn retired_return_cases(pool: &Arc<PostgresPool>, source: &SqliteSource, h
                 .expect("model intent-only cleanup");
         }
     }
-    // The prerequisite retains a plan-only return instead of discarding its evidence.
-    let before = return_files(home);
+    // Replace a valid captured Remote plan only after an actual SQL lock wait is observed.
+    let mut forged: InstallPlan = serde_json::from_slice(&real).expect("plan");
+    forged.backup_dir = home.join("elsewhere");
+    let mut replaced = Vec::new();
     let remote = dataset_state(pool, source).await;
-    assert!(matches!(returning.recover().await, Err(Conflict)));
-    assert_eq!(return_files(home), before);
-    assert_eq!(dataset_state(pool, source).await, remote);
-    // The legacy no-intent abort contract remains Idle even with an owned plan held.
+    let result = blocked_recovery(pool, &returning, run_id, false, || {
+        fs::write(&plan_path, serde_json::to_vec(&forged).unwrap()).unwrap();
+        replaced = return_files(home);
+    })
+    .await;
+    assert!(matches!(
+        result,
+        Err(CutoverError::Destination(MigrationError::TargetBusy))
+    ));
+    assert_eq!(return_files(home), replaced);
+    abandoned(pool, source, &remote).await;
+    fs::write(&plan_path, &real).expect("restore captured plan");
+    assert!(matches!(
+        returning.recover().await,
+        Ok(RecoveryOutcome::RolledBack)
+    ));
+    assert_eq!(install::read_plan(home).expect("plan"), None);
+
+    // Local plan-only cleanup must retain a newly arrived intent during its SQL read.
+    remote_authority(pool, source, home).await;
+    let (returning, run_id, _) = staged_return(pool, home, "local-evidence", true).await;
+    let intent = returning.prepare(run_id).expect("prepare");
+    returning.publish(&intent).await.expect("retire");
+    returning.install().expect("install");
+    codex_storage_authority::complete_cutover(home, &intent).expect("publish Local, retain plan");
+    let sql = dataset_state(pool, source).await;
+    let full_sql = return_sql(pool).await;
+    let mut foreign = intent;
+    foreign.run_id = Uuid::new_v4();
+    let mut replaced = Vec::new();
+    let result = blocked_recovery(pool, &returning, run_id, true, || {
+        fs::write(
+            home.join("storage-cutover.json"),
+            serde_json::to_vec(&foreign).unwrap(),
+        )
+        .unwrap();
+        replaced = return_files(home);
+    })
+    .await;
+    assert!(matches!(
+        result,
+        Err(CutoverError::Destination(MigrationError::TargetBusy))
+    ));
+    assert_eq!(return_files(home), replaced);
+    assert!(dataset_state(pool, source).await.retired);
+    assert_eq!(dataset_state(pool, source).await, sql);
+    assert_eq!(return_sql(pool).await, full_sql);
+    fs::remove_file(home.join("storage-cutover.json")).expect("clear fixture foreign intent");
+    let before = return_files(home);
     assert_eq!(
-        returning.abort().await.expect("legacy no-intent abort"),
-        RecoveryOutcome::Idle
+        returning.recover().await.expect("Local cleanup retry"),
+        RolledForward { generation: 3 }
     );
-    assert_eq!(return_files(home), before);
-    assert_eq!(dataset_state(pool, source).await, remote);
+    assert_eq!(install::read_plan(home).unwrap(), None);
+    assert_eq!(read_cutover(home).unwrap(), None);
+    assert_eq!(dataset_state(pool, source).await, sql);
+    assert_eq!(return_sql(pool).await, full_sql);
+    let remaining: Vec<_> = before
+        .into_iter()
+        .filter(|(p, _, _)| p != &plan_path)
+        .collect();
+    assert_eq!(return_files(home), remaining);
 }
 
 pub(super) async fn return_phase(
