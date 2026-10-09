@@ -105,12 +105,12 @@ impl StorageService {
     }
 
     /// Whether this run can only be settled by recovery, never re-exported or failed: its
-    /// markers remain (unreadable ones are assumed its own) or the home is already Local.
+    /// markers remain (unreadable ones are assumed its own) or Remote authority is unproven.
     fn requires_recovery(&self, record: &OperationRecord) -> bool {
         self.return_markers(record).unwrap_or(true)
-            || matches!(
+            || !matches!(
                 codex_storage_authority::authority_state(&self.inputs.codex_home),
-                Ok(codex_storage_authority::AuthorityState::Local(_))
+                Ok(codex_storage_authority::AuthorityState::Remote(_))
             )
     }
 
@@ -248,10 +248,20 @@ impl StorageService {
         let Some(_claim) = self.claim(record.operation_id) else {
             return self.operation(record.operation_id);
         };
-        let _owner = self
-            .journal
-            .claim_return(record.operation_id)
-            .map_err(|_| StorageError(BlockerCode::OperationConflict))?;
+        let _owner = match self.journal.claim_return(record.operation_id) {
+            Ok(owner) => owner,
+            Err(error)
+                if matches!(
+                    error
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<std::fs::TryLockError>()),
+                    Some(std::fs::TryLockError::WouldBlock)
+                ) =>
+            {
+                return self.operation(record.operation_id);
+            }
+            Err(_) => return Err(StorageError(BlockerCode::OperationConflict)),
+        };
         let current = self.operation(record.operation_id)?;
         if current != record
             || current.action != PlanAction::Return
@@ -275,10 +285,25 @@ impl StorageService {
         let run_id = record
             .run_id
             .ok_or(StorageError(BlockerCode::OperationConflict))?;
-        let source = self.return_source(record)?;
         let staged_home = self.staged_home(record.operation_id);
-        std::fs::create_dir_all(&staged_home).map_err(internal)?;
-        let config = self.staged_config(&staged_home)?;
+        if record.return_source.is_none() {
+            return Err(StorageError(BlockerCode::OperationConflict));
+        }
+        let preflight = self.return_source(record).and_then(|source| {
+            let config = self.staged_config(&staged_home)?;
+            std::fs::create_dir_all(&staged_home)
+                .map_err(|_| StorageError(BlockerCode::StagingFailed))?;
+            Ok((source, config))
+        });
+        let (source, config) = match preflight {
+            Ok(ready) => ready,
+            Err(error) => {
+                record.blocker = Some(error.0);
+                self.save(record, OperationState::Failed)?;
+                return Err(error);
+            }
+        };
+        record.blocker = None;
         self.save(record, OperationState::Copying)?;
         let storage = match self.connect().await {
             Ok(storage) => storage,
@@ -488,9 +513,25 @@ impl StorageService {
         let run_id = record
             .run_id
             .ok_or(StorageError(BlockerCode::OperationConflict))?;
+        let staged_home = self.staged_home(record.operation_id);
+        if record.return_source.is_none() {
+            return Err(StorageError(BlockerCode::OperationConflict));
+        }
+        // Copying is durable before any SQL fence; an untouched Planned owner needs no SQL.
+        if record.state == OperationState::Planned {
+            if !record.copied.is_empty()
+                || record.blocker.is_some()
+                || self.requires_recovery(&record)
+                || !matches!(std::fs::symlink_metadata(&staged_home),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(StorageError(BlockerCode::OperationConflict));
+            }
+            self.save(&mut record, OperationState::Cancelled)?;
+            return Ok(record);
+        }
         self.check_return_intent(&record)?;
         let source = self.return_source(&record)?;
-        let staged_home = self.staged_home(record.operation_id);
         let config = self.staged_config(&staged_home)?;
         let markers = self.return_markers(&record)?;
         let storage = self.connect().await?;

@@ -586,22 +586,31 @@ async fn real_postgres_storage_service() {
     assert_eq!(Some(source_identity.dataset_id), plan.connection.dataset_id);
     assert_eq!(Some(source_identity.generation), plan.connection.generation);
     assert_eq!(owned_source.destination, plan.destination);
-    // The real prepared owner is durable, but a held persistent claim excludes both paths.
+    // Model only a durable lifecycle advance under the real lock, not an actual SQL fence.
     let owner = service.journal.claim_return(interrupted_id).unwrap();
+    let advanced = saved(&service, &interrupted, OperationState::Copying);
     let before = return_files(home.path());
     let sql = return_evidence(&service).await.1;
-    assert_eq!(
-        service.run_return(interrupted.clone()).await,
-        Err(StorageError(BlockerCode::OperationConflict))
-    );
+    let lock_error = service.journal.claim_return(interrupted_id).unwrap_err();
+    assert!(matches!(
+        lock_error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<std::fs::TryLockError>()),
+        Some(std::fs::TryLockError::WouldBlock)
+    ));
+    let lock_retry = service
+        .start_return(interrupted_id, plan.plan_id, confirmed)
+        .await;
+    let stale_retry = service.run_return(interrupted.clone()).await;
     assert_eq!(
         service.cancel(interrupted_id).await,
         Err(StorageError(BlockerCode::OperationConflict))
     );
-    assert_eq!(service.operation(interrupted_id).unwrap(), interrupted);
+    assert_eq!(service.operation(interrupted_id).unwrap(), advanced);
     assert_eq!(return_files(home.path()), before);
     assert_eq!(return_evidence(&service).await.1, sql);
     drop(owner);
+    service.journal.update(&interrupted).unwrap();
     // Model the absent serde-default fields of a legacy Planned journal, never a new owner.
     let mut legacy = interrupted.clone();
     legacy.run_id = None;
@@ -695,6 +704,158 @@ async fn real_postgres_storage_service() {
         .plan(PlanAction::Return)
         .await
         .expect("fresh return plan");
+    // A is genuinely untouched; B's public export changes the actual SQL state to migrating.
+    let (untouched, created) = service
+        .prepare_return(Uuid::new_v4(), plan.plan_id, confirmed)
+        .await
+        .unwrap();
+    assert!(created && untouched.state == OperationState::Planned);
+    drop(
+        service
+            .journal
+            .claim_return(untouched.operation_id)
+            .unwrap(),
+    );
+    assert!(!service.staged_home(untouched.operation_id).exists());
+    let other = service
+        .start_return(Uuid::new_v4(), plan.plan_id, confirmed)
+        .await
+        .unwrap();
+    assert_eq!(other.state, OperationState::Ready);
+    let before = return_evidence(&service).await;
+    let rows: serde_json::Value = serde_json::from_str(&before.1).unwrap();
+    assert_eq!(rows["activation"]["state"], "migrating");
+    assert_eq!(
+        rows["activation"]["run_id"],
+        other.run_id.unwrap().to_string()
+    );
+    assert!(
+        !rows["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["run_id"] == untouched.run_id.unwrap().to_string())
+    );
+    let drift_cancel = service.cancel(untouched.operation_id).await;
+    let untouched_now = service.operation(untouched.operation_id).unwrap();
+    let after = return_evidence(&service).await;
+    assert_eq!(after.1, before.1);
+    assert_eq!(
+        except_journal(after.0, home.path(), untouched.operation_id),
+        except_journal(before.0, home.path(), untouched.operation_id)
+    );
+    assert_eq!(service.operation(other.operation_id).unwrap(), other);
+    assert!(!service.staged_home(untouched.operation_id).exists());
+    let mut unchanged = untouched_now.clone();
+    unchanged.state = untouched.state;
+    unchanged.updated_at_ms = untouched.updated_at_ms;
+    assert_eq!(unchanged, untouched);
+    assert_eq!(
+        service.cancel(other.operation_id).await.unwrap().state,
+        OperationState::Cancelled
+    );
+
+    // An actual service configuration without a candidate fails before any staging/connection.
+    let plan = service.plan(PlanAction::Return).await.unwrap();
+    let (preflight, created) = service
+        .prepare_return(Uuid::new_v4(), plan.plan_id, confirmed)
+        .await
+        .unwrap();
+    assert!(created);
+    drop(
+        service
+            .journal
+            .claim_return(preflight.operation_id)
+            .unwrap(),
+    );
+    let missing = self::service(home.path(), state, None, keyring(state, None));
+    let before = return_evidence(&service).await;
+    let validation_error = missing.run_return(preflight.clone()).await;
+    let failed = service.operation(preflight.operation_id).unwrap();
+    let after = return_evidence(&service).await;
+    assert_eq!(after.1, before.1);
+    assert_eq!(
+        except_journal(after.0, home.path(), preflight.operation_id),
+        except_journal(before.0, home.path(), preflight.operation_id)
+    );
+    assert!(!service.staged_home(preflight.operation_id).exists());
+    let mut unchanged = failed.clone();
+    unchanged.state = preflight.state;
+    unchanged.blocker = preflight.blocker;
+    unchanged.updated_at_ms = preflight.updated_at_ms;
+    assert_eq!(unchanged, preflight);
+    // Restoring the actual configured service retries the same owner, then cancels its real run.
+    let retry = service
+        .start_return(preflight.operation_id, plan.plan_id, confirmed)
+        .await
+        .unwrap();
+    assert_eq!(retry.state, OperationState::Ready);
+    assert_eq!(retry.blocker, None);
+    assert_eq!(retry.run_id, preflight.run_id);
+    assert_eq!(retry.return_source, preflight.return_source);
+    assert_eq!(
+        service.cancel(retry.operation_id).await.unwrap().state,
+        OperationState::Cancelled
+    );
+
+    // A real lock-open error is not contention and must not return a successful record.
+    let plan = service.plan(PlanAction::Return).await.unwrap();
+    let (unclaimable, _) = service
+        .prepare_return(Uuid::new_v4(), plan.plan_id, confirmed)
+        .await
+        .unwrap();
+    std::fs::create_dir(
+        home.path()
+            .join("storage-operations")
+            .join(format!("{}.lock", unclaimable.operation_id)),
+    )
+    .unwrap();
+    let before = return_evidence(&service).await;
+    assert_eq!(
+        service.run_return(unclaimable.clone()).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    );
+    assert_eq!(
+        service.operation(unclaimable.operation_id).unwrap(),
+        unclaimable
+    );
+    assert_eq!(return_evidence(&service).await, before);
+
+    // Retention proofs above run on both sources; collect all three outcomes before asserting.
+    eprintln!(
+        "return-p2-lock operation={interrupted_id} run={owned_run} public={:?} stale={:?}",
+        lock_retry.as_ref().map(|r| r.state),
+        stale_retry.as_ref().map(|r| r.state)
+    );
+    eprintln!(
+        "return-p2-drift operation={} run={} result={:?} durable={:?}",
+        untouched.operation_id,
+        untouched.run_id.unwrap(),
+        drift_cancel.as_ref().map(|r| r.state),
+        untouched_now.state
+    );
+    eprintln!(
+        "return-p2-validation operation={} run={} result={:?} durable={:?} blocker={:?}",
+        preflight.operation_id,
+        preflight.run_id.unwrap(),
+        validation_error.as_ref().map(|r| r.state),
+        failed.state,
+        failed.blocker
+    );
+    assert_eq!(lock_retry, Ok(advanced.clone()));
+    assert_eq!(stale_retry, Ok(advanced));
+    assert_eq!(drift_cancel, Ok(untouched_now.clone()));
+    assert_eq!(untouched_now.state, OperationState::Cancelled);
+    assert_eq!(
+        validation_error,
+        Err(StorageError(BlockerCode::NoCandidateProfile))
+    );
+    assert_eq!(failed.state, OperationState::Failed);
+    assert_eq!(failed.blocker, Some(BlockerCode::NoCandidateProfile));
+    let plan = service
+        .plan(PlanAction::Return)
+        .await
+        .expect("post-control plan");
     assert!(plan.is_startable(), "{:?}", plan.blockers);
     let returning = Uuid::new_v4();
     assert_eq!(
@@ -896,6 +1057,18 @@ fn return_files(path: &Path) -> Vec<(std::path::PathBuf, bool, Vec<u8>)> {
     }
     files.sort();
     files
+}
+
+fn except_journal(
+    files: Vec<(std::path::PathBuf, bool, Vec<u8>)>,
+    home: &Path,
+    id: Uuid,
+) -> Vec<(std::path::PathBuf, bool, Vec<u8>)> {
+    let journal = home.join("storage-operations").join(format!("{id}.json"));
+    files
+        .into_iter()
+        .filter(|(path, _, _)| *path != journal)
+        .collect()
 }
 
 async fn return_evidence(
