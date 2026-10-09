@@ -402,6 +402,101 @@ async fn completed_finish_is_repeatable(
     assert!(staged_home.exists());
 }
 
+/// Cancellation, completion and fault cases once the dataset has been retired.
+async fn retired_return_cases(pool: &Arc<PostgresPool>, source: &SqliteSource, home: &Path) {
+    // After retirement a return can only finish: cancelling reports the roll-forward.
+    remote_authority(pool, source, home).await;
+    let (returning, run_id, _) = staged_return(pool, home, "abort-retired", true).await;
+    let intent = returning.prepare(run_id).expect("prepare");
+    returning.publish(&intent).await.expect("retire");
+    assert!(matches!(
+        returning.abort().await,
+        Ok(RecoveryOutcome::RolledForward { generation: 3 })
+    ));
+    assert_eq!(backend(home), ActiveBackend::Local);
+    assert_eq!(read_cutover(home).expect("intent"), None);
+    assert_eq!(install::read_plan(home).expect("plan"), None);
+    // Without markers only the exact retired run counts as completed.
+    assert_eq!(returning.completed(run_id).await.expect("done"), Some(3));
+    assert!(matches!(
+        returning.completed(Uuid::new_v4()).await,
+        Err(CutoverError::Conflict)
+    ));
+    let backup = format!("{run_id}-before-return");
+    let manifest = home
+        .join("storage-backups")
+        .join(backup)
+        .join("manifest.json");
+    let kept = std::fs::read(&manifest).expect("manifest");
+    let mut forged: InstallPlan = serde_json::from_slice(&kept).expect("manifest plan");
+    forged.staged_home = home.join("elsewhere");
+    std::fs::write(&manifest, serde_json::to_vec(&forged).expect("forged")).expect("forge");
+    assert!(matches!(
+        returning.completed(run_id).await,
+        Err(CutoverError::Conflict)
+    ));
+    std::fs::write(&manifest, kept).expect("restore manifest");
+    assert!(matches!(returning.abort().await, Ok(RecoveryOutcome::Idle)));
+    remote_authority(pool, source, home).await;
+    let (returning, run_id, _) = staged_return(pool, home, "not-retired", true).await;
+    assert_eq!(returning.completed(run_id).await.expect("open"), None);
+
+    // A genuine install fault after retirement keeps every recovery marker.
+    remote_authority(pool, source, home).await;
+    let (returning, run_id, _) = staged_return(pool, home, "install-fault", true).await;
+    let fault = home
+        .join("storage-backups")
+        .join(format!("{run_id}-before-return"));
+    std::fs::create_dir_all(fault.parent().expect("backup root")).expect("backup root");
+    std::fs::write(&fault, b"fault").expect("install fault");
+    assert!(returning.execute(run_id).await.is_err());
+    assert!(dataset_state(pool, source).await.retired);
+    let intent = read_cutover(home).expect("intent").expect("kept intent");
+    let plan = install::read_plan(home).expect("plan").expect("kept plan");
+    assert!(returning.recover().await.is_err());
+    assert_eq!(read_cutover(home).expect("intent"), Some(intent));
+    assert_eq!(install::read_plan(home).expect("plan"), Some(plan));
+    std::fs::remove_file(&fault).expect("clear fault");
+    assert!(matches!(
+        returning.recover().await,
+        Ok(RecoveryOutcome::RolledForward { generation: 3 })
+    ));
+    assert_eq!(backend(home), ActiveBackend::Local);
+
+    // A plan left by a failed cleanup is discarded only for the exact abandoned export.
+    remote_authority(pool, source, home).await;
+    let (returning, run_id, _) = staged_return(pool, home, "cleanup-fault", true).await;
+    returning.prepare(run_id).expect("prepare");
+    let plan_path = home.join("storage-install.json");
+    let kept = home.join("storage-install.json.kept");
+    std::fs::rename(&plan_path, &kept).expect("keep plan");
+    std::fs::create_dir(&plan_path).expect("cleanup fault");
+    assert!(returning.recover().await.is_err());
+    assert!(!dataset_state(pool, source).await.migrating);
+    assert_eq!(read_cutover(home).expect("intent"), None);
+    std::fs::remove_dir(&plan_path).expect("clear fault");
+    let real = std::fs::read(&kept).expect("plan bytes");
+    for variant in 0..3 {
+        let mut forged: InstallPlan = serde_json::from_slice(&real).expect("plan");
+        match variant {
+            0 => forged.run_id = Uuid::new_v4(),
+            1 => forged.staged_home = home.join("storage-staging").join("elsewhere"),
+            _ => forged.backup_dir = home.join("elsewhere"),
+        }
+        let forged = serde_json::to_vec(&forged).expect("forged plan");
+        std::fs::write(&plan_path, &forged).expect("forged plan");
+        assert!(returning.recover().await.is_err());
+        assert_eq!(std::fs::read(&plan_path).expect("kept"), forged);
+    }
+    std::fs::write(&plan_path, &real).expect("restore plan");
+    std::fs::remove_file(&kept).expect("drop copy");
+    assert!(matches!(
+        returning.recover().await,
+        Ok(RecoveryOutcome::RolledBack)
+    ));
+    assert_eq!(install::read_plan(home).expect("plan"), None);
+}
+
 pub(super) async fn return_phase(
     pool: &Arc<PostgresPool>,
     source: &SqliteSource,
@@ -589,5 +684,6 @@ pub(super) async fn return_phase(
     assert_eq!(read_cutover(home).expect("intent"), None);
     assert_eq!(backend(home), ActiveBackend::Remote);
     completed_finish_is_repeatable(pool, source, home).await;
+    retired_return_cases(pool, source, home).await;
     reset_target(pool).await;
 }
