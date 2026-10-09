@@ -369,3 +369,7 @@ mod staged_sidecar_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "install_sqlite_tests.rs"]
+mod sqlite_tests;
