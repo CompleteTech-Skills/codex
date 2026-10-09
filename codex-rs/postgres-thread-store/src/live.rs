@@ -69,6 +69,11 @@ impl Ordinals {
     fn current(self) -> ThreadStoreResult<Option<u64>> {
         match self {
             Self::Legacy => Ok(None),
+            Self::Paginated {
+                next: Some(ordinal),
+            } if i64::try_from(ordinal).is_err() => Err(ThreadStoreError::InvalidRequest {
+                message: "ordinal exceeds PostgreSQL BIGINT".to_string(),
+            }),
             Self::Paginated { next } => next.map(Some).ok_or(ThreadStoreError::Internal {
                 message: "paginated rollout record ordinal overflow".to_string(),
             }),
@@ -196,6 +201,18 @@ impl LiveThread {
 
     pub(crate) fn queue(&mut self, items: Vec<RolloutItem>) {
         self.pending.extend(items);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_snapshot(&self) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(&(
+            &self.meta,
+            &self.pending,
+            &self.staged,
+            self.next_position,
+            self.materialized,
+            format!("{:?}", self.ordinals),
+        ))
     }
 
     /// True while a newly created thread has written nothing and has nothing to write.

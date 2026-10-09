@@ -191,9 +191,9 @@ jobs:
       - name: Compare thread store behavior across SQLite and PostgreSQL
         working-directory: codex-rs
         run: CODEX_TEST_POSTGRES_THREAD_STORE_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-postgres-thread-store real_postgres_thread_store
-      - name: Test staged batch refusal before connection use against real server
+      - name: Test staged and generated ordinal refusal before connection use against real server
         working-directory: codex-rs
-        run: CODEX_TEST_POSTGRES_THREAD_STORE_STATE="$CODEX_TEST_POSTGRES_STATE" just test --locked -p codex-postgres-thread-store --run-ignored only actual_staged_unrepresentable_batch_is_refused_before_connection_use --retries 0 --test-threads 1
+        run: CODEX_TEST_POSTGRES_THREAD_STORE_STATE="$CODEX_TEST_POSTGRES_STATE" just test --locked -p codex-postgres-thread-store --run-ignored only -E 'test(actual_staged_unrepresentable_batch_is_refused_before_connection_use) | test(actual_generated_ordinal_refusal_preserves_buffers_before_connection_use)' --retries 0 --test-threads 1
       - name: Migrate a SQLite catalog into PostgreSQL and verify it
         working-directory: codex-rs
         run: |

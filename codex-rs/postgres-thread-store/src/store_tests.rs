@@ -750,3 +750,66 @@ async fn actual_staged_unrepresentable_batch_is_refused_before_connection_use() 
     assert_eq!(live.next_position, 0);
     assert!(!live.materialized);
 }
+
+#[tokio::test]
+#[ignore = "requires a declared isolated PostgreSQL fixture; run with --run-ignored only"]
+async fn actual_generated_ordinal_refusal_preserves_buffers_before_connection_use() {
+    let state = std::env::var("CODEX_TEST_POSTGRES_THREAD_STORE_STATE")
+        .expect("declared real PostgreSQL fixture required");
+    let pool = connect(Path::new(&state), "runtime").await;
+    pool.close().await.expect("close the real pool");
+    let cwd = tempfile::tempdir().expect("local cwd");
+    let max = i64::MAX as u64;
+    for (base, count, invalid) in [
+        (u64::MAX, 1, true),
+        (u64::MAX - 1, 2, true),
+        (max + 1, 1, true),
+        (max, 1, true),
+        (max - 1, 2, true),
+        (0, 1, false),
+        (max - 1, 1, false),
+    ] {
+        let thread_id = ThreadId::new();
+        let mut params = create_params(thread_id, "provider", cwd.path());
+        params.history_mode = ThreadHistoryMode::Paginated;
+        params.history_base = Some(codex_protocol::protocol::HistoryPosition {
+            thread_id,
+            end_ordinal_exclusive: base,
+            end_byte_offset: 0,
+        });
+        let mut live = LiveThread::for_create(&params);
+        live.queue(
+            (0..count)
+                .map(|_| user_message("retained 🦀\r\n"))
+                .collect(),
+        );
+        if !invalid {
+            let reachable = live.write(&pool, thread_id, "provider").await;
+            assert!(
+                matches!(&reachable, Err(ThreadStoreError::Internal { message })
+                if message.contains("Closed")),
+                "{reachable:?}"
+            );
+            // Already staged valid bytes must also survive a complete-request refusal.
+            live.next_position = u64::MAX;
+        }
+        let snapshot = live.request_snapshot().expect("snapshot request buffers");
+        let expected = if invalid {
+            "ordinal exceeds PostgreSQL BIGINT"
+        } else {
+            "position exceeds PostgreSQL BIGINT"
+        };
+        for _ in 0..2 {
+            let refused = live.write(&pool, thread_id, "provider").await;
+            assert!(
+                matches!(&refused, Err(ThreadStoreError::InvalidRequest { message })
+                if message == expected),
+                "base {base}, count {count}: {refused:?}"
+            );
+            assert_eq!(
+                live.request_snapshot().expect("snapshot after refusal"),
+                snapshot
+            );
+        }
+    }
+}
