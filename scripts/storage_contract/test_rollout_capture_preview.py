@@ -1,9 +1,8 @@
 """Synthetic physical-copy and direct-lineage checks for snapshot previews."""
 
-import json
 import contextlib
 import io
-import subprocess
+import json
 import sys
 import tempfile
 import unittest
@@ -16,6 +15,22 @@ from .rollout_capture_cli import main
 
 
 class RolloutCapturePreviewTest(unittest.TestCase):
+    def test_recursive_helper_json_is_reported_as_protocol_failure(self):
+        depth = max(10_000, sys.getrecursionlimit() * 2)
+        response = b"[" * depth + b"0" + b"]" * depth + b"\n"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch(
+                "storage_contract.rollout_capture_preview._capture_helper_output",
+                return_value=(0, response, None),
+            ):
+                result = _compressed_headers(
+                    Path(temporary),
+                    Path(sys.executable).resolve(),
+                    [("a.zst", "id", "id")],
+                )
+        self.assertEqual(result, (None, "helper_protocol"))
+
     def test_copies_and_direct_ancestors_are_reported_without_selecting_a_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
@@ -96,31 +111,29 @@ class RolloutCapturePreviewTest(unittest.TestCase):
                 self._meta(parent), encoding="utf-8"
             )
 
-            def respond(args, *, input, stdout, **kwargs):
-                self.assertEqual(args[1:], ["--snapshot-home", str(home.absolute())])
+            def respond(command, requests):
+                self.assertEqual(command[1:], ["--snapshot-home", str(home.absolute())])
                 paths = [
-                    json.loads(line)["relative_path"] for line in input.splitlines()
+                    json.loads(line)["relative_path"] for line in requests.splitlines()
                 ]
                 self.assertEqual(len(paths), 2)
+                responses = []
                 for path in paths:
                     thread_id = parent if parent in path else child
                     ancestor = missing if thread_id == child else None
-                    stdout.write(
-                        (
-                            json.dumps(
-                                {
-                                    "status": "ok",
-                                    "thread_id": thread_id,
-                                    "ancestor_rollout_id": ancestor,
-                                }
-                            )
-                            + "\n"
+                    responses.append(
+                        json.dumps(
+                            {
+                                "status": "ok",
+                                "thread_id": thread_id,
+                                "ancestor_rollout_id": ancestor,
+                            }
                         ).encode()
                     )
-                return subprocess.CompletedProcess(args, 0)
+                return 0, b"\n".join(responses) + b"\n", None
 
             with mock.patch(
-                "storage_contract.rollout_capture_preview.subprocess.run",
+                "storage_contract.rollout_capture_preview._capture_helper_output",
                 side_effect=respond,
             ):
                 result = preview(
@@ -147,29 +160,22 @@ class RolloutCapturePreviewTest(unittest.TestCase):
                     archive / f"rollout-2026-09-28T12-00-00-{thread_id}.jsonl.zst"
                 ).write_bytes(b"zstd")
 
-            def respond(args, *, stdout, **kwargs):
-                stdout.write(
-                    (
-                        json.dumps(
-                            {
-                                "status": "ok",
-                                "thread_id": ids[0],
-                                "ancestor_rollout_id": str(uuid.uuid4()),
-                            }
-                        )
-                        + "\n"
-                    ).encode()
+            def respond(command, requests):
+                first = json.dumps(
+                    {
+                        "status": "ok",
+                        "thread_id": ids[0],
+                        "ancestor_rollout_id": str(uuid.uuid4()),
+                    }
                 )
-                stdout.write(
-                    (
-                        f'{{"status":"ok","thread_id":"{ids[1]}",'
-                        f'"thread_id":"{ids[1]}","ancestor_rollout_id":null}}\n'
-                    ).encode()
+                second = (
+                    f'{{"status":"ok","thread_id":"{ids[1]}",'
+                    f'"thread_id":"{ids[1]}","ancestor_rollout_id":null}}'
                 )
-                return subprocess.CompletedProcess(args, 0)
+                return 0, f"{first}\n{second}\n".encode(), None
 
             with mock.patch(
-                "storage_contract.rollout_capture_preview.subprocess.run",
+                "storage_contract.rollout_capture_preview._capture_helper_output",
                 side_effect=respond,
             ):
                 result = preview(
@@ -190,8 +196,8 @@ class RolloutCapturePreviewTest(unittest.TestCase):
                 archive / f"rollout-2026-09-28T12-00-00-{thread_id}.jsonl.zst"
             ).write_bytes(b"zstd")
             with mock.patch(
-                "storage_contract.rollout_capture_preview.subprocess.run",
-                side_effect=subprocess.TimeoutExpired("helper", 30),
+                "storage_contract.rollout_capture_preview._capture_helper_output",
+                return_value=(None, None, "helper_timeout"),
             ):
                 result = preview(
                     home, compressed_header_helper=Path(sys.executable).resolve()
@@ -219,13 +225,9 @@ class RolloutCapturePreviewTest(unittest.TestCase):
                 archive / f"rollout-2026-09-28T12-00-00-{thread_id}.jsonl.zst"
             ).write_bytes(b"zstd")
 
-            def respond(args, *, stdout, **kwargs):
-                stdout.write(b"x" * (512 * 1024 + 1))
-                return subprocess.CompletedProcess(args, 0)
-
             with mock.patch(
-                "storage_contract.rollout_capture_preview.subprocess.run",
-                side_effect=respond,
+                "storage_contract.rollout_capture_preview._capture_helper_output",
+                return_value=(None, None, "helper_output_limit"),
             ):
                 result = preview(
                     home, compressed_header_helper=Path(sys.executable).resolve()

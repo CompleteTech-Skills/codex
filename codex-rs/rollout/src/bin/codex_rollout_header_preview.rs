@@ -36,19 +36,18 @@ fn main() -> ExitCode {
     let valid_flag = args.next().is_some()
         && args.next().as_deref() == Some(std::ffi::OsStr::new("--snapshot-home"));
     let root = args.next();
-    if !valid_flag || root.is_none() || args.next().is_some() {
-        println!(
-            "{}",
-            json!({"status": "rejected", "code": "invalid_request"})
-        );
-        return ExitCode::from(2);
-    }
+    let root = match (valid_flag, root) {
+        (true, Some(root)) if args.next().is_none() => root,
+        _ => {
+            println!(
+                "{}",
+                json!({"status": "rejected", "code": "invalid_request"})
+            );
+            return ExitCode::from(2);
+        }
+    };
     let mut output = io::stdout().lock();
-    match run(
-        Path::new(root.as_deref().expect("checked root")),
-        io::stdin().lock(),
-        &mut output,
-    ) {
+    match run(Path::new(&root), io::stdin().lock(), &mut output) {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => {
             let _ = writeln!(output, "{}", json!({"status": "rejected", "code": code}));

@@ -105,9 +105,73 @@ async fn reject_namespace_objects(pool: &PostgresPool) {
     }
 }
 
+// Required SQL qualification must never succeed through the optional-fixture return.
+fn bootstrap_fixture_state<'a>(
+    required_mode: Option<&std::ffi::OsStr>,
+    state: Option<&'a std::ffi::OsStr>,
+) -> Result<Option<&'a str>, &'static str> {
+    let required = match required_mode {
+        None => false,
+        Some(mode) if mode == "1" => true,
+        Some(_) => return Err("invalid bootstrap fixture required mode; use 1 or leave unset"),
+    };
+    let state = state.and_then(std::ffi::OsStr::to_str);
+    if required && state.is_none_or(|value| value.trim().is_empty()) {
+        return Err("required bootstrap fixture state is absent, empty, or not Unicode");
+    }
+    Ok(state)
+}
+
+#[test]
+fn bootstrap_fixture_admission_requires_declared_fixture() {
+    use std::ffi::OsStr;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+
+        let invalid = std::ffi::OsString::from_wide(&[0xD800]);
+        assert_eq!(
+            bootstrap_fixture_state(None, Some(invalid.as_os_str())),
+            Ok(None)
+        );
+        assert!(bootstrap_fixture_state(Some(OsStr::new("1")), Some(invalid.as_os_str())).is_err());
+        assert!(
+            bootstrap_fixture_state(Some(invalid.as_os_str()), Some(OsStr::new("owned"))).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        let invalid = OsStr::from_bytes(&[0xff]);
+        assert_eq!(bootstrap_fixture_state(None, Some(invalid)), Ok(None));
+        assert!(bootstrap_fixture_state(Some(OsStr::new("1")), Some(invalid)).is_err());
+        assert!(bootstrap_fixture_state(Some(invalid), Some(OsStr::new("owned"))).is_err());
+    }
+    assert_eq!(bootstrap_fixture_state(None, None), Ok(None));
+    assert_eq!(
+        bootstrap_fixture_state(None, Some(OsStr::new(""))),
+        Ok(Some(""))
+    );
+    assert!(bootstrap_fixture_state(Some(OsStr::new("1")), None).is_err());
+    assert!(bootstrap_fixture_state(Some(OsStr::new("1")), Some(OsStr::new(""))).is_err());
+    assert!(bootstrap_fixture_state(Some(OsStr::new("1")), Some(OsStr::new(" "))).is_err());
+    assert!(bootstrap_fixture_state(Some(OsStr::new("0")), Some(OsStr::new("owned"))).is_err());
+    assert_eq!(
+        bootstrap_fixture_state(Some(OsStr::new("1")), Some(OsStr::new("owned"))),
+        Ok(Some("owned"))
+    );
+}
+
 #[tokio::test]
 async fn real_postgres_bootstrap_is_atomic_role_scoped_and_idempotent() {
-    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_STATE") else {
+    let required_mode = std::env::var_os("CODEX_TEST_POSTGRES_REQUIRED");
+    let state = std::env::var_os("CODEX_TEST_POSTGRES_STATE");
+    let Some(state) = bootstrap_fixture_state(required_mode.as_deref(), state.as_deref())
+        .expect("bootstrap fixture admission failed")
+    else {
         return;
     };
     let state = Path::new(&state);

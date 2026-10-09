@@ -115,7 +115,7 @@ async fn status_views_keep_the_active_backend_apart_from_a_saved_profile() {
             status_view(&status(
                 StorageBackend::LocalSqlite,
                 StorageAuthority::Unmanaged,
-                false,
+                /*candidate_configured*/ false,
                 Vec::new(),
             )),
         ),
@@ -124,7 +124,7 @@ async fn status_views_keep_the_active_backend_apart_from_a_saved_profile() {
             status_view(&status(
                 StorageBackend::LocalSqlite,
                 StorageAuthority::Local,
-                true,
+                /*candidate_configured*/ true,
                 Vec::new(),
             )),
         ),
@@ -133,7 +133,7 @@ async fn status_views_keep_the_active_backend_apart_from_a_saved_profile() {
             status_view(&status(
                 StorageBackend::RemotePostgres,
                 StorageAuthority::Remote,
-                true,
+                /*candidate_configured*/ true,
                 Vec::new(),
             )),
         ),
@@ -142,7 +142,7 @@ async fn status_views_keep_the_active_backend_apart_from_a_saved_profile() {
             status_view(&status(
                 StorageBackend::LocalSqlite,
                 StorageAuthority::CutoverInProgress,
-                true,
+                /*candidate_configured*/ true,
                 vec![StorageBlocker::CutoverInProgress],
             )),
         ),
@@ -151,7 +151,7 @@ async fn status_views_keep_the_active_backend_apart_from_a_saved_profile() {
             status_view(&status(
                 StorageBackend::LocalSqlite,
                 StorageAuthority::Invalid,
-                false,
+                /*candidate_configured*/ false,
                 vec![StorageBlocker::AuthorityInvalid],
             )),
         ),
@@ -172,7 +172,7 @@ async fn only_a_never_managed_host_with_a_profile_is_offered_the_join() {
     let (app, _rx) = app_with(status_view(&status(
         StorageBackend::LocalSqlite,
         StorageAuthority::Unmanaged,
-        true,
+        /*candidate_configured*/ true,
         Vec::new(),
     )))
     .await;
@@ -187,7 +187,7 @@ async fn a_selection_never_starts_anything_by_itself() {
     let (mut app, mut rx) = app_with(status_view(&status(
         StorageBackend::LocalSqlite,
         StorageAuthority::Local,
-        true,
+        /*candidate_configured*/ true,
         Vec::new(),
     )))
     .await;
@@ -200,7 +200,7 @@ async fn a_selection_never_starts_anything_by_itself() {
     app.chat_widget.show_selection_view(status_view(&status(
         StorageBackend::LocalSqlite,
         StorageAuthority::Local,
-        true,
+        /*candidate_configured*/ true,
         Vec::new(),
     )));
     app.chat_widget.handle_key_event(KeyCode::Down.into());
@@ -213,7 +213,7 @@ async fn a_selection_never_starts_anything_by_itself() {
     app.chat_widget.show_selection_view(status_view(&status(
         StorageBackend::LocalSqlite,
         StorageAuthority::Unmanaged,
-        false,
+        /*candidate_configured*/ false,
         Vec::new(),
     )));
     app.chat_widget.handle_key_event(KeyCode::Enter.into());
@@ -348,15 +348,15 @@ async fn operations_show_progress_and_offer_only_what_their_state_allows() {
     for (name, operation) in [
         (
             "storage_operation_copying",
-            operation(StorageOperationState::Copying, None),
+            operation(StorageOperationState::Copying, /*blocker*/ None),
         ),
         (
             "storage_operation_ready",
-            operation(StorageOperationState::Ready, None),
+            operation(StorageOperationState::Ready, /*blocker*/ None),
         ),
         (
             "storage_operation_active",
-            operation(StorageOperationState::Active, None),
+            operation(StorageOperationState::Active, /*blocker*/ None),
         ),
         (
             "storage_operation_failed",
@@ -373,7 +373,7 @@ async fn operations_show_progress_and_offer_only_what_their_state_allows() {
     // Switching over is the first row of a verified copy and asks for an explicit accept.
     let (mut app, mut rx) = app_with(operation_view(&operation(
         StorageOperationState::Ready,
-        None,
+        /*blocker*/ None,
     )))
     .await;
     app.chat_widget.handle_key_event(KeyCode::Enter.into());

@@ -202,7 +202,6 @@ codex-postgres-thread-store = { path = "postgres-thread-store" }
 codex-postgres-queue-store = { path = "postgres-queue-store" }
 codex-postgres-rollout-store = { path = "postgres-rollout-store" }
 codex-postgres-runtime = { path = "postgres-runtime" }
-codex-storage-candidate-preflight = { path = "storage-candidate-preflight" }
 codex-storage-migration = { path = "storage-migration" }
 codex-storage-service = { path = "storage-service" }
 codex-remote-backend = { path = "remote-backend" }

@@ -218,7 +218,7 @@ where
 
 #[tokio::test]
 #[ignore = "requires ROOT-admitted isolated canonical rollout fixture"]
-async fn actual_direct_append_refusal_preserves_transaction_and_retry() {
+async fn actual_direct_append_commit_replay_with_bigint_boundary_and_opaque_bytes() {
     let state = std::env::var("CODEX_TEST_POSTGRES_ROLLOUT_STORE_STATE")
         .expect("declared real PostgreSQL fixture required");
     let state = Path::new(&state);

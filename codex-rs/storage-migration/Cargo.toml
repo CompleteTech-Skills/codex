@@ -23,7 +23,6 @@ sha2 = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "sqlite"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
-tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v7"] }
 
 [dev-dependencies]

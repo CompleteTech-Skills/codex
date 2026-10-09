@@ -59,6 +59,24 @@ class ProgramTests(unittest.TestCase):
             programs._windows_program(str(explicit), [], self.cwd), str(explicit)
         )
 
+    def test_explicit_extensionless_path_does_not_select_sibling_exe(self):
+        explicit = self.cwd / "docker"
+        explicit.write_bytes(b"explicit wrapper fixture, never executed")
+        explicit.with_suffix(".exe").write_bytes(b"sibling fixture, never executed")
+        for requested in (str(explicit), "./docker"):
+            with self.subTest(requested=requested):
+                self.assertEqual(
+                    programs._windows_program(requested, [], self.cwd), str(explicit)
+                )
+
+    def test_missing_explicit_extensionless_path_does_not_select_sibling_exe(self):
+        explicit = self.cwd / "docker"
+        explicit.with_suffix(".exe").write_bytes(b"sibling fixture, never executed")
+        for requested in (str(explicit), "./docker"):
+            with self.subTest(requested=requested):
+                with self.assertRaises(ServiceError):
+                    programs._windows_program(requested, [], self.cwd)
+
     def test_extension_and_quoted_absolute_path_entries_work(self):
         self.assertEqual(
             programs._windows_program(
