@@ -93,14 +93,9 @@ async fn fixture_pool(state: &Path) -> PostgresPool {
             .fetch_one(&mut *connection)
             .await
             .expect("bound fixture identity");
-    assert_eq!(
-        identity,
-        (
-            "codex".to_owned(),
-            receipt(state)["port"].as_u64().unwrap() as i32,
-            "codex_migrator".to_owned()
-        )
-    );
+    let port = receipt(state)["port"].as_u64().unwrap() as i32;
+    let login = "codex_migrator".to_owned();
+    assert_eq!(identity, ("codex".to_owned(), port, login));
     drop(connection);
     pool
 }
@@ -126,6 +121,7 @@ async fn reset_target(state: &Path) {
         "UPDATE storage_activation SET state = 'open', run_id = NULL, generation = 0, dataset_id = NULL",
         "DELETE FROM storage_migration_runs",
         "DELETE FROM thread_spawn_edges",
+        "TRUNCATE project_idempotency_keys, queued_thread_revisions, agent_board_deleted, external_agent_config_imports, threads, projects CASCADE",
         "DELETE FROM threads",
         "DELETE FROM projects",
         "DELETE FROM thread_sections WHERE id <> '01984de2-8f74-7c91-a3b2-5c5e937cf318'",
@@ -177,6 +173,8 @@ async fn fixture_residue_control(state: &Path) {
             .unwrap_or_else(|error| panic!("{statement}: {error}"));
     }
     transaction.commit().await.expect("commit genuine residue");
+    let owner = sqlx::query("SET ROLE codex_owner");
+    owner.execute(&mut *connection).await.expect("role");
     let seeded: Vec<i64> = sqlx::query_scalar(RESIDUE_STATE_SQL)
         .fetch_one(&mut *connection)
         .await
@@ -187,6 +185,8 @@ async fn fixture_residue_control(state: &Path) {
     reset_target(state).await;
     let pool = fixture_pool(state).await;
     let mut connection = pool.acquire().await.expect("reset evidence");
+    let owner = sqlx::query("SET ROLE codex_owner");
+    owner.execute(&mut *connection).await.expect("role");
     let cleaned: Vec<i64> = sqlx::query_scalar(RESIDUE_STATE_SQL)
         .fetch_one(&mut *connection)
         .await
