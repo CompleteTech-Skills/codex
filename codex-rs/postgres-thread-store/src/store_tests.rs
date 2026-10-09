@@ -700,3 +700,53 @@ async fn real_postgres_thread_store() {
         .await
         .expect("delete shared thread");
 }
+
+#[tokio::test]
+#[ignore = "requires a declared isolated PostgreSQL fixture; run with --run-ignored only"]
+async fn actual_staged_unrepresentable_batch_is_refused_before_connection_use() {
+    let state = std::env::var("CODEX_TEST_POSTGRES_THREAD_STORE_STATE")
+        .expect("declared real PostgreSQL fixture required");
+    // A real pool that connected, then closed: any SQL request or acquire would now fail.
+    let pool = connect(Path::new(&state), "runtime").await;
+    pool.close().await.expect("close the real pool");
+    let cwd = tempfile::tempdir().expect("local cwd");
+
+    async fn first_write(
+        pool: &PostgresPool,
+        cwd: &Path,
+        base: u64,
+    ) -> (LiveThread, ThreadStoreResult<()>) {
+        let thread_id = ThreadId::new();
+        let mut params = create_params(thread_id, "provider", cwd);
+        params.history_mode = ThreadHistoryMode::Paginated;
+        params.history_base = Some(codex_protocol::protocol::HistoryPosition {
+            thread_id,
+            end_ordinal_exclusive: base,
+            end_byte_offset: 0,
+        });
+        let mut live = LiveThread::for_create(&params);
+        live.queue(vec![user_message("first")]);
+        let result = live.write(pool, thread_id, "provider").await;
+        (live, result)
+    }
+
+    // A valid batch reaches the closed pool, proving the pool really refuses PostgreSQL use.
+    let (_, reachable) = first_write(&pool, cwd.path(), 0).await;
+    assert!(
+        matches!(reachable, Err(ThreadStoreError::Internal { .. })),
+        "{reachable:?}"
+    );
+
+    // An ordinal beyond BIGINT keeps its public class instead of the connection failure.
+    let (live, refused) = first_write(&pool, cwd.path(), i64::MAX as u64 + 1).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(ThreadStoreError::InvalidRequest { message })
+                if message == "ordinal exceeds PostgreSQL BIGINT"
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(live.next_position, 0);
+    assert!(!live.materialized);
+}

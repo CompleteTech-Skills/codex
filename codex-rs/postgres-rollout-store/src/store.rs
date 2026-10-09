@@ -340,7 +340,8 @@ fn checked_request_position(position: u64) -> Result<i64, RolloutStoreError> {
         .map_err(|_| RolloutStoreError::InvalidRequest("position exceeds PostgreSQL BIGINT"))
 }
 
-fn validate_append_request(
+/// Check an append request without touching PostgreSQL; returns the exclusive end position.
+pub fn validate_append_request(
     expected: u64,
     lines: &[(Option<u64>, String)],
 ) -> Result<u64, RolloutStoreError> {

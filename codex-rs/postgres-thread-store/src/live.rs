@@ -11,6 +11,7 @@ use codex_git_utils::collect_git_info;
 use codex_git_utils::get_git_repo_root;
 use codex_postgres_rollout_store::RolloutStoreError;
 use codex_postgres_rollout_store::append_in;
+use codex_postgres_rollout_store::validate_append_request;
 use codex_postgres_runtime::PostgresPool;
 use codex_postgres_runtime::ThreadOwnership;
 use codex_postgres_runtime::require_storage_open;
@@ -275,6 +276,8 @@ impl LiveThread {
         {
             return Err(ownership_lost(thread_id));
         }
+        // An unrepresentable staged batch is refused before any connection or SQL request.
+        validate_append_request(self.next_position, &lines).map_err(rollout_error)?;
         let fence = self
             .ownership
             .as_ref()

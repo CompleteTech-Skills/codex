@@ -221,7 +221,12 @@ where
 async fn actual_direct_append_refusal_preserves_transaction_and_retry() {
     let state = std::env::var("CODEX_TEST_POSTGRES_ROLLOUT_STORE_STATE")
         .expect("declared real PostgreSQL fixture required");
-    let pool = connect(Path::new(&state), "runtime").await;
+    let state = Path::new(&state);
+    // A fresh fixture has no product schema; bootstrap is idempotent on an owned fixture.
+    bootstrap_codex_storage(&*connect(state, "migrator").await)
+        .await
+        .expect("bootstrap rollout schema");
+    let pool = connect(state, "runtime").await;
     let thread = ThreadId::new();
     insert_thread(&pool, thread).await;
     let store = PostgresRolloutStore::new(Arc::clone(&pool));

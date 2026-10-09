@@ -185,9 +185,15 @@ jobs:
       - name: Test canonical rollout storage against real server
         working-directory: codex-rs
         run: CODEX_TEST_POSTGRES_ROLLOUT_STORE_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-postgres-rollout-store real_postgres_rollouts
+      - name: Test direct rollout append refusal and retry against real server
+        working-directory: codex-rs
+        run: CODEX_TEST_POSTGRES_ROLLOUT_STORE_STATE="$CODEX_TEST_POSTGRES_STATE" just test --locked -p codex-postgres-rollout-store --run-ignored only actual_direct_append_refusal_preserves_transaction_and_retry --retries 0 --test-threads 1
       - name: Compare thread store behavior across SQLite and PostgreSQL
         working-directory: codex-rs
         run: CODEX_TEST_POSTGRES_THREAD_STORE_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-postgres-thread-store real_postgres_thread_store
+      - name: Test staged batch refusal before connection use against real server
+        working-directory: codex-rs
+        run: CODEX_TEST_POSTGRES_THREAD_STORE_STATE="$CODEX_TEST_POSTGRES_STATE" just test --locked -p codex-postgres-thread-store --run-ignored only actual_staged_unrepresentable_batch_is_refused_before_connection_use --retries 0 --test-threads 1
       - name: Migrate a SQLite catalog into PostgreSQL and verify it
         working-directory: codex-rs
         run: |
