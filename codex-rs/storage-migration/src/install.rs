@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::HashSet;
 use std::io;
 use std::io::Read;
 use std::io::Write;
@@ -178,6 +179,66 @@ pub fn read_plan(home: &Path) -> io::Result<Option<InstallPlan>> {
     }
 }
 
+/// Read the retained manifest for one completed installation without changing its backup.
+pub(crate) fn read_backup_plan(home: &Path, run_id: Uuid) -> io::Result<InstallPlan> {
+    let backups = home.join(BACKUPS_DIR);
+    let backup = backups.join(format!("{run_id}-before-return"));
+    for directory in [&backups, &backup] {
+        let metadata = std::fs::symlink_metadata(directory)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(corrupt("return backup directory is not an owned directory"));
+        }
+    }
+    let manifest = backup.join(MANIFEST_FILE);
+    let metadata = std::fs::symlink_metadata(&manifest)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(corrupt("return backup manifest is not a regular file"));
+    }
+    serde_json::from_slice(&std::fs::read(manifest)?)
+        .map_err(|_| corrupt("return backup manifest is unreadable"))
+}
+
+/// Refuse a plan whose identity or paths do not belong to this exact return operation.
+pub(crate) fn validate_plan_identity(
+    home: &Path,
+    staged_home: &Path,
+    run_id: Uuid,
+    plan: &InstallPlan,
+) -> io::Result<()> {
+    validate_plan_paths(home, plan)?;
+    if plan.run_id != run_id || plan.staged_home.as_path() != staged_home {
+        return Err(corrupt("install plan does not match the return operation"));
+    }
+    Ok(())
+}
+
+fn validate_plan_paths(home: &Path, plan: &InstallPlan) -> io::Result<()> {
+    let expected_backup = home
+        .join(BACKUPS_DIR)
+        .join(format!("{}-before-return", plan.run_id));
+    if plan.backup_dir != expected_backup {
+        return Err(corrupt(
+            "install plan backup is outside its owned return path",
+        ));
+    }
+
+    let mut names = HashSet::new();
+    for unit in &plan.units {
+        if unit.name.is_empty()
+            || unit.name == "."
+            || unit.name == ".."
+            || unit
+                .name
+                .chars()
+                .any(|character| matches!(character, '/' | '\\' | ':'))
+            || !names.insert(unit.name.as_str())
+        {
+            return Err(corrupt("install plan contains an unsafe unit path"));
+        }
+    }
+    Ok(())
+}
+
 /// Forget a plan whose swap never moved anything.
 pub fn discard_plan(home: &Path) -> io::Result<()> {
     match std::fs::remove_file(plan_path(home)) {
@@ -189,6 +250,7 @@ pub fn discard_plan(home: &Path) -> io::Result<()> {
 
 /// Run or finish the swap. Safe to repeat.
 pub fn install(home: &Path, plan: &InstallPlan) -> io::Result<()> {
+    validate_plan_paths(home, plan)?;
     std::fs::create_dir_all(&plan.backup_dir)?;
     let manifest = plan.backup_dir.join(MANIFEST_FILE);
     if !manifest.exists() {

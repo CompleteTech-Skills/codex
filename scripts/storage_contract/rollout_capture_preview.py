@@ -8,9 +8,12 @@ import datetime
 import json
 import os
 import re
+import select
+import signal
 import stat
 import subprocess
 import tempfile
+import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -101,7 +104,351 @@ def _examples(values):
     return {"count": len(ordered), "examples": ordered[:MAX_EXAMPLES]}
 
 
-def _compressed_headers(home, helper, candidates):
+class _WindowsJob:
+    """Own the helper process tree and kill descendants when its job closes."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", BasicLimitInformation),
+                ("IoInfo", IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = self._kernel32
+        kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE,
+            wintypes.INT,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = (
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        )
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        self._handle = kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = ExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            self._handle,
+            9,  # JobObjectExtendedLimitInformation
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def assign_and_resume(self, process):
+        ctypes = self._ctypes
+        wintypes = self._wintypes
+        kernel32 = self._kernel32
+        if not kernel32.AssignProcessToJobObject(self._handle, process._handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        class ThreadEntry32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD),
+                ("tpBasePri", ctypes.c_long),
+                ("tpDeltaPri", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Thread32First.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(ThreadEntry32),
+        )
+        kernel32.Thread32First.restype = wintypes.BOOL
+        kernel32.Thread32Next.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(ThreadEntry32),
+        )
+        kernel32.Thread32Next.restype = wintypes.BOOL
+        kernel32.OpenThread.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenThread.restype = wintypes.HANDLE
+        kernel32.ResumeThread.argtypes = (wintypes.HANDLE,)
+        kernel32.ResumeThread.restype = wintypes.DWORD
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)
+        if snapshot == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        thread_handle = None
+        try:
+            entry = ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            found = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+            while found:
+                if entry.th32OwnerProcessID == process.pid:
+                    thread_handle = kernel32.OpenThread(
+                        0x0002, False, entry.th32ThreadID
+                    )
+                    if not thread_handle:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    if kernel32.ResumeThread(thread_handle) == 0xFFFFFFFF:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    return
+                entry.dwSize = ctypes.sizeof(entry)
+                found = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+            raise OSError("suspended helper thread was not found")
+        finally:
+            if thread_handle:
+                kernel32.CloseHandle(thread_handle)
+            kernel32.CloseHandle(snapshot)
+
+    def terminate(self):
+        return bool(self._kernel32.TerminateJobObject(self._handle, 1))
+
+    def close(self):
+        if self._handle:
+            handle, self._handle = self._handle, None
+            self._kernel32.CloseHandle(handle)
+
+
+def _start_helper_process(command, request_stream):
+    options = {
+        "stdin": request_stream,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "bufsize": 0,
+    }
+    if os.name != "nt":
+        return subprocess.Popen(command, start_new_session=True, **options), None
+
+    job = _WindowsJob()
+    process = None
+    try:
+        process = subprocess.Popen(
+            command,
+            creationflags=getattr(subprocess, "CREATE_SUSPENDED", 0x00000004),
+            **options,
+        )
+        job.assign_and_resume(process)
+        return process, job
+    except BaseException:
+        if process is not None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        job.close()
+        raise
+
+
+def _terminate_helper_tree(process, owner):
+    if owner is not None and owner.terminate():
+        return
+    if os.name == "nt":
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _windows_stdout_reader(process):
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.PeekNamedPipe.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.PeekNamedPipe.restype = wintypes.BOOL
+    kernel32.ReadFile.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    )
+    kernel32.ReadFile.restype = wintypes.BOOL
+    handle = wintypes.HANDLE(msvcrt.get_osfhandle(process.stdout.fileno()))
+
+    def read_available(maximum):
+        available = wintypes.DWORD()
+        if not kernel32.PeekNamedPipe(
+            handle, None, 0, None, ctypes.byref(available), None
+        ):
+            error = ctypes.get_last_error()
+            if error in (109, 232):  # broken pipe or no pipe instance
+                return b""
+            raise ctypes.WinError(error)
+        if available.value == 0:
+            return None
+        size = min(maximum, available.value)
+        buffer = ctypes.create_string_buffer(size)
+        received = wintypes.DWORD()
+        if not kernel32.ReadFile(handle, buffer, size, ctypes.byref(received), None):
+            error = ctypes.get_last_error()
+            if error in (109, 232):
+                return b""
+            raise ctypes.WinError(error)
+        return buffer.raw[: received.value] if received.value else None
+
+    return read_available
+
+
+def _helper_exited(process):
+    if os.name == "nt":
+        return process.poll() is not None
+    try:
+        status = os.waitid(
+            os.P_PID,
+            process.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except InterruptedError:
+        return False
+    return status is not None and status.si_pid != 0
+
+
+def _posix_waitid_supported():
+    return all(
+        hasattr(os, name)
+        for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+    )
+
+
+def _capture_helper_output(command, requests):
+    if os.name != "nt" and not _posix_waitid_supported():
+        return None, None, "helper_unavailable"
+    with tempfile.TemporaryFile(mode="w+b") as request_stream:
+        request_stream.write(requests)
+        request_stream.seek(0)
+        process, owner = _start_helper_process(command, request_stream)
+        output = bytearray()
+        deadline = time.monotonic() + HELPER_TIMEOUT_SECONDS
+        ownership_lost = False
+        try:
+            read_available = (
+                _windows_stdout_reader(process)
+                if os.name == "nt"
+                else lambda maximum: (
+                    os.read(process.stdout.fileno(), maximum)
+                    if select.select([process.stdout], [], [], 0)[0]
+                    else None
+                )
+            )
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _stop_helper_process(process, owner)
+                    return None, None, "helper_timeout"
+                chunk = read_available(
+                    min(64 * 1024, MAX_HELPER_OUTPUT + 1 - len(output))
+                )
+                if chunk == b"":
+                    if _helper_exited(process):
+                        _stop_helper_process(process, owner)
+                        return process.returncode, bytes(output), None
+                elif chunk:
+                    output.extend(chunk)
+                    if len(output) > MAX_HELPER_OUTPUT:
+                        _stop_helper_process(process, owner)
+                        return None, None, "helper_output_limit"
+                time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        except ChildProcessError:
+            ownership_lost = True
+            return None, None, "helper_failed"
+        except OSError:
+            _stop_helper_process(process, owner)
+            return None, None, "helper_failed"
+        finally:
+            if owner is not None:
+                owner.close()
+            if not ownership_lost and process.returncode is None:
+                _stop_helper_process(process, None)
+            process.stdout.close()
+
+
+def _stop_helper_process(process, owner):
+    _terminate_helper_tree(process, owner)
+    if owner is not None:
+        owner.close()
+    process.stdout.close()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _compressed_headers(home, helper, candidates, *, _helper_args=()):
     """Return one validated batch, or a path-free code with no partial results."""
     if len(candidates) > MAX_COMPRESSED_REQUESTS:
         return None, "request_limit"
@@ -115,26 +462,24 @@ def _compressed_headers(home, helper, candidates):
             (json.dumps({"relative_path": relative}) + "\n").encode("utf-8")
             for relative, _, _ in candidates
         )
-        with tempfile.TemporaryFile(mode="w+b") as output:
-            result = subprocess.run(
-                [str(executable), "--snapshot-home", str(home.absolute())],
-                input=requests,
-                stdout=output,
-                stderr=subprocess.DEVNULL,
-                timeout=HELPER_TIMEOUT_SECONDS,
-                check=False,
-            )
-            if result.returncode != 0:
-                return None, "helper_failed"
-            if output.tell() > MAX_HELPER_OUTPUT:
-                return None, "helper_output_limit"
-            output.seek(0)
-            data = output.read()
-            if data and not data.endswith(b"\n"):
-                return None, "helper_protocol"
-            lines = data.splitlines()
-    except subprocess.TimeoutExpired:
-        return None, "helper_timeout"
+        command = [
+            str(executable),
+            *_helper_args,
+            "--snapshot-home",
+            str(home.absolute()),
+        ]
+        returncode, data, error = _capture_helper_output(command, requests)
+        if error is not None:
+            return None, error
+        if returncode != 0:
+            return None, "helper_failed"
+        if data is None:
+            return None, "helper_failed"
+        if len(data) > MAX_HELPER_OUTPUT:
+            return None, "helper_output_limit"
+        if data and not data.endswith(b"\n"):
+            return None, "helper_protocol"
+        lines = data.splitlines()
     except OSError:
         return None, "helper_unavailable"
     if len(lines) != len(candidates):
@@ -143,7 +488,7 @@ def _compressed_headers(home, helper, candidates):
     for line, (_, thread_id, rollout_id) in zip(lines, candidates):
         try:
             response = json.loads(line, object_pairs_hook=_unique_object)
-        except (UnicodeDecodeError, ValueError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
             return None, "helper_protocol"
         if type(response) is not dict:
             return None, "helper_protocol"

@@ -15,8 +15,10 @@ use crate::ops::RecoveryKind;
 use crate::ops::RecoveryReport;
 use crate::service::StorageService;
 use codex_state::SqliteConfig;
+use codex_storage_authority::ActiveBackend;
 use codex_storage_authority::read_cutover;
 use codex_storage_migration::ActivationTarget;
+use codex_storage_migration::CutoverError;
 use codex_storage_migration::Migrator;
 use codex_storage_migration::RecoveryOutcome;
 use codex_storage_migration::ReturnCutover;
@@ -38,6 +40,7 @@ fn internal<E>(_: E) -> StorageError {
 
 impl StorageService {
     fn check_return_intent(&self, record: &OperationRecord) -> Result<(), StorageError> {
+        self.return_markers(record)?;
         let source = self.return_source(record)?;
         if let Some(intent) = read_cutover(&self.inputs.codex_home).map_err(internal)?
             && (Some(intent.run_id) != record.run_id
@@ -45,12 +48,6 @@ impl StorageService {
                 || i64::try_from(intent.from_generation).ok() != Some(source.generation)
                 || i64::try_from(intent.to_generation).ok() != source.generation.checked_add(1)
                 || intent.target != codex_storage_authority::ActiveBackend::Local)
-        {
-            return Err(StorageError(BlockerCode::OperationConflict));
-        }
-        if let Some(plan) = read_plan(&self.inputs.codex_home).map_err(internal)?
-            && (Some(plan.run_id) != record.run_id
-                || plan.staged_home != self.staged_home(record.operation_id))
         {
             return Err(StorageError(BlockerCode::OperationConflict));
         }
@@ -106,6 +103,35 @@ impl StorageService {
             generation: source.generation,
         })
     }
+
+    /// Whether this run can only be settled by recovery, never re-exported or failed: its
+    /// markers remain (unreadable ones are assumed its own) or the home is already Local.
+    fn requires_recovery(&self, record: &OperationRecord) -> bool {
+        self.return_markers(record).unwrap_or(true)
+            || matches!(
+                codex_storage_authority::authority_state(&self.inputs.codex_home),
+                Ok(codex_storage_authority::AuthorityState::Local(_))
+            )
+    }
+
+    /// Whether any return marker exists; markers of another run are a conflict.
+    fn return_markers(&self, record: &OperationRecord) -> Result<bool, StorageError> {
+        let home = &self.inputs.codex_home;
+        let intent = read_cutover(home).map_err(internal)?;
+        let plan = read_plan(home).map_err(internal)?;
+        if intent
+            .as_ref()
+            .is_some_and(|i| Some(i.run_id) != record.run_id || i.target != ActiveBackend::Local)
+            || plan.as_ref().is_some_and(|p| {
+                Some(p.run_id) != record.run_id
+                    || p.staged_home != self.staged_home(record.operation_id)
+            })
+        {
+            return Err(StorageError(BlockerCode::OperationConflict));
+        }
+        Ok(intent.is_some() || plan.is_some())
+    }
+
     pub(crate) fn staged_home(&self, operation_id: Uuid) -> PathBuf {
         self.inputs
             .codex_home
@@ -166,7 +192,8 @@ impl StorageService {
                         | OperationState::Copying
                         | OperationState::Verifying
                         | OperationState::Failed
-                );
+                )
+                && !self.requires_recovery(&existing);
             return Ok((existing, retry));
         }
         if !confirmation.writers_stopped {
@@ -219,24 +246,27 @@ impl StorageService {
         mut record: OperationRecord,
     ) -> Result<OperationRecord, StorageError> {
         let Some(_claim) = self.claim(record.operation_id) else {
-            return Ok(record);
+            return self.operation(record.operation_id);
         };
         let _owner = self
             .journal
             .claim_return(record.operation_id)
             .map_err(|_| StorageError(BlockerCode::OperationConflict))?;
-        record = self.operation(record.operation_id)?;
-        if record.action != PlanAction::Return
+        let current = self.operation(record.operation_id)?;
+        if current != record
+            || current.action != PlanAction::Return
             || !matches!(
-                record.state,
+                current.state,
                 OperationState::Planned
                     | OperationState::Copying
                     | OperationState::Verifying
                     | OperationState::Failed
             )
+            || self.requires_recovery(&current)
         {
             return Err(StorageError(BlockerCode::OperationConflict));
         }
+        record = current;
         self.export_and_verify(&mut record).await?;
         Ok(record)
     }
@@ -300,13 +330,30 @@ impl StorageService {
         &self,
         mut record: OperationRecord,
     ) -> Result<OperationRecord, StorageError> {
+        let _claim = self
+            .claim(record.operation_id)
+            .ok_or(StorageError(BlockerCode::OperationConflict))?;
+        let _owner = self
+            .journal
+            .claim_return(record.operation_id)
+            .map_err(|_| StorageError(BlockerCode::OperationConflict))?;
+        if self.operation(record.operation_id)? != record || record.action != PlanAction::Return {
+            return Err(StorageError(BlockerCode::OperationConflict));
+        }
+        self.check_return_intent(&record)?;
         let run_id = record
             .run_id
             .ok_or(StorageError(BlockerCode::OperationConflict))?;
-        let storage = self.connect().await?;
-        self.save(&mut record, OperationState::Committing)?;
         let staged_home = self.staged_home(record.operation_id);
         let config = self.staged_config(&staged_home)?;
+        let storage = self.connect().await?;
+        if let Err(error) = self
+            .check_return_intent(&record)
+            .and_then(|_| self.save(&mut record, OperationState::Committing))
+        {
+            storage.close().await;
+            return Err(error);
+        }
         let returning = ReturnCutover::new(
             self.inputs.codex_home.clone(),
             staged_home,
@@ -315,7 +362,11 @@ impl StorageService {
         // An interrupted earlier attempt left an intent behind; settle it before starting.
         let result = match returning.recover().await {
             Ok(RecoveryOutcome::RolledForward { .. }) => Ok(()),
-            Ok(_) => returning.execute(run_id).await.map(|_| ()),
+            // Nothing left to settle: only the journal is behind if the exact run already retired.
+            Ok(_) => match returning.completed(run_id).await {
+                Ok(None) => returning.execute(run_id).await.map(|_| ()),
+                done => done.map(|_| ()),
+            },
             Err(error) => Err(error),
         };
         storage.close().await;
@@ -324,12 +375,18 @@ impl StorageService {
                 self.save(&mut record, OperationState::Active)?;
                 Ok(record)
             }
-            Err(codex_storage_migration::CutoverError::Uncertain) => {
+            // With markers left the dataset may be retired: only recovery settles it, never Failed.
+            Err(error)
+                if !matches!(error, CutoverError::Uncertain)
+                    && !self.requires_recovery(&record) =>
+            {
+                Err(self.fail(&mut record, error.into()))
+            }
+            Err(_) => {
                 record.blocker = Some(BlockerCode::CutoverInProgress);
                 self.save(&mut record, OperationState::Committing)?;
                 Err(StorageError(BlockerCode::CutoverInProgress))
             }
-            Err(error) => Err(self.fail(&mut record, error.into())),
         }
     }
 
@@ -342,8 +399,34 @@ impl StorageService {
                 operations: Vec::new(),
             });
         };
+        let (plan_run, staged) = (plan.run_id, plan.staged_home.clone());
+        let mut record = self
+            .journal
+            .list()
+            .into_iter()
+            .find(|record| {
+                record.action == PlanAction::Return
+                    && matches!(
+                        record.state,
+                        OperationState::Committing | OperationState::Failed
+                    )
+                    && record.run_id == Some(plan_run)
+                    && self.staged_home(record.operation_id) == staged
+            })
+            .ok_or(StorageError(BlockerCode::OperationConflict))?;
+        let _claim = self
+            .claim(record.operation_id)
+            .ok_or(StorageError(BlockerCode::OperationConflict))?;
+        let _owner = self
+            .journal
+            .claim_return(record.operation_id)
+            .map_err(|_| StorageError(BlockerCode::OperationConflict))?;
+        if self.operation(record.operation_id)? != record {
+            return Err(StorageError(BlockerCode::OperationConflict));
+        }
+        self.check_return_intent(&record)?;
+        let config = self.staged_config(&staged)?;
         let storage = self.connect().await?;
-        let config = self.staged_config(&plan.staged_home)?;
         let returning = ReturnCutover::new(
             self.inputs.codex_home.clone(),
             plan.staged_home,
@@ -353,21 +436,19 @@ impl StorageService {
         storage.close().await;
         let outcome = outcome.map_err(|error| StorageError(error.into()))?;
         let mut touched = Vec::new();
-        for mut record in self.journal.list().into_iter().filter(|record| {
-            record.action == PlanAction::Return && record.state == OperationState::Committing
-        }) {
-            match outcome {
-                RecoveryOutcome::RolledForward { .. } => {
-                    record.blocker = None;
-                    self.save(&mut record, OperationState::Active)?;
-                }
-                // The dataset was reopened, so a new return needs a new export.
-                RecoveryOutcome::RolledBack => {
-                    record.blocker = None;
-                    self.save(&mut record, OperationState::Cancelled)?;
-                }
-                RecoveryOutcome::Idle => continue,
+        match outcome {
+            RecoveryOutcome::RolledForward { .. } => {
+                record.blocker = None;
+                self.save(&mut record, OperationState::Active)?;
             }
+            // The dataset was reopened, so a new return needs a new export.
+            RecoveryOutcome::RolledBack => {
+                record.blocker = None;
+                self.save(&mut record, OperationState::Cancelled)?;
+            }
+            RecoveryOutcome::Idle => {}
+        }
+        if !matches!(outcome, RecoveryOutcome::Idle) {
             touched.push(record);
         }
         Ok(RecoveryReport {
@@ -380,7 +461,8 @@ impl StorageService {
         })
     }
 
-    /// Cancel a return that has not retired the dataset. The dataset is reopened unchanged.
+    /// Cancel a return. Before retirement the dataset is reopened unchanged; afterwards the
+    /// return can only finish, so the completed handoff is settled as `Active`, never `Cancelled`.
     pub(crate) async fn cancel_return(
         &self,
         mut record: OperationRecord,
@@ -392,8 +474,9 @@ impl StorageService {
             .journal
             .claim_return(record.operation_id)
             .map_err(|_| StorageError(BlockerCode::OperationConflict))?;
-        record = self.operation(record.operation_id)?;
-        if record.action != PlanAction::Return
+        let current = self.operation(record.operation_id)?;
+        if current != record
+            || current.action != PlanAction::Return
             || matches!(
                 record.state,
                 OperationState::Active | OperationState::Cancelled
@@ -401,13 +484,17 @@ impl StorageService {
         {
             return Err(StorageError(BlockerCode::OperationConflict));
         }
+        record = current;
         let run_id = record
             .run_id
             .ok_or(StorageError(BlockerCode::OperationConflict))?;
+        self.check_return_intent(&record)?;
         let source = self.return_source(&record)?;
         let staged_home = self.staged_home(record.operation_id);
         let config = self.staged_config(&staged_home)?;
+        let markers = self.return_markers(&record)?;
         let storage = self.connect().await?;
+        let refuse = |error: CutoverError| StorageError(error.into());
         let migrator = Migrator::new(self.staged_source(config.clone()), storage.pool().clone());
         let returning = ReturnCutover::new(
             self.inputs.codex_home.clone(),
@@ -415,32 +502,40 @@ impl StorageService {
             Migrator::new(self.staged_source(config), storage.pool().clone()),
         );
         let result = async {
-            let intent = read_cutover(&self.inputs.codex_home).map_err(internal)?;
-            if let Some(intent) = &intent
-                && (intent.run_id != run_id
-                    || intent.target != codex_storage_authority::ActiveBackend::Local)
-            {
-                return Err(StorageError(BlockerCode::OperationConflict));
-            }
-            if intent.is_some() {
-                self.check_return_intent(&record)?;
-                returning
-                    .abort()
-                    .await
-                    .map_err(|error| StorageError(error.into()))?;
+            self.check_return_intent(&record)?;
+            let finished = if markers {
+                let outcome = returning.abort().await.map_err(refuse)?;
+                matches!(outcome, RecoveryOutcome::RolledForward { .. })
             } else {
+                returning.completed(run_id).await.map_err(refuse)?.is_some()
+            };
+            if !finished {
+                // A run that was never retired only read the dataset, so abandoning it reopens it.
                 migrator
                     .abandon_export_owned(run_id, source)
                     .await
                     .map_err(|error| StorageError(error.into()))?;
             }
-            Ok(())
+            Ok::<bool, StorageError>(finished)
         }
         .await;
         storage.close().await;
-        result?;
+        let finished = match result {
+            Ok(finished) => finished,
+            Err(_) if self.requires_recovery(&record) => {
+                record.blocker = Some(BlockerCode::CutoverInProgress);
+                self.save(&mut record, OperationState::Committing)?;
+                return Err(StorageError(BlockerCode::CutoverInProgress));
+            }
+            Err(error) => return Err(error),
+        };
         record.blocker = None;
-        self.save(&mut record, OperationState::Cancelled)?;
+        let state = if finished {
+            OperationState::Active
+        } else {
+            OperationState::Cancelled
+        };
+        self.save(&mut record, state)?;
         Ok(record)
     }
 }

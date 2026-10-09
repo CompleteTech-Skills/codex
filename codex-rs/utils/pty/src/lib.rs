@@ -51,9 +51,13 @@ pub use pty::conpty_supported;
 /// Spawn a process attached to a PTY for interactive use.
 pub use pty::spawn_process as spawn_pty_process;
 #[cfg(windows)]
+pub use win::ContainedWorkerJob;
+#[cfg(windows)]
 pub use win::JobObject;
 #[cfg(windows)]
 pub use win::PsuedoCon;
+#[cfg(windows)]
+pub use win::WorkerJobTerminal;
 #[cfg(windows)]
 pub use win::conpty::RawConPty;
 #[cfg(windows)]

@@ -48,6 +48,9 @@ mod psuedocon;
 
 pub use conpty::ConPtySystem;
 pub use job::JobObject;
+mod contained_worker;
+pub use contained_worker::ContainedWorkerJob;
+pub use contained_worker::WorkerJobTerminal;
 pub use psuedocon::PsuedoCon;
 pub use psuedocon::conpty_supported;
 

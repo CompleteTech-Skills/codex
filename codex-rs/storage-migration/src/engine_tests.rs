@@ -400,9 +400,64 @@ async fn populate(home: &Path) -> Vec<ThreadMetadata> {
     threads
 }
 
+fn migration_fixture_state<'a>(
+    required_mode: Option<&std::ffi::OsStr>,
+    state: Option<&'a std::ffi::OsStr>,
+) -> Result<Option<&'a str>, &'static str> {
+    let required = match required_mode {
+        None => false,
+        Some(mode) if mode == "1" => true,
+        Some(_) => return Err("invalid migration fixture required mode; use 1 or leave unset"),
+    };
+    let state = state.and_then(std::ffi::OsStr::to_str);
+    if required && state.is_none_or(|value| value.trim().is_empty()) {
+        return Err("required migration fixture state is absent, empty, or not Unicode");
+    }
+    Ok(state)
+}
+
+#[test]
+fn migration_fixture_admission_requires_declared_fixture() {
+    use std::ffi::OsStr;
+
+    assert_eq!(migration_fixture_state(None, None), Ok(None));
+    assert_eq!(
+        migration_fixture_state(None, Some(OsStr::new(""))),
+        Ok(Some(""))
+    );
+    for state in [None, Some(OsStr::new("")), Some(OsStr::new(" "))] {
+        assert!(migration_fixture_state(Some(OsStr::new("1")), state).is_err());
+    }
+    assert!(migration_fixture_state(Some(OsStr::new("0")), Some(OsStr::new("owned"))).is_err());
+    assert_eq!(
+        migration_fixture_state(Some(OsStr::new("1")), Some(OsStr::new("owned"))),
+        Ok(Some("owned"))
+    );
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xD800])
+    };
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0xff])
+    };
+    #[cfg(any(windows, unix))]
+    {
+        assert_eq!(migration_fixture_state(None, Some(&invalid)), Ok(None));
+        assert!(migration_fixture_state(Some(OsStr::new("1")), Some(&invalid)).is_err());
+        assert!(migration_fixture_state(Some(&invalid), Some(OsStr::new("owned"))).is_err());
+    }
+}
+
 #[tokio::test]
 async fn real_postgres_catalog_migration() {
-    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_MIGRATION_STATE") else {
+    let required_mode = std::env::var_os("CODEX_TEST_POSTGRES_REQUIRED");
+    let state = std::env::var_os("CODEX_TEST_POSTGRES_MIGRATION_STATE");
+    let Some(state) = migration_fixture_state(required_mode.as_deref(), state.as_deref())
+        .expect("migration fixture admission failed")
+    else {
         return;
     };
     let state = Path::new(&state);
