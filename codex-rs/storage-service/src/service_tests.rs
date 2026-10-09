@@ -121,6 +121,7 @@ async fn reset_target(state: &Path) {
         "UPDATE storage_activation SET state = 'open', run_id = NULL, generation = 0, dataset_id = NULL",
         "DELETE FROM storage_migration_runs",
         "DELETE FROM thread_spawn_edges",
+        "TRUNCATE project_idempotency_keys, queued_thread_revisions, agent_board_deleted, external_agent_config_imports, threads, projects CASCADE",
         "DELETE FROM threads",
         "DELETE FROM projects",
         "DELETE FROM thread_sections WHERE id <> '01984de2-8f74-7c91-a3b2-5c5e937cf318'",
