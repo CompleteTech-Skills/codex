@@ -1143,6 +1143,13 @@ mod finish_journal_control {
         let control = home.join("storage-install.json");
         let remote = load_authority(home).unwrap();
         assert_eq!(remote.marker.active_backend, ActiveBackend::Remote);
+        let authority_bytes = || {
+            [
+                fs::read(home.join("storage-identity.json")).unwrap(),
+                fs::read(home.join("storage-activation.json")).unwrap(),
+            ]
+        };
+        let remote_bytes = authority_bytes();
         assert_eq!(read_cutover(home).unwrap(), None);
         assert_eq!(read_plan(home).unwrap(), None);
         let stage_before = return_files(&staged);
@@ -1227,7 +1234,7 @@ mod finish_journal_control {
                     .join(format!("{run_id}-before-return"))
             );
             assert!(!plan.backup_dir.exists());
-            assert_eq!(load_authority(home).unwrap(), remote);
+            assert_eq!(authority_bytes(), remote_bytes);
             assert_eq!(return_files(&staged), stage_before);
             assert_eq!(sql(&mut observer).await, sql_before);
             let committing = svc.operation(id).unwrap();
