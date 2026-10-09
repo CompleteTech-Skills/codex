@@ -941,6 +941,7 @@ fn unknown_target_emptiness_still_blocks_migration() {
 
 mod finish_journal_control {
     use super::*;
+    use pretty_assertions::assert_eq;
     use codex_storage_authority::ActiveBackend;
     use codex_storage_authority::load_authority;
     use codex_storage_authority::read_cutover;
