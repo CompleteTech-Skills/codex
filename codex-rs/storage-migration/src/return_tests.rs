@@ -105,6 +105,98 @@ async fn dataset_state(pool: &Arc<PostgresPool>, source: &SqliteSource) -> Activ
         .expect("activation state")
 }
 
+fn wal_files(dir: &Path, skip: &Path) -> Vec<(PathBuf, u64, Option<String>)> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("evidence directory") {
+        let path = entry.expect("entry").path();
+        if path == skip {
+            continue;
+        }
+        if path.is_dir() {
+            files.push((path.clone(), 0, None));
+            files.extend(wal_files(&path, skip));
+        } else {
+            let len = std::fs::metadata(&path).expect("length").len();
+            let hash = (!path.to_string_lossy().ends_with(".sqlite-shm"))
+                .then(|| install::sha256_file(&path).expect("hash"));
+            files.push((path, len, hash));
+        }
+    }
+    files.sort();
+    files
+}
+async fn wal_bound<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(60), future)
+        .await
+        .expect("prepare WAL operation timed out")
+}
+async fn prepare_wal(
+    pool: &Arc<PostgresPool>,
+    home: &Path,
+    returning: &ReturnCutover,
+    run: Uuid,
+    stage: &Path,
+) {
+    let config = SqliteConfig::new_for_testing(stage.abs());
+    let source = SqliteSource::new(config.clone()).relocated_from(home.to_path_buf());
+    let state = dataset_state(pool, &source).await;
+    assert!(state.migrating && !state.retired);
+    assert_eq!(state.run_id, Some(run));
+    assert_eq!(backend(home), ActiveBackend::Remote);
+    let sql = "SELECT jsonb_build_object('activation', to_jsonb(a), 'run', to_jsonb(r), 'domains', (SELECT jsonb_agg(to_jsonb(d) ORDER BY domain) FROM storage_migration_domains d WHERE run_id = $1)) FROM storage_activation a JOIN storage_migration_runs r ON r.run_id = $1 WHERE a.singleton";
+    let observed = || async {
+        let query = sqlx::query_scalar::<_, serde_json::Value>(sql).bind(run);
+        let mut connection = pool.acquire().await.expect("SQL evidence connection");
+        query.fetch_one(&mut *connection).await.expect("SQL")
+    };
+    let before = wal_bound(observed()).await;
+    assert_eq!(before["run"]["state"], "verified");
+    assert_eq!(before["run"]["direction"], "export");
+    let fingerprint = source.fingerprint().await.expect("fingerprint");
+    assert_eq!(before["run"]["source_fingerprint"], fingerprint);
+    let db = config.state_db_path();
+    let open = config.open_read_write_pool(&db);
+    let writer = wal_bound(open).await.expect("staged writer");
+    let write = sqlx::query("CREATE TABLE qa_prepare_marker AS SELECT 1 AS value");
+    let committed = wal_bound(write.execute(&writer)).await;
+    committed.expect("committed private marker");
+    let wal = db.with_extension("sqlite-wal");
+    assert!(std::fs::metadata(wal).expect("real WAL").len() > 0);
+    assert!(db.with_extension("sqlite-shm").is_file());
+    assert_eq!(read_cutover(home).expect("no intent"), None);
+    assert_eq!(install::read_plan(home).expect("no plan"), None);
+    let live = || wal_files(home, &home.join("storage-staging"));
+    let staged = || wal_files(stage, Path::new(""));
+    let sentinel = home.join("storage-cutover.json");
+    let expected = "staged SQLite sidecars";
+    for blocked_intent in [false, true] {
+        if blocked_intent {
+            std::fs::create_dir(&sentinel).expect("intent creation sentinel");
+        }
+        let files = (live(), staged());
+        let refused = returning.prepare(run).expect_err("real WAL refusal");
+        let sidecar = matches!(refused, CutoverError::Authority(ref m) if m.contains(expected));
+        assert!(sidecar, "{refused:?}");
+        assert_eq!(wal_bound(observed()).await, before);
+        assert_eq!((live(), staged()), files);
+        if blocked_intent {
+            std::fs::remove_dir(&sentinel).expect("remove empty fixture sentinel");
+        }
+    }
+    let marker = sqlx::query_scalar::<_, i64>("SELECT value FROM qa_prepare_marker");
+    let value = wal_bound(marker.fetch_one(&writer)).await.expect("marker");
+    assert_eq!(value, 1);
+    let checkpoint = sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(TRUNCATE)");
+    let done = wal_bound(checkpoint.fetch_one(&writer));
+    let result = done.await.expect("checkpoint");
+    assert_eq!(result.0, 0);
+    wal_bound(writer.close()).await;
+    install::validate_staged_sqlite_sidecars(stage).expect("all staged sidecars gone");
+    let migrator = Migrator::new(source, pool.clone());
+    let verified = wal_bound(migrator.verify(run)).await.expect("reverify");
+    assert_eq!(verified.run_id, run);
+}
+
 pub(super) async fn return_phase(
     pool: &Arc<PostgresPool>,
     source: &SqliteSource,
@@ -129,7 +221,8 @@ pub(super) async fn return_phase(
         .to_string_lossy()
         .into_owned();
 
-    let (returning, run_id, _staged_home) = staged_return(pool, home, "happy", true).await;
+    let (returning, run_id, staged_home) = staged_return(pool, home, "happy", true).await;
+    prepare_wal(pool, home, &returning, run_id, &staged_home).await;
     let moved = returning.execute(run_id).await.expect("return");
     assert_eq!(moved.marker.active_backend, ActiveBackend::Local);
     assert_eq!(moved.identity.generation, 3);
@@ -138,6 +231,7 @@ pub(super) async fn return_phase(
     assert_eq!(install::read_plan(home).expect("plan"), None);
     let state = dataset_state(pool, source).await;
     assert!(state.retired);
+    assert_eq!(state.run_id, Some(run_id));
     assert_eq!(state.generation, 3);
 
     // The ordinary runtime opens the installed home and has the remote-only data.
