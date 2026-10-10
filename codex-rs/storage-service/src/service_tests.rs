@@ -561,140 +561,6 @@ async fn real_postgres_storage_service() {
     remote.close().await;
 
     let plan = service.plan(PlanAction::Return).await.expect("return plan");
-    // A domain failure happens after the remote fence but before an install plan exists.
-    // Explicit cancellation must use the durable pre-fence ownership identity.
-    let interrupted_id = Uuid::new_v4();
-    let (mut interrupted, created) = service
-        .prepare_return(interrupted_id, plan.plan_id, confirmed)
-        .await
-        .expect("prepare durable owner");
-    assert!(created);
-    let owned_run = interrupted.run_id.expect("identity before remote fence");
-    assert_eq!(
-        service
-            .operation(interrupted_id)
-            .expect("durable journal")
-            .run_id,
-        Some(owned_run)
-    );
-    let owned_source = interrupted.return_source.as_ref().expect("owned source");
-    let source_identity = codex_storage_migration::ActivationTarget {
-        dataset_id: owned_source.dataset_id,
-        generation: owned_source.generation,
-    };
-    assert_eq!(service.operation(interrupted_id).unwrap(), interrupted);
-    assert_eq!(Some(source_identity.dataset_id), plan.connection.dataset_id);
-    assert_eq!(Some(source_identity.generation), plan.connection.generation);
-    assert_eq!(owned_source.destination, plan.destination);
-    // The real prepared owner is durable, but a held persistent claim excludes both paths.
-    let owner = service.journal.claim_return(interrupted_id).unwrap();
-    let before = return_files(home.path());
-    let sql = return_evidence(&service).await.1;
-    assert_eq!(
-        service.run_return(interrupted.clone()).await,
-        Err(StorageError(BlockerCode::OperationConflict))
-    );
-    assert_eq!(
-        service.cancel(interrupted_id).await,
-        Err(StorageError(BlockerCode::OperationConflict))
-    );
-    assert_eq!(service.operation(interrupted_id).unwrap(), interrupted);
-    assert_eq!(return_files(home.path()), before);
-    assert_eq!(return_evidence(&service).await.1, sql);
-    drop(owner);
-    // Model the absent serde-default fields of a legacy Planned journal, never a new owner.
-    let mut legacy = interrupted.clone();
-    legacy.run_id = None;
-    legacy.return_source = None;
-    service.journal.update(&legacy).unwrap();
-    let before = return_files(home.path());
-    assert_eq!(
-        service.run_return(legacy.clone()).await,
-        Err(StorageError(BlockerCode::OperationConflict))
-    );
-    assert_eq!(
-        service.cancel(interrupted_id).await,
-        Err(StorageError(BlockerCode::OperationConflict))
-    );
-    assert_eq!(
-        service
-            .prepare_return(interrupted_id, plan.plan_id, confirmed)
-            .await
-            .unwrap(),
-        (legacy.clone(), false)
-    );
-    assert_eq!(service.operation(interrupted_id).unwrap(), legacy);
-    assert_eq!(return_files(home.path()), before);
-    assert_eq!(return_evidence(&service).await.1, sql);
-    service.journal.update(&interrupted).unwrap();
-    let staged_home = service.staged_home(interrupted_id);
-    std::fs::create_dir_all(&staged_home).expect("staging");
-    let target = codex_storage_migration::SqliteTarget::create(
-        SqliteConfig::new_for_testing(staged_home.abs()),
-        home.path().to_path_buf(),
-        "service-provider",
-    )
-    .await
-    .expect("staged target");
-    let remote = service.connect().await.expect("remote");
-    let exporter = codex_storage_migration::Migrator::new(
-        codex_storage_migration::SqliteSource::new(target.staging().clone())
-            .relocated_from(home.path().to_path_buf()),
-        remote.pool().clone(),
-    )
-    .with_batch_size(1)
-    .with_batch_limit(1);
-    service
-        .save(&mut interrupted, OperationState::Copying)
-        .expect("copying");
-    assert!(matches!(
-        exporter
-            .export_owned(&target, owned_run, source_identity)
-            .await,
-        Err(codex_storage_migration::MigrationError::Interrupted)
-    ));
-    assert_eq!(
-        exporter.activation_state().await.expect("fenced").run_id,
-        Some(owned_run)
-    );
-    target.close().await;
-    remote.close().await;
-    service
-        .save(&mut interrupted, OperationState::Failed)
-        .expect("failure receipt");
-    assert!(
-        codex_storage_migration::read_plan(home.path())
-            .expect("no install plan")
-            .is_none()
-    );
-    let cancelled = service
-        .cancel(interrupted_id)
-        .await
-        .expect("cancel pre-install owned export");
-    assert_eq!(cancelled.operation_id, interrupted_id);
-    assert_eq!(cancelled.state, OperationState::Cancelled);
-    assert_eq!(
-        service
-            .status(true)
-            .await
-            .remote
-            .expect("reopened")
-            .state
-            .as_deref(),
-        Some("open")
-    );
-    assert_eq!(
-        service
-            .start_return(interrupted_id, plan.plan_id, confirmed)
-            .await
-            .expect("terminal retry cannot reuse abandoned staging")
-            .state,
-        OperationState::Cancelled
-    );
-    let plan = service
-        .plan(PlanAction::Return)
-        .await
-        .expect("fresh return plan");
     assert!(plan.is_startable(), "{:?}", plan.blockers);
     let returning = Uuid::new_v4();
     assert_eq!(
@@ -801,19 +667,348 @@ async fn real_postgres_storage_service() {
     reset_target(state).await;
 }
 
+#[tokio::test]
+async fn real_postgres_storage_service_return_owned_controls() {
+    let state = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE");
+    if std::env::var("CODEX_TEST_POSTGRES_REQUIRED").as_deref() == Ok("1") {
+        assert!(
+            state.as_ref().is_ok_and(|path| !path.trim().is_empty()),
+            "required service fixture"
+        );
+    }
+    let Ok(state) = state else {
+        return;
+    };
+    let state = Path::new(&state);
+    let (home, service) = remote_return_home(state).await;
+    // The batch-limit fault must interrupt a real multi-row remote export.
+    let remote = service.connect().await.expect("owned control remote");
+    let mut extra = ThreadMetadataBuilder::new(
+        ThreadId::new(),
+        home.path().join("owned-control.jsonl"),
+        chrono::Utc::now(),
+        SessionSource::Cli,
+    );
+    extra.model_provider = Some("service-provider".to_string());
+    remote
+        .thread_catalog()
+        .upsert_thread(&extra.build("service-provider"))
+        .await
+        .expect("second real remote thread");
+    let mut connection = remote.pool().acquire().await.expect("thread count");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM threads")
+        .fetch_one(&mut *connection)
+        .await
+        .expect("genuine multi-row fixture");
+    assert_eq!(rows, 2);
+    drop(connection);
+    remote.close().await;
+    let confirmed = CONFIRMED;
+    let plan = service.plan(PlanAction::Return).await.expect("return plan");
+    // A domain failure happens after the remote fence but before an install plan exists.
+    // Explicit cancellation must use the durable pre-fence ownership identity.
+    let interrupted_id = Uuid::new_v4();
+    let (mut interrupted, created) = service
+        .prepare_return(interrupted_id, plan.plan_id, confirmed)
+        .await
+        .expect("prepare durable owner");
+    assert!(created);
+    let owned_run = interrupted.run_id.expect("identity before remote fence");
+    assert_eq!(
+        service
+            .operation(interrupted_id)
+            .expect("durable journal")
+            .run_id,
+        Some(owned_run)
+    );
+    let owned_source = interrupted.return_source.as_ref().expect("owned source");
+    let source_identity = codex_storage_migration::ActivationTarget {
+        dataset_id: owned_source.dataset_id,
+        generation: owned_source.generation,
+    };
+    assert_eq!(service.operation(interrupted_id).unwrap(), interrupted);
+    assert_eq!(Some(source_identity.dataset_id), plan.connection.dataset_id);
+    assert_eq!(Some(source_identity.generation), plan.connection.generation);
+    assert_eq!(owned_source.destination, plan.destination);
+    // Model only a durable lifecycle advance under the real lock, not an actual SQL fence.
+    let owner = service.journal.claim_return(interrupted_id).unwrap();
+    let advanced = saved(&service, &interrupted, OperationState::Copying);
+    let before = return_files(home.path());
+    let sql = return_evidence(&service).await.1;
+    let lock_error = service.journal.claim_return(interrupted_id).unwrap_err();
+    assert!(matches!(
+        lock_error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<std::fs::TryLockError>()),
+        Some(std::fs::TryLockError::WouldBlock)
+    ));
+    let lock_retry = service
+        .start_return(interrupted_id, plan.plan_id, confirmed)
+        .await;
+    let stale_retry = service.run_return(interrupted.clone()).await;
+    assert_eq!(
+        service.cancel(interrupted_id).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    );
+    assert_eq!(service.operation(interrupted_id).unwrap(), advanced);
+    assert_eq!(return_files(home.path()), before);
+    assert_eq!(return_evidence(&service).await.1, sql);
+    drop(owner);
+    service.journal.update(&interrupted).unwrap();
+    // Model the absent serde-default fields of a legacy Planned journal, never a new owner.
+    let mut legacy = interrupted.clone();
+    legacy.run_id = None;
+    legacy.return_source = None;
+    service.journal.update(&legacy).unwrap();
+    let before = return_files(home.path());
+    assert_eq!(
+        service.run_return(legacy.clone()).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    );
+    assert_eq!(
+        service.cancel(interrupted_id).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    );
+    assert_eq!(
+        service
+            .prepare_return(interrupted_id, plan.plan_id, confirmed)
+            .await
+            .unwrap(),
+        (legacy.clone(), false)
+    );
+    assert_eq!(service.operation(interrupted_id).unwrap(), legacy);
+    assert_eq!(return_files(home.path()), before);
+    assert_eq!(return_evidence(&service).await.1, sql);
+    service.journal.update(&interrupted).unwrap();
+    let staged_home = service.staged_home(interrupted_id);
+    std::fs::create_dir_all(&staged_home).expect("staging");
+    let target = codex_storage_migration::SqliteTarget::create(
+        SqliteConfig::new_for_testing(staged_home.abs()),
+        home.path().to_path_buf(),
+        "service-provider",
+    )
+    .await
+    .expect("staged target");
+    let remote = service.connect().await.expect("remote");
+    let exporter = codex_storage_migration::Migrator::new(
+        codex_storage_migration::SqliteSource::new(target.staging().clone())
+            .relocated_from(home.path().to_path_buf()),
+        remote.pool().clone(),
+    )
+    .with_batch_size(1)
+    .with_batch_limit(1);
+    service
+        .save(&mut interrupted, OperationState::Copying)
+        .expect("copying");
+    assert!(matches!(
+        exporter
+            .export_owned(&target, owned_run, source_identity)
+            .await,
+        Err(codex_storage_migration::MigrationError::Interrupted)
+    ));
+    assert_eq!(
+        exporter.activation_state().await.expect("fenced").run_id,
+        Some(owned_run)
+    );
+    target.close().await;
+    remote.close().await;
+    service
+        .save(&mut interrupted, OperationState::Failed)
+        .expect("failure receipt");
+    assert!(
+        codex_storage_migration::read_plan(home.path())
+            .expect("no install plan")
+            .is_none()
+    );
+    let cancelled = service
+        .cancel(interrupted_id)
+        .await
+        .expect("cancel pre-install owned export");
+    assert_eq!(cancelled.operation_id, interrupted_id);
+    assert_eq!(cancelled.state, OperationState::Cancelled);
+    assert_eq!(
+        service
+            .status(true)
+            .await
+            .remote
+            .expect("reopened")
+            .state
+            .as_deref(),
+        Some("open")
+    );
+    assert_eq!(
+        service
+            .start_return(interrupted_id, plan.plan_id, confirmed)
+            .await
+            .expect("terminal retry cannot reuse abandoned staging")
+            .state,
+        OperationState::Cancelled
+    );
+    let plan = service
+        .plan(PlanAction::Return)
+        .await
+        .expect("fresh return plan");
+    // A is genuinely untouched; B's public export changes the actual SQL state to migrating.
+    let (untouched, created) = service
+        .prepare_return(Uuid::new_v4(), plan.plan_id, confirmed)
+        .await
+        .unwrap();
+    assert!(created && untouched.state == OperationState::Planned);
+    drop(
+        service
+            .journal
+            .claim_return(untouched.operation_id)
+            .unwrap(),
+    );
+    assert!(!service.staged_home(untouched.operation_id).exists());
+    let other = service
+        .start_return(Uuid::new_v4(), plan.plan_id, confirmed)
+        .await
+        .unwrap();
+    assert_eq!(other.state, OperationState::Ready);
+    let before = return_evidence(&service).await;
+    let rows: serde_json::Value = serde_json::from_str(&before.1).unwrap();
+    assert_eq!(rows["activation"]["state"], "migrating");
+    assert_eq!(
+        rows["activation"]["run_id"],
+        other.run_id.unwrap().to_string()
+    );
+    assert!(
+        !rows["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["run_id"] == untouched.run_id.unwrap().to_string())
+    );
+    let drift_cancel = service.cancel(untouched.operation_id).await;
+    let untouched_now = service.operation(untouched.operation_id).unwrap();
+    let after = return_evidence(&service).await;
+    assert_eq!(after.1, before.1);
+    assert_eq!(
+        except_journal(after.0, home.path(), untouched.operation_id),
+        except_journal(before.0, home.path(), untouched.operation_id)
+    );
+    assert_eq!(service.operation(other.operation_id).unwrap(), other);
+    assert!(!service.staged_home(untouched.operation_id).exists());
+    let mut unchanged = untouched_now.clone();
+    unchanged.state = untouched.state;
+    unchanged.updated_at_ms = untouched.updated_at_ms;
+    assert_eq!(unchanged, untouched);
+    assert_eq!(
+        service.cancel(other.operation_id).await.unwrap().state,
+        OperationState::Cancelled
+    );
+
+    // An actual service configuration without a candidate fails before any staging/connection.
+    let plan = service.plan(PlanAction::Return).await.unwrap();
+    let (preflight, created) = service
+        .prepare_return(Uuid::new_v4(), plan.plan_id, confirmed)
+        .await
+        .unwrap();
+    assert!(created);
+    drop(
+        service
+            .journal
+            .claim_return(preflight.operation_id)
+            .unwrap(),
+    );
+    let missing = self::service(home.path(), state, None, keyring(state, None));
+    let before = return_evidence(&service).await;
+    let validation_error = missing.run_return(preflight.clone()).await;
+    let failed = service.operation(preflight.operation_id).unwrap();
+    let after = return_evidence(&service).await;
+    assert_eq!(after.1, before.1);
+    assert_eq!(
+        except_journal(after.0, home.path(), preflight.operation_id),
+        except_journal(before.0, home.path(), preflight.operation_id)
+    );
+    assert!(!service.staged_home(preflight.operation_id).exists());
+    let mut unchanged = failed.clone();
+    unchanged.state = preflight.state;
+    unchanged.blocker = preflight.blocker;
+    unchanged.updated_at_ms = preflight.updated_at_ms;
+    assert_eq!(unchanged, preflight);
+    // Restoring the actual configured service retries the same owner, then cancels its real run.
+    let retry = service
+        .start_return(preflight.operation_id, plan.plan_id, confirmed)
+        .await
+        .unwrap();
+    assert_eq!(retry.state, OperationState::Ready);
+    assert_eq!(retry.blocker, None);
+    assert_eq!(retry.run_id, preflight.run_id);
+    assert_eq!(retry.return_source, preflight.return_source);
+    assert_eq!(
+        service.cancel(retry.operation_id).await.unwrap().state,
+        OperationState::Cancelled
+    );
+
+    // A real lock-open error is not contention and must not return a successful record.
+    let plan = service.plan(PlanAction::Return).await.unwrap();
+    let (unclaimable, _) = service
+        .prepare_return(Uuid::new_v4(), plan.plan_id, confirmed)
+        .await
+        .unwrap();
+    std::fs::create_dir(
+        home.path()
+            .join("storage-operations")
+            .join(format!("{}.lock", unclaimable.operation_id)),
+    )
+    .unwrap();
+    let before = return_evidence(&service).await;
+    assert_eq!(
+        service.run_return(unclaimable.clone()).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    );
+    assert_eq!(
+        service.operation(unclaimable.operation_id).unwrap(),
+        unclaimable
+    );
+    assert_eq!(return_evidence(&service).await, before);
+
+    // Retention proofs above run on both sources; collect all three outcomes before asserting.
+    eprintln!(
+        "return-p2-lock operation={interrupted_id} run={owned_run} public={:?} stale={:?}",
+        lock_retry.as_ref().map(|r| r.state),
+        stale_retry.as_ref().map(|r| r.state)
+    );
+    eprintln!(
+        "return-p2-drift operation={} run={} result={:?} durable={:?}",
+        untouched.operation_id,
+        untouched.run_id.unwrap(),
+        drift_cancel.as_ref().map(|r| r.state),
+        untouched_now.state
+    );
+    eprintln!(
+        "return-p2-validation operation={} run={} result={:?} durable={:?} blocker={:?}",
+        preflight.operation_id,
+        preflight.run_id.unwrap(),
+        validation_error.as_ref().map(|r| r.state),
+        failed.state,
+        failed.blocker
+    );
+    assert_eq!(lock_retry, Ok(advanced.clone()));
+    assert_eq!(stale_retry, Ok(advanced));
+    assert_eq!(drift_cancel, Ok(untouched_now.clone()));
+    assert_eq!(untouched_now.state, OperationState::Cancelled);
+    assert_eq!(
+        validation_error,
+        Err(StorageError(BlockerCode::NoCandidateProfile))
+    );
+    assert_eq!(failed.state, OperationState::Failed);
+    assert_eq!(failed.blocker, Some(BlockerCode::NoCandidateProfile));
+    reset_target(state).await;
+    eprintln!(
+        "return-owned-controls-qualified operation={interrupted_id} run={owned_run} drift_operation={} validation_operation={}",
+        untouched.operation_id, preflight.operation_id
+    );
+}
+
 const CONFIRMED: Confirmation = Confirmation {
     writers_stopped: true,
 };
 
-/// A remote home with a verified export of its dataset waiting in `Ready`.
-async fn ready_return(
-    state: &Path,
-) -> (
-    tempfile::TempDir,
-    StorageService,
-    OperationRecord,
-    (Uuid, OperationRecord),
-) {
+/// A genuinely populated home migrated, verified and activated on the owned remote fixture.
+async fn remote_return_home(state: &Path) -> (tempfile::TempDir, StorageService) {
     reset_target(state).await;
     let home = populated_home().await;
     let profile = Some(profile(state, true));
@@ -826,6 +1021,19 @@ async fn ready_return(
         .await;
     started.expect("migrate");
     svc.activate(migration).await.expect("activate");
+    (home, svc)
+}
+
+/// A remote home with a verified export of its dataset waiting in `Ready`.
+async fn ready_return(
+    state: &Path,
+) -> (
+    tempfile::TempDir,
+    StorageService,
+    OperationRecord,
+    (Uuid, OperationRecord),
+) {
+    let (home, svc) = remote_return_home(state).await;
     let plan = svc.plan(PlanAction::Return).await.expect("return plan");
     let (prepared, created) = svc
         .prepare_return(Uuid::new_v4(), plan.plan_id, CONFIRMED)
@@ -896,6 +1104,18 @@ fn return_files(path: &Path) -> Vec<(std::path::PathBuf, bool, Vec<u8>)> {
     }
     files.sort();
     files
+}
+
+fn except_journal(
+    files: Vec<(std::path::PathBuf, bool, Vec<u8>)>,
+    home: &Path,
+    id: Uuid,
+) -> Vec<(std::path::PathBuf, bool, Vec<u8>)> {
+    let journal = home.join("storage-operations").join(format!("{id}.json"));
+    files
+        .into_iter()
+        .filter(|(path, _, _)| *path != journal)
+        .collect()
 }
 
 async fn return_evidence(
