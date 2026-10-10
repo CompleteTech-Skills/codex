@@ -561,6 +561,150 @@ async fn real_postgres_storage_service() {
     remote.close().await;
 
     let plan = service.plan(PlanAction::Return).await.expect("return plan");
+    assert!(plan.is_startable(), "{:?}", plan.blockers);
+    let returning = Uuid::new_v4();
+    assert_eq!(
+        service
+            .start_return(
+                returning,
+                plan.plan_id,
+                Confirmation {
+                    writers_stopped: false
+                }
+            )
+            .await,
+        Err(StorageError(BlockerCode::NotConfirmed))
+    );
+    assert_eq!(
+        service
+            .start_return(returning, Uuid::new_v4(), confirmed)
+            .await,
+        Err(StorageError(BlockerCode::StalePlan))
+    );
+    let ready = service
+        .start_return(returning, plan.plan_id, confirmed)
+        .await
+        .expect("export");
+    assert_eq!(ready.state, OperationState::Ready);
+    assert!(
+        ready
+            .copied
+            .iter()
+            .any(|(domain, rows)| domain == "threads" && *rows == 4)
+    );
+    // While the export waits, the dataset is closed to writers but the home is still remote.
+    let waiting = service.status(true).await;
+    assert_eq!(waiting.active_backend, BackendName::RemotePostgres);
+    assert_eq!(
+        waiting.remote.expect("remote summary").state.as_deref(),
+        Some("migrating")
+    );
+
+    // Cancelling reopens the dataset unchanged and a new export can be made.
+    let cancelled = service.cancel(returning).await.expect("cancel");
+    assert_eq!(cancelled.state, OperationState::Cancelled);
+    assert_eq!(
+        service
+            .status(true)
+            .await
+            .remote
+            .expect("remote")
+            .state
+            .as_deref(),
+        Some("open")
+    );
+    let plan = service.plan(PlanAction::Return).await.expect("plan again");
+    let second_return = Uuid::new_v4();
+    let ready = service
+        .start_return(second_return, plan.plan_id, confirmed)
+        .await
+        .expect("second export");
+    assert_eq!(ready.state, OperationState::Ready);
+    let done = service.activate(second_return).await.expect("return");
+    assert_eq!(done.state, OperationState::Active);
+    assert_eq!(service.activate(second_return).await.expect("again"), done);
+
+    // The home is local again, the dataset is retired, and the local files hold everything.
+    let status = service.status(true).await;
+    assert_eq!(status.active_backend, BackendName::LocalSqlite);
+    assert_eq!(status.authority, AuthorityLabel::Local);
+    assert_eq!(status.local_generation, Some(3));
+    assert!(status.remote_ever_activated);
+    assert_eq!(
+        status.remote.expect("remote").state.as_deref(),
+        Some("retired")
+    );
+    let runtime = StateRuntime::init(
+        SqliteConfig::new_for_testing(home.path().abs()),
+        "service-provider".to_string(),
+    )
+    .await
+    .expect("returned runtime");
+    assert!(
+        runtime
+            .get_thread(remote_only.id)
+            .await
+            .expect("remote-only thread")
+            .is_some()
+    );
+    runtime.close().await;
+    assert!(
+        service
+            .plan(PlanAction::Migrate)
+            .await
+            .expect("plan after return")
+            .blockers
+            .contains(&BlockerCode::DatasetRetired)
+    );
+    assert_eq!(
+        service.recover().await.expect("recover").outcome,
+        RecoveryKind::Idle
+    );
+    // The host that joined is told plainly, not left writing a history nobody reads.
+    let stranded = second.status(true).await;
+    assert!(stranded.blockers.contains(&BlockerCode::DatasetRetired));
+    return_fault_cases(state).await;
+    reset_target(state).await;
+}
+
+#[tokio::test]
+async fn real_postgres_storage_service_return_owned_controls() {
+    let state = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE");
+    if std::env::var("CODEX_TEST_POSTGRES_REQUIRED").as_deref() == Ok("1") {
+        assert!(
+            state.as_ref().is_ok_and(|path| !path.trim().is_empty()),
+            "required service fixture"
+        );
+    }
+    let Ok(state) = state else {
+        return;
+    };
+    let state = Path::new(&state);
+    let (home, service) = remote_return_home(state).await;
+    // The batch-limit fault must interrupt a real multi-row remote export.
+    let remote = service.connect().await.expect("owned control remote");
+    let mut extra = ThreadMetadataBuilder::new(
+        ThreadId::new(),
+        home.path().join("owned-control.jsonl"),
+        chrono::Utc::now(),
+        SessionSource::Cli,
+    );
+    extra.model_provider = Some("service-provider".to_string());
+    remote
+        .thread_catalog()
+        .upsert_thread(&extra.build("service-provider"))
+        .await
+        .expect("second real remote thread");
+    let mut connection = remote.pool().acquire().await.expect("thread count");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM threads")
+        .fetch_one(&mut *connection)
+        .await
+        .expect("genuine multi-row fixture");
+    assert_eq!(rows, 2);
+    drop(connection);
+    remote.close().await;
+    let confirmed = CONFIRMED;
+    let plan = service.plan(PlanAction::Return).await.expect("return plan");
     // A domain failure happens after the remote fence but before an install plan exists.
     // Explicit cancellation must use the durable pre-fence ownership identity.
     let interrupted_id = Uuid::new_v4();
@@ -852,129 +996,19 @@ async fn real_postgres_storage_service() {
     );
     assert_eq!(failed.state, OperationState::Failed);
     assert_eq!(failed.blocker, Some(BlockerCode::NoCandidateProfile));
-    let plan = service
-        .plan(PlanAction::Return)
-        .await
-        .expect("post-control plan");
-    assert!(plan.is_startable(), "{:?}", plan.blockers);
-    let returning = Uuid::new_v4();
-    assert_eq!(
-        service
-            .start_return(
-                returning,
-                plan.plan_id,
-                Confirmation {
-                    writers_stopped: false
-                }
-            )
-            .await,
-        Err(StorageError(BlockerCode::NotConfirmed))
-    );
-    assert_eq!(
-        service
-            .start_return(returning, Uuid::new_v4(), confirmed)
-            .await,
-        Err(StorageError(BlockerCode::StalePlan))
-    );
-    let ready = service
-        .start_return(returning, plan.plan_id, confirmed)
-        .await
-        .expect("export");
-    assert_eq!(ready.state, OperationState::Ready);
-    assert!(
-        ready
-            .copied
-            .iter()
-            .any(|(domain, rows)| domain == "threads" && *rows == 4)
-    );
-    // While the export waits, the dataset is closed to writers but the home is still remote.
-    let waiting = service.status(true).await;
-    assert_eq!(waiting.active_backend, BackendName::RemotePostgres);
-    assert_eq!(
-        waiting.remote.expect("remote summary").state.as_deref(),
-        Some("migrating")
-    );
-
-    // Cancelling reopens the dataset unchanged and a new export can be made.
-    let cancelled = service.cancel(returning).await.expect("cancel");
-    assert_eq!(cancelled.state, OperationState::Cancelled);
-    assert_eq!(
-        service
-            .status(true)
-            .await
-            .remote
-            .expect("remote")
-            .state
-            .as_deref(),
-        Some("open")
-    );
-    let plan = service.plan(PlanAction::Return).await.expect("plan again");
-    let second_return = Uuid::new_v4();
-    let ready = service
-        .start_return(second_return, plan.plan_id, confirmed)
-        .await
-        .expect("second export");
-    assert_eq!(ready.state, OperationState::Ready);
-    let done = service.activate(second_return).await.expect("return");
-    assert_eq!(done.state, OperationState::Active);
-    assert_eq!(service.activate(second_return).await.expect("again"), done);
-
-    // The home is local again, the dataset is retired, and the local files hold everything.
-    let status = service.status(true).await;
-    assert_eq!(status.active_backend, BackendName::LocalSqlite);
-    assert_eq!(status.authority, AuthorityLabel::Local);
-    assert_eq!(status.local_generation, Some(3));
-    assert!(status.remote_ever_activated);
-    assert_eq!(
-        status.remote.expect("remote").state.as_deref(),
-        Some("retired")
-    );
-    let runtime = StateRuntime::init(
-        SqliteConfig::new_for_testing(home.path().abs()),
-        "service-provider".to_string(),
-    )
-    .await
-    .expect("returned runtime");
-    assert!(
-        runtime
-            .get_thread(remote_only.id)
-            .await
-            .expect("remote-only thread")
-            .is_some()
-    );
-    runtime.close().await;
-    assert!(
-        service
-            .plan(PlanAction::Migrate)
-            .await
-            .expect("plan after return")
-            .blockers
-            .contains(&BlockerCode::DatasetRetired)
-    );
-    assert_eq!(
-        service.recover().await.expect("recover").outcome,
-        RecoveryKind::Idle
-    );
-    // The host that joined is told plainly, not left writing a history nobody reads.
-    let stranded = second.status(true).await;
-    assert!(stranded.blockers.contains(&BlockerCode::DatasetRetired));
-    return_fault_cases(state).await;
     reset_target(state).await;
+    eprintln!(
+        "return-owned-controls-qualified operation={interrupted_id} run={owned_run} drift_operation={} validation_operation={}",
+        untouched.operation_id, preflight.operation_id
+    );
 }
 
 const CONFIRMED: Confirmation = Confirmation {
     writers_stopped: true,
 };
 
-/// A remote home with a verified export of its dataset waiting in `Ready`.
-async fn ready_return(
-    state: &Path,
-) -> (
-    tempfile::TempDir,
-    StorageService,
-    OperationRecord,
-    (Uuid, OperationRecord),
-) {
+/// A genuinely populated home migrated, verified and activated on the owned remote fixture.
+async fn remote_return_home(state: &Path) -> (tempfile::TempDir, StorageService) {
     reset_target(state).await;
     let home = populated_home().await;
     let profile = Some(profile(state, true));
@@ -987,6 +1021,19 @@ async fn ready_return(
         .await;
     started.expect("migrate");
     svc.activate(migration).await.expect("activate");
+    (home, svc)
+}
+
+/// A remote home with a verified export of its dataset waiting in `Ready`.
+async fn ready_return(
+    state: &Path,
+) -> (
+    tempfile::TempDir,
+    StorageService,
+    OperationRecord,
+    (Uuid, OperationRecord),
+) {
+    let (home, svc) = remote_return_home(state).await;
     let plan = svc.plan(PlanAction::Return).await.expect("return plan");
     let (prepared, created) = svc
         .prepare_return(Uuid::new_v4(), plan.plan_id, CONFIRMED)

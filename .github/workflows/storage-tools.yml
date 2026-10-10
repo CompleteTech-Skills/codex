@@ -265,7 +265,10 @@ jobs:
 
           sql(Path(os.environ["CODEX_TEST_POSTGRES_STATE"]), "TRUNCATE codex_storage.project_idempotency_keys, codex_storage.queued_thread_revisions, codex_storage.agent_board_deleted, codex_storage.external_agent_config_imports, codex_storage.threads, codex_storage.projects CASCADE")
           PY
-          CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE="$CODEX_TEST_POSTGRES_STATE" just test -p codex-storage-service real_postgres_storage_service
+          CODEX_TEST_POSTGRES_REQUIRED=1 CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE="$CODEX_TEST_POSTGRES_STATE" \
+            just test --locked -p codex-storage-service \
+              -E 'test(=tests::real_postgres_storage_service) | test(=tests::real_postgres_storage_service_return_owned_controls)' \
+              --retries 0 --test-threads 1 --success-output=final
       - name: Require public service journal settlement after Local finish failure
         working-directory: codex-rs
         shell: bash
