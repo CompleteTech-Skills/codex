@@ -90,7 +90,7 @@ impl StorageService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(operation_id);
-        inserted.then_some(RunGuard {
+        inserted.then(|| RunGuard {
             service: self,
             operation_id,
         })
