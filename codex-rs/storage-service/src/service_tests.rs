@@ -745,8 +745,9 @@ fn settled(home: &Path) -> bool {
 }
 
 fn return_files(path: &Path) -> Vec<(std::path::PathBuf, bool, Vec<u8>)> {
-    let directory = path.is_dir();
-    let bytes = if directory {
+    let metadata = std::fs::metadata(path).expect("evidence metadata");
+    let directory = metadata.is_dir();
+    let bytes = if directory || (metadata.is_file() && metadata.len() == 0) {
         Vec::new()
     } else {
         std::fs::read(path).expect("file evidence")
@@ -866,6 +867,202 @@ async fn return_fault_cases(state: &Path) {
     );
     let cancelled = svc.cancel(failed.operation_id).await.expect("cancel");
     assert_eq!(cancelled.state, OperationState::Cancelled);
+}
+
+#[tokio::test]
+async fn real_postgres_storage_service_return_claims() {
+    let state = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE");
+    if std::env::var("CODEX_TEST_POSTGRES_REQUIRED").as_deref() == Ok("1") {
+        assert!(
+            state.as_ref().is_ok_and(|s| !s.trim().is_empty()),
+            "required service fixture"
+        );
+    }
+    let Ok(state) = state else {
+        return;
+    };
+    tokio::time::timeout(Duration::from_secs(50), async {
+        let (home, svc, ready, (_, prepared)) = ready_return(Path::new(&state)).await;
+        assert_eq!(prepared.run_id, None);
+        assert_eq!(prepared.return_source, None);
+        assert_eq!(ready.return_source, None);
+        let id = ready.operation_id;
+        let conflict = Err(StorageError(BlockerCode::OperationConflict));
+        let lock = home
+            .path()
+            .join("storage-operations")
+            .join(format!("{id}.lock"));
+        let owner = svc.journal.claim_return(id).unwrap();
+        let before = return_evidence(&svc).await;
+        // Ready was reached by the public exporter, not a modeled journal/SQL fence.
+        assert_eq!(svc.run_return(prepared.clone()).await.unwrap(), ready);
+        assert_eq!(svc.activate(id).await, conflict);
+        assert_eq!(svc.cancel(id).await, conflict);
+        assert_eq!(svc.operation(id).unwrap(), ready);
+        assert_eq!(return_evidence(&svc).await, before);
+        drop(owner);
+        // In-process exclusion obeys the same freshness/refusal policy.
+        let claim = svc.claim(id).unwrap();
+        assert_eq!(svc.run_return(prepared.clone()).await.unwrap(), ready);
+        assert_eq!(svc.activate(id).await, conflict);
+        assert_eq!(svc.cancel(id).await, conflict);
+        drop(claim);
+        assert_eq!(return_evidence(&svc).await, before);
+        let mut stale_digest = ready.clone();
+        stale_digest.plan_digest.push_str("stale");
+        let mut stale_copied = ready.clone();
+        stale_copied.copied.push(("stale".to_owned(), 1));
+        for stale in [stale_digest, stale_copied] {
+            assert_eq!(svc.run_return(stale.clone()).await, conflict);
+            assert_eq!(svc.activate_return(stale.clone()).await, conflict);
+            assert_eq!(svc.cancel_return(stale).await, conflict);
+            assert_eq!(svc.operation(id).unwrap(), ready);
+            assert_eq!(return_evidence(&svc).await, before);
+        }
+        let mut foreign = ready.clone();
+        foreign.action = PlanAction::Migrate;
+        assert_eq!(svc.run_return(foreign.clone()).await, conflict);
+        assert_eq!(svc.activate_return(foreign.clone()).await, conflict);
+        assert_eq!(svc.cancel_return(foreign).await, conflict);
+        assert_eq!(return_evidence(&svc).await, before);
+
+        // Public activate creates real owned intent/plan and retires SQL before this install fault.
+        let fault = home
+            .path()
+            .join("storage-backups")
+            .join(format!("{}-before-return", ready.run_id.unwrap()));
+        std::fs::create_dir_all(fault.parent().unwrap()).unwrap();
+        std::fs::write(&fault, b"owned install fault").unwrap();
+        assert_eq!(
+            svc.activate(id).await,
+            Err(StorageError(BlockerCode::CutoverInProgress))
+        );
+        let held = svc.operation(id).unwrap();
+        assert_eq!(held.state, OperationState::Committing);
+        assert!(markers(home.path()));
+        let mut sentinel = held.clone();
+        sentinel.operation_id = Uuid::new_v4();
+        // Synthetic filtering control: same run, different operation-derived stage, no SQL owner.
+        svc.journal.create(&sentinel).unwrap();
+        let owner = svc.journal.claim_return(id).unwrap();
+        let before = return_evidence(&svc).await;
+        let sql: serde_json::Value = serde_json::from_str(&before.1).unwrap();
+        assert_eq!(sql["activation"]["state"], "retired");
+        assert_eq!(
+            sql["activation"]["run_id"],
+            ready.run_id.unwrap().to_string()
+        );
+        let intent = codex_storage_authority::read_cutover(home.path())
+            .unwrap()
+            .unwrap();
+        let plan = codex_storage_migration::read_plan(home.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.run_id, ready.run_id.unwrap());
+        assert_eq!(intent.target, codex_storage_authority::ActiveBackend::Local);
+        assert_eq!(plan.run_id, intent.run_id);
+        assert_eq!(plan.staged_home, svc.staged_home(id));
+        assert_eq!(
+            sql["activation"]["generation"].as_u64(),
+            Some(intent.to_generation)
+        );
+        assert_eq!(
+            sql["activation"]["dataset_id"],
+            intent.dataset_id.to_string()
+        );
+        assert_eq!(svc.run_return(prepared).await.unwrap(), held);
+        assert_eq!(svc.activate(id).await, conflict);
+        assert_eq!(svc.cancel(id).await, conflict);
+        assert_eq!(
+            svc.recover().await,
+            Err(StorageError(BlockerCode::OperationConflict))
+        );
+        assert_eq!(svc.operation(id).unwrap(), held);
+        assert_eq!(svc.operation(sentinel.operation_id).unwrap(), sentinel);
+        assert_eq!(return_evidence(&svc).await, before);
+        drop(owner);
+        let claim = svc.claim(id).unwrap();
+        assert_eq!(
+            svc.recover().await,
+            Err(StorageError(BlockerCode::OperationConflict))
+        );
+        drop(claim);
+        assert_eq!(return_evidence(&svc).await, before);
+        assert_eq!(svc.activate_return(ready.clone()).await, conflict);
+        assert_eq!(svc.cancel_return(ready.clone()).await, conflict);
+        assert_eq!(return_evidence(&svc).await, before);
+
+        // A genuine open error must refuse every driver, not masquerade as contention.
+        // Preserve the exact persistent file inode; only this disposable fixture path is moved.
+        let retained = lock.with_extension("retained-lock");
+        std::fs::rename(&lock, &retained).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        let before_io = return_evidence(&svc).await;
+        assert_eq!(svc.run_return(held.clone()).await, conflict);
+        assert_eq!(svc.activate(id).await, conflict);
+        assert_eq!(svc.cancel(id).await, conflict);
+        assert_eq!(
+            svc.recover().await,
+            Err(StorageError(BlockerCode::OperationConflict))
+        );
+        assert_eq!(svc.operation(id).unwrap(), held);
+        assert_eq!(return_evidence(&svc).await, before_io);
+        std::fs::remove_dir(&lock).unwrap();
+        std::fs::rename(&retained, &lock).unwrap();
+        assert_eq!(return_evidence(&svc).await, before);
+
+        // Missing and ambiguous captured owners refuse before recovery changes SQL/files.
+        let mut wrong = held.clone();
+        wrong.run_id = Some(Uuid::new_v4());
+        svc.journal.update(&wrong).unwrap();
+        let evidence = return_evidence(&svc).await;
+        assert_eq!(
+            svc.recover().await,
+            Err(StorageError(BlockerCode::OperationConflict))
+        );
+        assert_eq!(svc.operation(id).unwrap(), wrong);
+        assert_eq!(return_evidence(&svc).await, evidence);
+        svc.journal.update(&held).unwrap();
+        let alias = home
+            .path()
+            .join("storage-operations")
+            .join(format!("{}.json", Uuid::new_v4()));
+        // Deliberately duplicated journal bytes model ambiguity, never a second causal owner.
+        std::fs::write(&alias, serde_json::to_vec(&held).unwrap()).unwrap();
+        let evidence = return_evidence(&svc).await;
+        assert_eq!(
+            svc.recover().await,
+            Err(StorageError(BlockerCode::OperationConflict))
+        );
+        assert_eq!(return_evidence(&svc).await, evidence);
+        std::fs::remove_file(alias).unwrap();
+        assert_eq!(return_evidence(&svc).await, before);
+
+        std::fs::remove_file(fault).unwrap();
+        let recovered = svc.recover().await.unwrap();
+        assert_eq!(recovered.outcome, RecoveryKind::RolledForward);
+        let done = svc.operation(id).unwrap();
+        let mut expected = held;
+        expected.state = OperationState::Active;
+        expected.blocker = None;
+        expected.updated_at_ms = done.updated_at_ms;
+        assert_eq!(done, expected);
+        assert_eq!(recovered.operations, vec![done.clone()]);
+        assert_eq!(svc.operation(sentinel.operation_id).unwrap(), sentinel);
+        assert_eq!(return_evidence(&svc).await.1, before.1);
+        assert!(settled(home.path()));
+        assert!(codex_storage_migration::verify_backup(&plan).unwrap());
+        assert_eq!(svc.activate(id).await.unwrap(), done);
+        assert_eq!(svc.cancel(id).await.unwrap(), done);
+        assert!(lock.is_file());
+        reset_target(Path::new(&state)).await;
+        eprintln!(
+            "return-claims-qualified operation={id} run={}",
+            done.run_id.unwrap()
+        );
+    })
+    .await
+    .expect("whole return claims control bound");
 }
 
 fn dataset_report() -> ConnectionReport {

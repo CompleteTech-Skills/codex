@@ -376,6 +376,12 @@ crate.annotation(
     ],
 )
 crate.annotation(
+    # Cached build scripts must resolve metadata against their current execution root.
+    crate = "libsqlite3-sys",
+    patch_args = ["-p1"],
+    patches = ["//patches:libsqlite3-sys_runtime_manifest_dir.patch"],
+)
+crate.annotation(
     crate = "ring",
     patch_args = ["-p1"],
     patches = [
