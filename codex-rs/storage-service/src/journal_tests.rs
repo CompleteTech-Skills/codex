@@ -78,15 +78,31 @@ fn return_identity_survives_restart_and_export_cancel_exclude_each_other() {
         restarted.read(planned.operation_id).expect("restart"),
         Some(planned.clone())
     );
+    let lock = journal.path(planned.operation_id).with_extension("lock");
+    std::fs::write(&lock, b"persistent owner bytes").expect("existing lock");
     let export = journal
         .claim_return(planned.operation_id)
         .expect("export owner");
-    assert!(restarted.claim_return(planned.operation_id).is_err());
+    assert_eq!(
+        restarted
+            .claim_return(planned.operation_id)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
     drop(export);
+    assert_eq!(std::fs::read(&lock).unwrap(), b"persistent owner bytes");
     let cancel = restarted
         .claim_return(planned.operation_id)
         .expect("cancel after exporter exits");
     drop(cancel);
+    assert_eq!(std::fs::read(&lock).unwrap(), b"persistent owner bytes");
+    let other = Uuid::new_v4();
+    std::fs::create_dir(journal.path(other).with_extension("lock")).unwrap();
+    assert_ne!(
+        journal.claim_return(other).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
     // A failed ownership journal creation cannot announce a usable export receipt.
     assert!(journal.create(&planned).is_err());
     assert_eq!(
