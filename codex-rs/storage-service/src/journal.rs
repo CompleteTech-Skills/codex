@@ -82,7 +82,7 @@ impl Journal {
             .create(true)
             .truncate(false)
             .open(self.path(operation_id).with_extension("lock"))?;
-        file.try_lock().map_err(io::Error::other)?;
+        file.try_lock().map_err(io::Error::from)?;
         Ok(file)
     }
 

@@ -39,6 +39,14 @@ fn internal<E>(_: E) -> StorageError {
 }
 
 impl StorageService {
+    fn current_return(&self, record: &OperationRecord) -> Result<(), StorageError> {
+        if self.operation(record.operation_id)? != *record || record.action != PlanAction::Return {
+            return Err(StorageError(BlockerCode::OperationConflict));
+        }
+        self.return_markers(record)?;
+        Ok(())
+    }
+
     fn check_return_intent(&self, record: &OperationRecord) -> Result<(), StorageError> {
         self.return_markers(record)?;
         let source = self.return_source(record)?;
@@ -250,33 +258,22 @@ impl StorageService {
         };
         let _owner = match self.journal.claim_return(record.operation_id) {
             Ok(owner) => owner,
-            Err(error)
-                if matches!(
-                    error
-                        .get_ref()
-                        .and_then(|e| e.downcast_ref::<std::fs::TryLockError>()),
-                    Some(std::fs::TryLockError::WouldBlock)
-                ) =>
-            {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 return self.operation(record.operation_id);
             }
             Err(_) => return Err(StorageError(BlockerCode::OperationConflict)),
         };
-        let current = self.operation(record.operation_id)?;
-        if current != record
-            || current.action != PlanAction::Return
-            || !matches!(
-                current.state,
-                OperationState::Planned
-                    | OperationState::Copying
-                    | OperationState::Verifying
-                    | OperationState::Failed
-            )
-            || self.requires_recovery(&current)
+        self.current_return(&record)?;
+        if !matches!(
+            record.state,
+            OperationState::Planned
+                | OperationState::Copying
+                | OperationState::Verifying
+                | OperationState::Failed
+        ) || self.requires_recovery(&record)
         {
             return Err(StorageError(BlockerCode::OperationConflict));
         }
-        record = current;
         self.export_and_verify(&mut record).await?;
         Ok(record)
     }
@@ -307,8 +304,15 @@ impl StorageService {
         self.save(record, OperationState::Copying)?;
         let storage = match self.connect().await {
             Ok(storage) => storage,
-            Err(error) => return Err(self.fail(record, error.0)),
+            Err(error) => {
+                self.current_return(record)?;
+                return Err(self.fail(record, error.0));
+            }
         };
+        if let Err(error) = self.current_return(record) {
+            storage.close().await;
+            return Err(error);
+        }
         let target = match SqliteTarget::create(
             config.clone(),
             self.inputs.codex_home.clone(),
@@ -319,6 +323,7 @@ impl StorageService {
             Ok(target) => target,
             Err(_) => {
                 storage.close().await;
+                self.current_return(record)?;
                 return Err(self.fail(record, BlockerCode::StagingFailed));
             }
         };
@@ -328,9 +333,15 @@ impl StorageService {
             Err(error) => {
                 target.close().await;
                 storage.close().await;
+                self.current_return(record)?;
                 return Err(self.fail(record, error.into()));
             }
         };
+        if let Err(error) = self.current_return(record) {
+            target.close().await;
+            storage.close().await;
+            return Err(error);
+        }
         record.run_id = Some(summary.run_id);
         record.copied = summary
             .domains
@@ -345,6 +356,7 @@ impl StorageService {
         let verified = exporter.verify(summary.run_id).await;
         target.close().await;
         storage.close().await;
+        self.current_return(record)?;
         if let Err(error) = verified {
             return Err(self.fail(record, error.into()));
         }
@@ -362,7 +374,11 @@ impl StorageService {
             .journal
             .claim_return(record.operation_id)
             .map_err(|_| StorageError(BlockerCode::OperationConflict))?;
-        if self.operation(record.operation_id)? != record || record.action != PlanAction::Return {
+        self.current_return(&record)?;
+        if !matches!(
+            record.state,
+            OperationState::Ready | OperationState::Committing
+        ) {
             return Err(StorageError(BlockerCode::OperationConflict));
         }
         self.check_return_intent(&record)?;
@@ -373,7 +389,8 @@ impl StorageService {
         let config = self.staged_config(&staged_home)?;
         let storage = self.connect().await?;
         if let Err(error) = self
-            .check_return_intent(&record)
+            .current_return(&record)
+            .and_then(|_| self.check_return_intent(&record))
             .and_then(|_| self.save(&mut record, OperationState::Committing))
         {
             storage.close().await;
@@ -395,6 +412,7 @@ impl StorageService {
             Err(error) => Err(error),
         };
         storage.close().await;
+        self.current_return(&record)?;
         match result {
             Ok(()) => {
                 self.save(&mut record, OperationState::Active)?;
@@ -419,17 +437,23 @@ impl StorageService {
     pub(crate) async fn recover_return(&self) -> Result<RecoveryReport, StorageError> {
         let plan = read_plan(&self.inputs.codex_home).map_err(internal)?;
         let Some(plan) = plan else {
+            if read_cutover(&self.inputs.codex_home)
+                .map_err(internal)?
+                .is_some()
+            {
+                return Err(StorageError(BlockerCode::OperationConflict));
+            }
             return Ok(RecoveryReport {
                 outcome: RecoveryKind::Idle,
                 operations: Vec::new(),
             });
         };
         let (plan_run, staged) = (plan.run_id, plan.staged_home.clone());
-        let mut record = self
+        let owners: Vec<_> = self
             .journal
             .list()
             .into_iter()
-            .find(|record| {
+            .filter(|record| {
                 record.action == PlanAction::Return
                     && matches!(
                         record.state,
@@ -438,43 +462,67 @@ impl StorageService {
                     && record.run_id == Some(plan_run)
                     && self.staged_home(record.operation_id) == staged
             })
-            .ok_or(StorageError(BlockerCode::OperationConflict))?;
-        let _claim = self
-            .claim(record.operation_id)
-            .ok_or(StorageError(BlockerCode::OperationConflict))?;
+            .collect();
+        let [record] = owners.as_slice() else {
+            return Err(StorageError(BlockerCode::OperationConflict));
+        };
+        let mut record = record.clone();
+        let Some(_claim) = self.claim(record.operation_id) else {
+            return Err(StorageError(BlockerCode::OperationConflict));
+        };
         let _owner = self
             .journal
             .claim_return(record.operation_id)
             .map_err(|_| StorageError(BlockerCode::OperationConflict))?;
-        if self.operation(record.operation_id)? != record {
+        self.current_return(&record)?;
+        self.check_return_intent(&record)?;
+        if read_plan(&self.inputs.codex_home)
+            .map_err(internal)?
+            .as_ref()
+            != Some(&plan)
+        {
             return Err(StorageError(BlockerCode::OperationConflict));
         }
-        self.check_return_intent(&record)?;
         let config = self.staged_config(&staged)?;
         let storage = self.connect().await?;
         let returning = ReturnCutover::new(
             self.inputs.codex_home.clone(),
-            plan.staged_home,
+            plan.staged_home.clone(),
             Migrator::new(self.staged_source(config), storage.pool().clone()),
         );
-        let outcome = returning.recover().await;
+        let outcome = async {
+            self.current_return(&record)?;
+            self.check_return_intent(&record)?;
+            if read_plan(&self.inputs.codex_home)
+                .map_err(internal)?
+                .as_ref()
+                != Some(&plan)
+            {
+                return Err(StorageError(BlockerCode::OperationConflict));
+            }
+            returning
+                .recover()
+                .await
+                .map_err(|error| StorageError(error.into()))
+        }
+        .await;
         storage.close().await;
-        let outcome = outcome.map_err(|error| StorageError(error.into()))?;
+        self.current_return(&record)?;
+        let outcome = outcome?;
         let mut touched = Vec::new();
         match outcome {
             RecoveryOutcome::RolledForward { .. } => {
                 record.blocker = None;
                 self.save(&mut record, OperationState::Active)?;
+                touched.push(record);
             }
             // The dataset was reopened, so a new return needs a new export.
             RecoveryOutcome::RolledBack => {
                 record.blocker = None;
                 self.save(&mut record, OperationState::Cancelled)?;
+                touched.push(record);
             }
             RecoveryOutcome::Idle => {}
-        }
-        if !matches!(outcome, RecoveryOutcome::Idle) {
-            touched.push(record);
         }
         Ok(RecoveryReport {
             outcome: match outcome {
@@ -499,17 +547,13 @@ impl StorageService {
             .journal
             .claim_return(record.operation_id)
             .map_err(|_| StorageError(BlockerCode::OperationConflict))?;
-        let current = self.operation(record.operation_id)?;
-        if current != record
-            || current.action != PlanAction::Return
-            || matches!(
-                record.state,
-                OperationState::Active | OperationState::Cancelled
-            )
-        {
+        self.current_return(&record)?;
+        if matches!(
+            record.state,
+            OperationState::Active | OperationState::Cancelled
+        ) {
             return Err(StorageError(BlockerCode::OperationConflict));
         }
-        record = current;
         let run_id = record
             .run_id
             .ok_or(StorageError(BlockerCode::OperationConflict))?;
@@ -533,7 +577,6 @@ impl StorageService {
         self.check_return_intent(&record)?;
         let source = self.return_source(&record)?;
         let config = self.staged_config(&staged_home)?;
-        let markers = self.return_markers(&record)?;
         let storage = self.connect().await?;
         let refuse = |error: CutoverError| StorageError(error.into());
         let migrator = Migrator::new(self.staged_source(config.clone()), storage.pool().clone());
@@ -543,7 +586,9 @@ impl StorageService {
             Migrator::new(self.staged_source(config), storage.pool().clone()),
         );
         let result = async {
+            self.current_return(&record)?;
             self.check_return_intent(&record)?;
+            let markers = self.return_markers(&record)?;
             let finished = if markers {
                 let outcome = returning.abort().await.map_err(refuse)?;
                 matches!(outcome, RecoveryOutcome::RolledForward { .. })
@@ -561,6 +606,7 @@ impl StorageService {
         }
         .await;
         storage.close().await;
+        self.current_return(&record)?;
         let finished = match result {
             Ok(finished) => finished,
             Err(_) if self.requires_recovery(&record) => {

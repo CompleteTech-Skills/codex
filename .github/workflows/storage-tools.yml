@@ -267,7 +267,7 @@ jobs:
           PY
           CODEX_TEST_POSTGRES_REQUIRED=1 CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE="$CODEX_TEST_POSTGRES_STATE" \
             just test --locked -p codex-storage-service \
-              -E 'test(=tests::real_postgres_storage_service) | test(=tests::real_postgres_storage_service_return_owned_controls)' \
+              -E 'test(=tests::real_postgres_storage_service) | test(=tests::real_postgres_storage_service_return_owned_controls) | test(=tests::real_postgres_storage_service_return_claims)' \
               --retries 0 --test-threads 1 --success-output=final
       - name: Require public service journal settlement after Local finish failure
         working-directory: codex-rs
