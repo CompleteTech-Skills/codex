@@ -234,6 +234,24 @@ fn service(
     })
 }
 
+#[test]
+fn rejected_process_claim_does_not_release_live_owner() {
+    let home = tempfile::tempdir().unwrap();
+    let svc = service(
+        home.path(),
+        home.path(),
+        None,
+        Arc::new(MockKeyringStore::default()),
+    );
+    let id = Uuid::new_v4();
+    let owner = svc.claim(id).unwrap();
+    for _ in 0..3 {
+        assert!(svc.claim(id).is_none());
+    }
+    drop(owner);
+    assert!(svc.claim(id).is_some());
+}
+
 #[tokio::test]
 async fn real_postgres_storage_service() {
     let state = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE");
