@@ -331,7 +331,18 @@ impl StorageService {
             .is_some_and(|intent| intent.target == ActiveBackend::Local)
             || read_plan(&self.inputs.codex_home)
                 .map_err(internal)?
-                .is_some();
+                .is_some()
+            || self.journal.list().iter().any(|record| {
+                record.action == PlanAction::Return
+                    && record.run_id.is_some()
+                    && matches!(
+                        record.state,
+                        OperationState::Copying
+                            | OperationState::Verifying
+                            | OperationState::Failed
+                            | OperationState::Committing
+                    )
+            });
         if returning {
             return self.recover_return().await;
         }

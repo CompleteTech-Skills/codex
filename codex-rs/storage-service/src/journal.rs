@@ -75,7 +75,6 @@ pub type Observer = std::sync::Arc<dyn Fn(&OperationRecord) + Send + Sync>;
 impl Journal {
     /// Cooperative cross-process exclusion for an operation's export and cancellation.
     /// The persistent lock file is never removed; closing the handle releases ownership.
-    #[cfg(test)]
     pub(crate) fn claim_return(&self, operation_id: Uuid) -> io::Result<std::fs::File> {
         let file = std::fs::OpenOptions::new()
             .read(true)

@@ -464,6 +464,94 @@ async fn real_postgres_storage_service() {
     remote.close().await;
 
     let plan = service.plan(PlanAction::Return).await.expect("return plan");
+    // A domain failure happens after the remote fence but before an install plan exists.
+    // Recovery must use the pre-fence journal identity, not silently report Idle.
+    let interrupted_id = Uuid::new_v4();
+    let (mut interrupted, created) = service
+        .prepare_return(interrupted_id, plan.plan_id, confirmed)
+        .await
+        .expect("prepare durable owner");
+    assert!(created);
+    let owned_run = interrupted.run_id.expect("identity before remote fence");
+    assert_eq!(
+        service
+            .operation(interrupted_id)
+            .expect("durable journal")
+            .run_id,
+        Some(owned_run)
+    );
+    let owned_source = interrupted.return_source.as_ref().expect("owned source");
+    let source_identity = codex_storage_migration::ActivationTarget {
+        dataset_id: owned_source.dataset_id,
+        generation: owned_source.generation,
+    };
+    let staged_home = service.staged_home(interrupted_id);
+    std::fs::create_dir_all(&staged_home).expect("staging");
+    let target = codex_storage_migration::SqliteTarget::create(
+        SqliteConfig::new_for_testing(staged_home.abs()),
+        home.path().to_path_buf(),
+        "service-provider",
+    )
+    .await
+    .expect("staged target");
+    let remote = service.connect().await.expect("remote");
+    let exporter = codex_storage_migration::Migrator::new(
+        codex_storage_migration::SqliteSource::new(target.staging().clone())
+            .relocated_from(home.path().to_path_buf()),
+        remote.pool().clone(),
+    )
+    .with_batch_size(1)
+    .with_batch_limit(1);
+    service
+        .save(&mut interrupted, OperationState::Copying)
+        .expect("copying");
+    assert!(matches!(
+        exporter
+            .export_owned(&target, owned_run, source_identity)
+            .await,
+        Err(codex_storage_migration::MigrationError::Interrupted)
+    ));
+    assert_eq!(
+        exporter.activation_state().await.expect("fenced").run_id,
+        Some(owned_run)
+    );
+    target.close().await;
+    remote.close().await;
+    service
+        .save(&mut interrupted, OperationState::Failed)
+        .expect("failure receipt");
+    assert!(
+        codex_storage_migration::read_plan(home.path())
+            .expect("no install plan")
+            .is_none()
+    );
+    let recovered = service.recover().await.expect("recover pre-install export");
+    assert_eq!(recovered.outcome, RecoveryKind::RolledBack);
+    assert_eq!(recovered.operations.len(), 1);
+    assert_eq!(recovered.operations[0].operation_id, interrupted_id);
+    assert_eq!(recovered.operations[0].state, OperationState::Cancelled);
+    assert_eq!(
+        service
+            .status(true)
+            .await
+            .remote
+            .expect("reopened")
+            .state
+            .as_deref(),
+        Some("open")
+    );
+    assert_eq!(
+        service
+            .start_return(interrupted_id, plan.plan_id, confirmed)
+            .await
+            .expect("terminal retry cannot reuse abandoned staging")
+            .state,
+        OperationState::Cancelled
+    );
+    let plan = service
+        .plan(PlanAction::Return)
+        .await
+        .expect("fresh return plan");
     assert!(plan.is_startable(), "{:?}", plan.blockers);
     let returning = Uuid::new_v4();
     assert_eq!(
@@ -503,8 +591,32 @@ async fn real_postgres_storage_service() {
         Some("migrating")
     );
 
-    // Cancelling reopens the dataset unchanged and a new export can be made.
-    let cancelled = service.cancel(returning).await.expect("cancel");
+    // Process loss after preparation but before retirement must reopen and cancel, rather
+    // than try to activate the now-abandoned staging under the same run.
+    let mut before_retire = ready.clone();
+    service
+        .save(&mut before_retire, OperationState::Committing)
+        .expect("committing");
+    let remote = service.connect().await.expect("remote before retirement");
+    let staged_home = service.staged_home(returning);
+    codex_storage_migration::ReturnCutover::new(
+        home.path().to_path_buf(),
+        staged_home.clone(),
+        codex_storage_migration::Migrator::new(
+            codex_storage_migration::SqliteSource::new(SqliteConfig::new_for_testing(
+                staged_home.abs(),
+            ))
+            .relocated_from(home.path().to_path_buf()),
+            remote.pool().clone(),
+        ),
+    )
+    .prepare(ready.run_id.expect("owned export"))
+    .expect("prepare before retirement");
+    remote.close().await;
+    let cancelled = service
+        .activate(returning)
+        .await
+        .expect("roll back prepared return");
     assert_eq!(cancelled.state, OperationState::Cancelled);
     assert_eq!(
         service
@@ -518,14 +630,67 @@ async fn real_postgres_storage_service() {
     );
     let plan = service.plan(PlanAction::Return).await.expect("plan again");
     let second_return = Uuid::new_v4();
-    let ready = service
+    let mut ready = service
         .start_return(second_return, plan.plan_id, confirmed)
         .await
         .expect("second export");
     assert_eq!(ready.state, OperationState::Ready);
-    let done = service.activate(second_return).await.expect("return");
+    // Process loss after the Committing journal write but before cutover preparation.
+    service
+        .save(&mut ready, OperationState::Committing)
+        .expect("committing before intent");
+    assert!(
+        codex_storage_migration::read_plan(home.path())
+            .expect("no plan yet")
+            .is_none()
+    );
+    let recovery = service.recover().await.expect("resume pre-intent commit");
+    assert_eq!(recovery.outcome, RecoveryKind::RolledForward);
+    let done = service
+        .operation(second_return)
+        .expect("returned operation");
     assert_eq!(done.state, OperationState::Active);
     assert_eq!(service.activate(second_return).await.expect("again"), done);
+    // The physical handoff succeeded but its final journal acknowledgement was lost.
+    let mut lost_ack = done.clone();
+    service
+        .save(&mut lost_ack, OperationState::Committing)
+        .expect("simulate lost Active ack");
+    assert!(
+        codex_storage_migration::read_plan(home.path())
+            .expect("completed plan discarded")
+            .is_none()
+    );
+    assert_eq!(
+        service
+            .recover()
+            .await
+            .expect("reconcile exact retired owner")
+            .outcome,
+        RecoveryKind::RolledForward
+    );
+    assert_eq!(
+        service.operation(second_return).expect("reconciled").state,
+        OperationState::Active
+    );
+    service
+        .save(&mut lost_ack, OperationState::Failed)
+        .expect("completed cleanup failure receipt");
+    assert_eq!(
+        service
+            .recover()
+            .await
+            .expect("exact completed failure evidence")
+            .outcome,
+        RecoveryKind::RolledForward
+    );
+    assert_eq!(
+        service
+            .operation(second_return)
+            .expect("failure reconciled")
+            .state,
+        OperationState::Active
+    );
 
     // The home is local again, the dataset is retired, and the local files hold everything.
     let status = service.status(true).await;
