@@ -285,7 +285,7 @@ impl ConfigLayerStack {
         let model_provider_requirements = Some(crate::model_provider_requirements::to_config(
             &requirements_toml,
         )?);
-        Ok(Self {
+        let stack = Self {
             model_provider_requirements,
             layers,
             requirements,
@@ -293,7 +293,9 @@ impl ConfigLayerStack {
             ignore_user_and_project_exec_policy_rules: false,
             startup_warnings: None,
             is_projectless: false,
-        })
+        };
+        stack.validate_storage_destination()?;
+        Ok(stack)
     }
 
     pub fn with_user_and_project_exec_policy_rules_ignored(
@@ -421,7 +423,7 @@ impl ConfigLayerStack {
             Some(index) => layers.insert(index, user_layer),
             None => layers.push(user_layer),
         }
-        Ok(Self {
+        let stack = Self {
             layers,
             model_provider_requirements: self.model_provider_requirements.clone(),
             requirements: self.requirements.clone(),
@@ -430,12 +432,14 @@ impl ConfigLayerStack {
                 .ignore_user_and_project_exec_policy_rules,
             startup_warnings: self.startup_warnings.clone(),
             is_projectless: self.is_projectless,
-        })
+        };
+        stack.validate_storage_destination()?;
+        Ok(stack)
     }
 
     /// Returns a new stack with the user layer copied from `other`, preserving
     /// every non-user layer already present in this stack.
-    pub fn with_user_layer_from(&self, other: &Self) -> Self {
+    pub fn with_user_layer_from(&self, other: &Self) -> std::io::Result<Self> {
         let user_layers = other
             .layers
             .iter()
@@ -457,7 +461,7 @@ impl ConfigLayerStack {
                 None => layers.push(user_layer),
             }
         }
-        Self {
+        let stack = Self {
             layers,
             model_provider_requirements: self.model_provider_requirements.clone(),
             requirements: self.requirements.clone(),
@@ -466,7 +470,9 @@ impl ConfigLayerStack {
                 .ignore_user_and_project_exec_policy_rules,
             startup_warnings: self.startup_warnings.clone(),
             is_projectless: self.is_projectless,
-        }
+        };
+        stack.validate_storage_destination()?;
+        Ok(stack)
     }
 
     /// Returns the merged config-layer view.

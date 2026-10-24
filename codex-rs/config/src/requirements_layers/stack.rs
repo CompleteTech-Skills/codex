@@ -154,11 +154,26 @@ impl RequirementsLayerStack {
         for layer in &layers {
             merge_toml_values(&mut merged_toml, &layer.regular_toml);
         }
+        // A destination requirement is one managed identity, never a table
+        // assembled from unrelated requirements sources.
+        if let Some(destination) = layers
+            .iter()
+            .rev()
+            .find_map(|layer| layer.regular_toml.get("storage_destination"))
+            && let Some(table) = merged_toml.as_table_mut()
+        {
+            table.insert("storage_destination".to_string(), destination.clone());
+        }
 
+        let has_storage_destination = merged_toml.get("storage_destination").is_some();
         let requirements: ConfigRequirementsToml =
             merged_toml.try_into().map_err(|err: toml::de::Error| {
                 RequirementsCompositionError::ComposedParse {
-                    message: err.to_string(),
+                    message: if has_storage_destination {
+                        "invalid managed storage destination".to_string()
+                    } else {
+                        err.to_string()
+                    },
                 }
             })?;
         let mut output = ConfigRequirementsWithSources::default();
@@ -216,6 +231,7 @@ fn populate_merged_regular_fields_with_sources(
         cli_auth_credentials_store,
         chatgpt_base_url,
         sqlite_home,
+        storage_destination,
         log_dir,
         model_catalog_json,
         model_provider,
@@ -261,6 +277,14 @@ fn populate_merged_regular_fields_with_sources(
     set_sourced!(cli_auth_credentials_store, &["cli_auth_credentials_store"]);
     set_sourced!(chatgpt_base_url, &["chatgpt_base_url"]);
     set_sourced!(sqlite_home, &["sqlite_home"]);
+    if let Some(destination) = storage_destination {
+        let source = layers
+            .iter()
+            .rev()
+            .find(|layer| layer.regular_toml.get("storage_destination").is_some())
+            .map_or(RequirementSource::Unknown, |layer| layer.source.clone());
+        output.storage_destination = Some(Sourced::new(destination, source));
+    }
     set_sourced!(log_dir, &["log_dir"]);
     set_sourced!(model_catalog_json, &["model_catalog_json"]);
     set_sourced!(model_provider, &["model_provider"]);

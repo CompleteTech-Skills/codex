@@ -118,6 +118,7 @@ pub use profile::EnvironmentVariableName;
 pub use profile::ProfileError;
 pub use profile::RemotePostgresProfile;
 pub use profile::StorageCandidateProfile;
+pub use profile::StorageDestination;
 pub use profile::TlsSettings;
 pub use profile::TlsVerification;
 

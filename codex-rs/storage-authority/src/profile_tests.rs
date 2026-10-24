@@ -124,3 +124,21 @@ fn full_verification_accepts_an_ip_and_absolute_ca_path() {
     assert_eq!(profile.endpoint, "2001:db8::1");
     assert_eq!(profile.tls.verification, TlsVerification::VerifyFull);
 }
+
+#[test]
+fn destination_projection_excludes_credential_and_connection_limits() {
+    let profile: StorageCandidateProfile = serde_json::from_value(remote_profile()).unwrap();
+    let destination = profile.destination();
+    destination.validate().unwrap();
+    let expected: StorageDestination = serde_json::from_value(json!({
+        "backend": "remote_postgres",
+        "endpoint": "db.example.test",
+        "port": 5432,
+        "database": "codex",
+        "namespace": "codex_storage"
+    })).unwrap();
+    assert_eq!(destination, expected);
+    let debug = format!("{destination:?}");
+    assert!(!debug.contains("db.example.test"));
+    assert!(!debug.contains("CODEX_PG_PASSWORD"));
+}

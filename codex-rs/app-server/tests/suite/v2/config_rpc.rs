@@ -67,6 +67,36 @@ fn write_config(codex_home: &TempDir, contents: &str) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_storage_destination_is_hidden_from_config_rpcs() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let ca = codex_home.path().join("private-ca.pem").display().to_string();
+    write_config(&codex_home, &format!("[storage_candidate]\nbackend = 'remote_postgres'\nendpoint = 'db.secret.test'\nport = 5432\ndatabase = 'codex'\nnamespace = 'history'\nconnect_timeout_seconds = 5\npool_acquire_timeout_seconds = 5\nmax_connections = 8\n[storage_candidate.credential]\nsource = 'environment'\nvariable = 'SECRET_PASSWORD_ENV'\n[storage_candidate.tls]\nca_certificate = '{ca}'\n"))?;
+    std::fs::write(codex_home.path().join("requirements.toml"),
+        format!("[storage_destination]\nbackend = 'remote_postgres'\nendpoint = 'db.secret.test'\nport = 5432\ndatabase = 'codex'\nnamespace = 'history'\n[storage_destination.tls]\nca_certificate = '{ca}'\n"))?;
+    let mut server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized_with_timeout(DEFAULT_READ_TIMEOUT)
+        .await?;
+    let requirements_id = server.send_config_requirements_read_request().await?;
+    let requirements: ConfigRequirementsReadResponse = timeout(
+        DEFAULT_READ_TIMEOUT, server.read_response(requirements_id)).await??;
+    let config_id = server.send_config_read_request(ConfigReadParams {
+        include_layers: true,
+        cwd: None,
+    }).await?;
+    let config: ConfigReadResponse = timeout(
+        DEFAULT_READ_TIMEOUT, server.read_response(config_id)).await??;
+    for wire in [serde_json::to_string(&requirements)?, serde_json::to_string(&config)?] {
+        for forbidden in ["db.secret.test", "SECRET_PASSWORD_ENV", "private-ca.pem", "storage_destination",
+            "storage_candidate"] {
+            assert!(!wire.contains(forbidden), "unexpected storage value in RPC");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_auth_settings_are_exposed_enforced_and_read_only() -> Result<()> {
     let codex_home = TempDir::new()?;
     write_config(

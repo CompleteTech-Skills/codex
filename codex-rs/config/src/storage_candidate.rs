@@ -5,6 +5,7 @@ use crate::ConfigLayerEntry;
 use crate::ConfigLayerSource;
 use crate::ConfigLayerStack;
 use codex_storage_authority::StorageCandidateProfile;
+use codex_storage_authority::StorageDestination;
 use std::io;
 use toml::Value as TomlValue;
 
@@ -48,6 +49,26 @@ pub(crate) fn validate_storage_candidate_value(value: &TomlValue) -> io::Result<
 }
 
 impl ConfigLayerStack {
+    pub(crate) fn validate_storage_destination(&self) -> io::Result<()> {
+        let Some(required) = &self.requirements_toml().storage_destination else {
+            return Ok(());
+        };
+        required.validate().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid managed storage destination")
+        })?;
+        let selected = self
+            .storage_candidate()?
+            .map(|candidate| candidate.destination())
+            .unwrap_or(StorageDestination::LocalSqlite);
+        if &selected != required {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "storage candidate does not match managed storage destination",
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns the highest-precedence validated candidate from a trusted layer.
     /// This proposal has no effect on the active SQLite backend.
     pub fn storage_candidate(&self) -> io::Result<Option<StorageCandidateProfile>> {

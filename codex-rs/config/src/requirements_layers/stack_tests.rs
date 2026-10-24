@@ -52,6 +52,28 @@ fn expected_requirements(contents: impl AsRef<str>) -> ConfigRequirementsToml {
 }
 
 #[test]
+fn storage_destination_is_one_whole_managed_requirement() {
+    let lower = layer("low", "Low", "[storage_destination]\nbackend = 'remote_postgres'\nendpoint = 'low.example'\nport = 5432\ndatabase = 'db'\nnamespace = 'ns'");
+    let higher = layer("high", "High", "[storage_destination]\nbackend = 'local_sqlite'");
+    let composed = compose_requirements_for_hostname(vec![lower, higher], /*hostname*/ None)
+        .unwrap().unwrap();
+    assert_eq!(composed.storage_destination.as_ref().unwrap().source,
+        RequirementSource::EnterpriseManaged {
+            id: "high".to_string(), name: "High".to_string()
+        });
+    assert_eq!(composed.into_toml().storage_destination,
+        expected_requirements("[storage_destination]\nbackend = 'local_sqlite'").storage_destination);
+}
+
+#[test]
+fn malformed_storage_destination_does_not_echo_values() {
+    let bad = layer("bad", "Bad", "[storage_destination]\nbackend = 'remote_postgres'\nendpoint = 'secret.example'\nport = 'wrong'");
+    let error = compose(vec![bad]).unwrap_err().to_string();
+    assert!(!error.contains("secret.example"));
+    assert!(!error.contains("wrong"));
+}
+
+#[test]
 fn empty_layers_compose_to_none() {
     let composed = compose(Vec::new()).expect("compose empty layers");
     assert_eq!(composed, None);

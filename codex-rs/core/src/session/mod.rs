@@ -2057,9 +2057,16 @@ impl Session {
                 .then(|| self.build_effective_session_config(&state.session_configuration));
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
             config.active_project = next_config.active_project.clone();
-            config.config_layer_stack = config
+            config.config_layer_stack = match config
                 .config_layer_stack
-                .with_user_layer_from(&next_config.config_layer_stack);
+                .with_user_layer_from(&next_config.config_layer_stack)
+            {
+                Ok(stack) => stack,
+                Err(err) => {
+                    warn!("failed to refresh user configuration: {err}");
+                    return;
+                }
+            };
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
             config.mcp_servers = next_config.mcp_servers.clone();
@@ -2137,9 +2144,16 @@ impl Session {
     pub(crate) async fn refresh_mcp_config(&self, next_config: Config) {
         let mut state = self.state.lock().await;
         let mut config = (*state.session_configuration.original_config_do_not_use).clone();
-        config.config_layer_stack = next_config
+        config.config_layer_stack = match next_config
             .config_layer_stack
-            .with_user_layer_from(&config.config_layer_stack);
+            .with_user_layer_from(&config.config_layer_stack)
+        {
+            Ok(stack) => stack,
+            Err(err) => {
+                warn!("failed to refresh MCP configuration: {err}");
+                return;
+            }
+        };
         config.mcp_servers = next_config.mcp_servers;
         config.mcp_optional_startup_grace = next_config.mcp_optional_startup_grace;
         config.mcp_oauth_credentials_store_mode = next_config.mcp_oauth_credentials_store_mode;

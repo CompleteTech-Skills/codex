@@ -1,6 +1,7 @@
 use crate::ApplicationRequirementsToml;
 use codex_features::FeatureToml;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_storage_authority::StorageDestination;
 pub use codex_model_provider_info::ResidencyRequirement;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::ForcedLoginMethod;
@@ -1032,6 +1033,7 @@ pub struct ConfigRequirementsToml {
     pub cli_auth_credentials_store: Option<AuthCredentialsStoreMode>,
     pub chatgpt_base_url: Option<String>,
     pub sqlite_home: Option<AbsolutePathBuf>,
+    pub storage_destination: Option<StorageDestination>,
     pub log_dir: Option<AbsolutePathBuf>,
     pub model_catalog_json: Option<AbsolutePathBuf>,
     /// Exact provider selection, overriding local and session configuration.
@@ -1143,6 +1145,7 @@ pub struct ConfigRequirementsWithSources {
     pub cli_auth_credentials_store: Option<Sourced<AuthCredentialsStoreMode>>,
     pub chatgpt_base_url: Option<Sourced<String>>,
     pub sqlite_home: Option<Sourced<AbsolutePathBuf>>,
+    pub storage_destination: Option<Sourced<StorageDestination>>,
     pub log_dir: Option<Sourced<AbsolutePathBuf>>,
     pub model_catalog_json: Option<Sourced<AbsolutePathBuf>>,
     pub model_provider: Option<Sourced<String>>,
@@ -1206,6 +1209,7 @@ impl ConfigRequirementsWithSources {
             cli_auth_credentials_store: _,
             chatgpt_base_url: _,
             sqlite_home: _,
+            storage_destination: _,
             log_dir: _,
             model_catalog_json: _,
             model_provider: _,
@@ -1271,6 +1275,7 @@ impl ConfigRequirementsWithSources {
                 cli_auth_credentials_store,
                 chatgpt_base_url,
                 sqlite_home,
+                storage_destination,
                 log_dir,
                 model_catalog_json,
                 model_provider,
@@ -1357,6 +1362,7 @@ impl ConfigRequirementsWithSources {
             cli_auth_credentials_store,
             chatgpt_base_url,
             sqlite_home,
+            storage_destination,
             log_dir,
             model_catalog_json,
             model_provider,
@@ -1401,6 +1407,7 @@ impl ConfigRequirementsWithSources {
             cli_auth_credentials_store: cli_auth_credentials_store.map(|sourced| sourced.value),
             chatgpt_base_url: chatgpt_base_url.map(|sourced| sourced.value),
             sqlite_home: sqlite_home.map(|sourced| sourced.value),
+            storage_destination: storage_destination.map(|sourced| sourced.value),
             log_dir: log_dir.map(|sourced| sourced.value),
             model_catalog_json: model_catalog_json.map(|sourced| sourced.value),
             model_provider: model_provider.map(|sourced| sourced.value),
@@ -1508,6 +1515,7 @@ impl ConfigRequirementsToml {
             && self.cli_auth_credentials_store.is_none()
             && self.chatgpt_base_url.is_none()
             && self.sqlite_home.is_none()
+            && self.storage_destination.is_none()
             && self.log_dir.is_none()
             && self.model_catalog_json.is_none()
             && self.model_provider.is_none()
@@ -1733,6 +1741,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             cli_auth_credentials_store,
             chatgpt_base_url,
             sqlite_home,
+            storage_destination: _,
             log_dir,
             model_catalog_json,
             model_provider,
@@ -2267,6 +2276,7 @@ mod tests {
             cli_auth_credentials_store,
             chatgpt_base_url,
             sqlite_home,
+            storage_destination,
             log_dir,
             model_catalog_json,
             model_provider,
@@ -2316,6 +2326,8 @@ mod tests {
             chatgpt_base_url: chatgpt_base_url
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             sqlite_home: sqlite_home.map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            storage_destination: storage_destination
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             log_dir: log_dir.map(|value| Sourced::new(value, RequirementSource::Unknown)),
             model_catalog_json: model_catalog_json
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
@@ -2842,6 +2854,7 @@ mod tests {
             cli_auth_credentials_store: Some(AuthCredentialsStoreMode::Keyring),
             chatgpt_base_url: Some("https://managed.example/backend-api/".to_string()),
             sqlite_home: Some(sqlite_home.clone()),
+            storage_destination: None,
             log_dir: Some(log_dir.clone()),
             model_catalog_json: Some(model_catalog_json.clone()),
             model_provider: Some("gateway".to_string()),
@@ -2904,6 +2917,7 @@ mod tests {
                     source.clone(),
                 )),
                 sqlite_home: Some(Sourced::new(sqlite_home, source.clone())),
+                storage_destination: None,
                 log_dir: Some(Sourced::new(log_dir, source.clone())),
                 model_catalog_json: Some(Sourced::new(model_catalog_json, source.clone())),
                 model_provider: Some(Sourced::new("gateway".to_string(), source.clone())),

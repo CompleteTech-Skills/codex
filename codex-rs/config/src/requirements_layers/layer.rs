@@ -17,12 +17,21 @@ const LOCAL_ONLY_AUTH_REQUIREMENTS: &[&str] = &[
     "chatgpt_base_url",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RequirementsLayerEntry {
     pub(super) source: RequirementSource,
     toml: RequirementsLayerToml,
     base_dir: Option<AbsolutePathBuf>,
     path_context: Option<ConfigPathContext>,
+}
+
+impl std::fmt::Debug for RequirementsLayerEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequirementsLayerEntry")
+            .field("source", &self.source)
+            .field("toml", &"[redacted]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl RequirementsLayerEntry {
@@ -71,17 +80,26 @@ impl RequirementsLayerEntry {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum RequirementsLayerToml {
     String(String),
     Value(TomlValue),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct ComposableRequirementsLayer {
     pub(super) source: RequirementSource,
     pub(super) regular_toml: TomlValue,
     pub(super) domain_fields: DomainMergedRequirementsFields,
+}
+
+impl std::fmt::Debug for ComposableRequirementsLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComposableRequirementsLayer")
+            .field("source", &self.source)
+            .field("regular_toml", &"[redacted]")
+            .finish_non_exhaustive()
+    }
 }
 
 impl ComposableRequirementsLayer {
@@ -185,7 +203,11 @@ fn parse_layer_toml(
             toml::from_str(contents).map_err(|err: toml::de::Error| {
                 RequirementsCompositionError::Parse {
                     layer_source: source.clone(),
-                    message: err.to_string(),
+                    message: if contents.contains("storage_destination") {
+                        "invalid managed storage destination".to_string()
+                    } else {
+                        err.to_string()
+                    },
                 }
             })
         }
@@ -202,7 +224,11 @@ fn parse_layer_requirements(
             toml::from_str(contents).map_err(|err: toml::de::Error| {
                 RequirementsCompositionError::Parse {
                     layer_source: source.clone(),
-                    message: err.to_string(),
+                    message: if contents.contains("storage_destination") {
+                        "invalid managed storage destination".to_string()
+                    } else {
+                        err.to_string()
+                    },
                 }
             })
         }
@@ -210,7 +236,11 @@ fn parse_layer_requirements(
             value.clone().try_into().map_err(|err: toml::de::Error| {
                 RequirementsCompositionError::Parse {
                     layer_source: source.clone(),
-                    message: err.to_string(),
+                    message: if value.get("storage_destination").is_some() {
+                        "invalid managed storage destination".to_string()
+                    } else {
+                        err.to_string()
+                    },
                 }
             })
         }

@@ -22,6 +22,69 @@ pub enum StorageCandidateProfile {
     RemotePostgres(RemotePostgresProfile),
 }
 
+/// Managed constraint on a proposal's destination, excluding its credential.
+#[derive(Clone, Eq, PartialEq, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StorageDestination {
+    LocalSqlite,
+    RemotePostgres {
+        endpoint: String,
+        port: u16,
+        database: String,
+        namespace: String,
+        #[serde(default)]
+        tls: TlsSettings,
+    },
+}
+
+impl fmt::Debug for StorageDestination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalSqlite => f.write_str("LocalSqlite"),
+            Self::RemotePostgres { .. } => f.write_str("RemotePostgres([redacted])"),
+        }
+    }
+}
+
+impl StorageDestination {
+    pub fn validate(&self) -> Result<(), ProfileError> {
+        if let Self::RemotePostgres {
+            endpoint,
+            port,
+            database,
+            namespace,
+            tls,
+        } = self
+            && (!valid_endpoint(endpoint)
+                || *port == 0
+                || !valid_pg_identifier(database)
+                || !valid_pg_identifier(namespace)
+                || tls
+                    .ca_certificate
+                    .as_ref()
+                    .is_some_and(|path| !path.is_absolute()))
+        {
+            return Err(ProfileError::InvalidDestination);
+        }
+        Ok(())
+    }
+}
+
+impl StorageCandidateProfile {
+    pub fn destination(&self) -> StorageDestination {
+        match self {
+            Self::LocalSqlite => StorageDestination::LocalSqlite,
+            Self::RemotePostgres(profile) => StorageDestination::RemotePostgres {
+                endpoint: profile.endpoint.clone(),
+                port: profile.port,
+                database: profile.database.clone(),
+                namespace: profile.namespace.clone(),
+                tls: profile.tls.clone(),
+            },
+        }
+    }
+}
+
 impl fmt::Debug for StorageCandidateProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -262,6 +325,7 @@ fn valid_endpoint(value: &str) -> bool {
 /// Redacted structural validation result. Input values never enter diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProfileError {
+    InvalidDestination,
     InvalidCredentialReference,
     InvalidEndpoint,
     InvalidPort,
@@ -273,6 +337,7 @@ pub enum ProfileError {
 impl fmt::Display for ProfileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let reason = match self {
+            Self::InvalidDestination => "invalid managed storage destination",
             Self::InvalidCredentialReference => "invalid credential reference",
             Self::InvalidEndpoint => "invalid PostgreSQL endpoint",
             Self::InvalidPort => "invalid PostgreSQL port",
