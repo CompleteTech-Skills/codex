@@ -668,8 +668,8 @@ impl StorageService {
                 storage.pool().clone(),
             ),
         );
-        if intent.is_some() || plan.is_some() {
-            if let Err(error) = returning.abort().await {
+        if (intent.is_some() || plan.is_some())
+            && let Err(error) = returning.abort().await {
                 let settlement = if matches!(
                     &error,
                     codex_storage_migration::CutoverError::AlreadyActivated
@@ -683,7 +683,6 @@ impl StorageService {
                 settlement?;
                 return Err(StorageError(error.into()));
             }
-        }
         if let Some(run_id) = record.run_id {
             // A run that was never retired only read the dataset, so abandoning it reopens it.
             let state = migrator
