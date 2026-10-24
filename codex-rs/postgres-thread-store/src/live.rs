@@ -380,6 +380,9 @@ fn database(error: sqlx::Error) -> ThreadStoreError {
 
 pub(crate) fn rollout_error(error: RolloutStoreError) -> ThreadStoreError {
     match error {
+        RolloutStoreError::InvalidRequest(message) => ThreadStoreError::InvalidRequest {
+            message: message.to_string(),
+        },
         RolloutStoreError::MissingThread(thread_id) => {
             ThreadStoreError::ThreadNotFound { thread_id }
         }
@@ -409,5 +412,21 @@ pub(crate) fn canonical_history_mode(items: &[RolloutItem]) -> ThreadHistoryMode
 fn ownership_lost(thread_id: ThreadId) -> ThreadStoreError {
     ThreadStoreError::Conflict {
         message: format!("the writer lease for thread {thread_id} was lost"),
+    }
+}
+
+#[cfg(test)]
+mod rollout_request_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_rollout_request_preserves_public_error_class() {
+        let mapped = rollout_error(RolloutStoreError::InvalidRequest(
+            "ordinal exceeds PostgreSQL BIGINT",
+        ));
+        assert!(
+            matches!(mapped, ThreadStoreError::InvalidRequest { message }
+            if message == "ordinal exceeds PostgreSQL BIGINT")
+        );
     }
 }

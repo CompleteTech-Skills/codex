@@ -215,3 +215,77 @@ where
     }
     results
 }
+
+#[tokio::test]
+#[ignore = "requires ROOT-admitted isolated canonical rollout fixture"]
+async fn actual_direct_append_refusal_preserves_transaction_and_retry() {
+    let state = std::env::var("CODEX_TEST_POSTGRES_ROLLOUT_STORE_STATE")
+        .expect("declared real PostgreSQL fixture required");
+    let pool = connect(Path::new(&state), "runtime").await;
+    let thread = ThreadId::new();
+    insert_thread(&pool, thread).await;
+    let store = PostgresRolloutStore::new(Arc::clone(&pool));
+    let exact = vec![
+        (None, "opaque Unicode \u{1f980}\r\n".to_owned()),
+        (
+            Some(i64::MAX as u64),
+            "unknown JSON fields retained".to_owned(),
+        ),
+    ];
+    let mut connection = pool.acquire().await.expect("original connection");
+    let mut tx = connection.begin().await.expect("caller transaction");
+    let bad = vec![
+        (Some(0), "must not be inserted".to_owned()),
+        (Some(u64::MAX), "last invalid ordinal".to_owned()),
+    ];
+    assert!(matches!(
+        append_in(&mut tx, thread, 0, &bad).await,
+        Err(RolloutStoreError::InvalidRequest(_))
+    ));
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM thread_rollout_lines WHERE thread_id = $1::uuid")
+            .bind(thread.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .expect("same transaction unchanged");
+    assert_eq!(count, 0);
+    assert_eq!(append_in(&mut tx, thread, 0, &exact).await, Ok(2));
+    tx.commit().await.expect("actual original commit");
+    drop(connection);
+    let committed = store
+        .read_all(thread)
+        .await
+        .expect("committed exact payload");
+    assert_eq!(
+        committed
+            .iter()
+            .map(|line| (line.ordinal, line.line.clone()))
+            .collect::<Vec<_>>(),
+        exact
+    );
+    // Replay the exact original batch, simulating a lost acknowledgement only.
+    assert_eq!(store.append(thread, 0, exact.clone()).await, Ok(2));
+    assert_eq!(
+        store.read_all(thread).await.expect("retry history"),
+        committed
+    );
+    assert!(matches!(
+        store.append(thread, 2, bad).await,
+        Err(RolloutStoreError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        store.truncate(thread, u64::MAX).await,
+        Err(RolloutStoreError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        store.read(thread, u64::MAX, 1).await,
+        Err(RolloutStoreError::InvalidRequest(_))
+    ));
+    assert_eq!(
+        store
+            .read_all(thread)
+            .await
+            .expect("all refusals preserve canonical data"),
+        committed
+    );
+}

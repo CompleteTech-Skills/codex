@@ -25,6 +25,9 @@ pub const MAX_READ_LINES: usize = 1_000;
 /// Failures that never expose connection details.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RolloutStoreError {
+    /// A caller value cannot be represented by the PostgreSQL storage format.
+    #[error("invalid rollout storage request: {0}")]
+    InvalidRequest(&'static str),
     /// PostgreSQL could not be reached or the operation did not complete.
     #[error("rollout storage is unavailable: {0}")]
     Unavailable(String),
@@ -123,6 +126,7 @@ impl PostgresRolloutStore {
         expected_position: u64,
         lines: Vec<(Option<u64>, String)>,
     ) -> Result<u64, RolloutStoreError> {
+        validate_append_request(expected_position, &lines)?;
         self.run(move |connection| {
             Box::pin(
                 async move { append_in(connection, thread_id, expected_position, &lines).await },
@@ -138,6 +142,7 @@ impl PostgresRolloutStore {
         from_position: u64,
         limit: usize,
     ) -> Result<Vec<StoredRolloutLine>, RolloutStoreError> {
+        checked_request_position(from_position)?;
         let limit = limit.min(MAX_READ_LINES);
         self.run(move |connection| {
             Box::pin(async move { read_in(connection, thread_id, from_position, limit).await })
@@ -166,6 +171,7 @@ impl PostgresRolloutStore {
 
     /// Keep positions below `keep` and delete the rest, for reverting a thread.
     pub async fn truncate(&self, thread_id: ThreadId, keep: u64) -> Result<u64, RolloutStoreError> {
+        let keep = checked_request_position(keep)?;
         self.run(move |connection| {
             Box::pin(async move {
                 lock_thread(connection, thread_id).await?;
@@ -174,7 +180,7 @@ impl PostgresRolloutStore {
                      WHERE thread_id = $1::uuid AND position >= $2",
                 )
                 .bind(thread_id.to_string())
-                .bind(i64::try_from(keep).unwrap_or(i64::MAX))
+                .bind(keep)
                 .execute(&mut *connection)
                 .await
                 .map_err(database)?
@@ -191,6 +197,7 @@ impl PostgresRolloutStore {
         destination: ThreadId,
         count: u64,
     ) -> Result<(), RolloutStoreError> {
+        let count_signed = checked_request_position(count)?;
         self.run(move |connection| {
             Box::pin(async move {
                 lock_thread(connection, destination).await?;
@@ -210,7 +217,7 @@ impl PostgresRolloutStore {
                 )
                 .bind(destination.to_string())
                 .bind(source.to_string())
-                .bind(i64::try_from(count).unwrap_or(i64::MAX))
+                .bind(count_signed)
                 .execute(&mut *connection)
                 .await
                 .map_err(database)?
@@ -227,24 +234,19 @@ impl PostgresRolloutStore {
     }
 }
 
-/// Compare-and-extend inside the caller's transaction; see [`PostgresRolloutStore::append`].
+/// Append inside a caller-owned transaction. Validate the complete request before any SQL.
+/// The next position must remain representable as PostgreSQL BIGINT.
 pub async fn append_in(
     connection: &mut PgConnection,
     thread_id: ThreadId,
     expected_position: u64,
     lines: &[(Option<u64>, String)],
 ) -> Result<u64, RolloutStoreError> {
-    let count = u64::try_from(lines.len())
-        .map_err(|_| RolloutStoreError::Corrupt("batch is too large".to_string()))?;
+    let end = validate_append_request(expected_position, lines)?;
+    let count = end - expected_position;
     lock_thread(connection, thread_id).await?;
     let stored = next_position_in(connection, thread_id).await?;
     if stored > expected_position {
-        let end = expected_position
-            .checked_add(count)
-            .ok_or(RolloutStoreError::Conflict {
-                expected: expected_position,
-                stored,
-            })?;
         if stored >= end {
             let existing = read_in(connection, thread_id, expected_position, lines.len()).await?;
             let same = existing.len() == lines.len()
@@ -267,20 +269,26 @@ pub async fn append_in(
         });
     }
     for (offset, (ordinal, line)) in lines.iter().enumerate() {
-        let position = i64::try_from(expected_position + offset as u64)
-            .map_err(|_| RolloutStoreError::Corrupt("position overflow".to_string()))?;
+        let offset = u64::try_from(offset)
+            .map_err(|_| RolloutStoreError::InvalidRequest("batch position overflow"))?;
+        let position = checked_request_position(
+            expected_position
+                .checked_add(offset)
+                .ok_or(RolloutStoreError::InvalidRequest("batch position overflow"))?,
+        )?;
         sqlx::query(
-            "INSERT INTO thread_rollout_lines              (thread_id, position, ordinal, line) VALUES ($1::uuid, $2, $3, $4)",
+            "INSERT INTO thread_rollout_lines \
+             (thread_id, position, ordinal, line) VALUES ($1::uuid, $2, $3, $4)",
         )
         .bind(thread_id.to_string())
         .bind(position)
-        .bind(ordinal.map(|ordinal| ordinal as i64))
+        .bind(checked_write_ordinal(*ordinal)?)
         .bind(line)
         .execute(&mut *connection)
         .await
         .map_err(database)?;
     }
-    Ok(expected_position + count)
+    Ok(end)
 }
 
 /// Lock the thread row, which also proves the thread exists. Every write takes this lock
@@ -320,32 +328,95 @@ async fn next_position_in(
     })
 }
 
+fn checked_write_ordinal(ordinal: Option<u64>) -> Result<Option<i64>, RolloutStoreError> {
+    ordinal
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| RolloutStoreError::InvalidRequest("ordinal exceeds PostgreSQL BIGINT"))
+}
+
+fn checked_request_position(position: u64) -> Result<i64, RolloutStoreError> {
+    i64::try_from(position)
+        .map_err(|_| RolloutStoreError::InvalidRequest("position exceeds PostgreSQL BIGINT"))
+}
+
+fn validate_append_request(
+    expected: u64,
+    lines: &[(Option<u64>, String)],
+) -> Result<u64, RolloutStoreError> {
+    checked_request_position(expected)?;
+    let count = u64::try_from(lines.len())
+        .map_err(|_| RolloutStoreError::InvalidRequest("batch length overflow"))?;
+    let end = expected
+        .checked_add(count)
+        .ok_or(RolloutStoreError::InvalidRequest("batch position overflow"))?;
+    checked_request_position(end)?;
+    for (ordinal, _) in lines {
+        checked_write_ordinal(*ordinal)?;
+    }
+    Ok(end)
+}
+
+fn checked_read_line(
+    expected: u64,
+    position: i64,
+    ordinal: Option<i64>,
+    line: String,
+) -> Result<StoredRolloutLine, RolloutStoreError> {
+    let position = u64::try_from(position)
+        .map_err(|_| RolloutStoreError::Corrupt("negative position".to_string()))?;
+    if position != expected {
+        return Err(RolloutStoreError::Corrupt(
+            "rollout page contains a position gap".to_string(),
+        ));
+    }
+    let ordinal = ordinal
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|_| RolloutStoreError::Corrupt("negative ordinal".to_string()))?;
+    Ok(StoredRolloutLine {
+        position,
+        ordinal,
+        line,
+    })
+}
+
 async fn read_in(
     connection: &mut PgConnection,
     thread_id: ThreadId,
     from_position: u64,
     limit: usize,
 ) -> Result<Vec<StoredRolloutLine>, RolloutStoreError> {
-    let rows = sqlx::query(
-        "SELECT position, ordinal, line FROM thread_rollout_lines \
+    let from_signed = checked_request_position(from_position)?;
+    let rows =
+        sqlx::query(
+            "SELECT position, ordinal, line FROM thread_rollout_lines \
          WHERE thread_id = $1::uuid AND position >= $2 ORDER BY position LIMIT $3",
-    )
-    .bind(thread_id.to_string())
-    .bind(i64::try_from(from_position).unwrap_or(i64::MAX))
-    .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-    .fetch_all(connection)
-    .await
-    .map_err(database)?;
+        )
+        .bind(thread_id.to_string())
+        .bind(from_signed)
+        .bind(i64::try_from(limit).map_err(|_| {
+            RolloutStoreError::InvalidRequest("read limit exceeds PostgreSQL BIGINT")
+        })?)
+        .fetch_all(connection)
+        .await
+        .map_err(database)?;
     rows.iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(offset, row)| {
             let position: i64 = row.try_get("position").map_err(database)?;
             let ordinal: Option<i64> = row.try_get("ordinal").map_err(database)?;
-            Ok(StoredRolloutLine {
-                position: u64::try_from(position)
-                    .map_err(|_| RolloutStoreError::Corrupt("negative position".to_string()))?,
-                ordinal: ordinal.map(|ordinal| ordinal as u64),
-                line: row.try_get("line").map_err(database)?,
-            })
+            let offset = u64::try_from(offset)
+                .map_err(|_| RolloutStoreError::Corrupt("page offset overflow".to_string()))?;
+            let expected = from_position
+                .checked_add(offset)
+                .ok_or_else(|| RolloutStoreError::Corrupt("page position overflow".to_string()))?;
+            checked_read_line(
+                expected,
+                position,
+                ordinal,
+                row.try_get("line").map_err(database)?,
+            )
         })
         .collect()
 }
@@ -353,3 +424,7 @@ async fn read_in(
 #[cfg(test)]
 #[path = "store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "store_contract_tests.rs"]
+mod contract_tests;
