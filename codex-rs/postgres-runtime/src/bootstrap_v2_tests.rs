@@ -3,13 +3,9 @@ use crate::ClientCapabilities;
 use crate::CompatibilityError;
 use crate::CompatibilityResult;
 use crate::ConnectionSettings;
-use crate::NamedNamespace;
 use crate::PoolLimits;
 use crate::RequiredAccess;
-use crate::bootstrap_named_namespace;
 use crate::check_codex_storage_compatibility;
-use crate::check_named_namespace_compatibility;
-use crate::named_bootstrap::namespaced_migrations;
 use serde_json::Value;
 use std::path::Path;
 
@@ -464,6 +460,12 @@ async fn real_v3_upgrade_to_thread_schema_preserves_history_and_origin_paths() {
         Err(CompatibilityError::UnsupportedSchema)
     );
     let mut connection = runtime.acquire().await.expect("runtime connection");
+    sqlx::query("INSERT INTO codex_storage.thread_sections (id, name) VALUES ($1, $2)")
+        .bind("section-with-catalog")
+        .bind("Imported section")
+        .execute(&mut *connection)
+        .await
+        .expect("runtime creates valid section assignment target");
     let id = "00000000-0000-0000-0000-000000000123";
     let path = r"C:\origin-host\rollouts\thread.jsonl";
     let cwd = r"C:\origin-host\project";
@@ -479,7 +481,7 @@ async fn real_v3_upgrade_to_thread_schema_preserves_history_and_origin_paths() {
         .bind(1_700_000_000_789_i64)
         .bind(cwd)
         .bind(1_700_000_000_i64)
-        .bind("section-without-catalog-yet")
+        .bind("section-with-catalog")
         .bind("project-without-catalog-yet")
         .fetch_one(&mut *connection)
         .await
@@ -493,7 +495,7 @@ async fn real_v3_upgrade_to_thread_schema_preserves_history_and_origin_paths() {
             1_700_000_000_456,
             1_700_000_000_789,
             Some(1_700_000_000),
-            Some("section-without-catalog-yet".to_string()),
+            Some("section-with-catalog".to_string()),
             Some("project-without-catalog-yet".to_string())
         )
     );
@@ -527,10 +529,10 @@ async fn real_v3_upgrade_to_thread_schema_preserves_history_and_origin_paths() {
 }
 
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL v4 upgrade fixture"]
 async fn real_v4_upgrade_to_section_catalog_rejects_orphans_and_preserves_join() {
-    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_SECTION_UPGRADE_STATE") else {
-        return;
-    };
+    let state = std::env::var("CODEX_TEST_POSTGRES_SECTION_UPGRADE_STATE")
+        .expect("required disposable v4 upgrade fixture");
     let state = Path::new(&state);
     let first = PostgresPool::connect(settings(state, "migrator"))
         .await
