@@ -17,6 +17,7 @@ use super::LocalThreadStore;
 use super::rollout_move_file::clear_rollout_move_intent;
 use super::rollout_move_file::move_rollout_noclobber_retained_bound;
 use super::rollout_move_file::published_rollout_move_owned;
+use super::rollout_move_file::published_rollout_source_binding;
 use super::rollout_move_file::touch_modified_time;
 use super::rollout_move_file::verify_published_rollout_move;
 use super::rollout_move_identity::RolloutFileIdentity;
@@ -37,6 +38,24 @@ struct MovePair {
     destination: PathBuf,
     source_id: RolloutFileIdentity,
     source_digest: [u8; 32],
+}
+
+// Journals written before source binding recorded only the paths. Keep this exact
+// disk shape readable across upgrades; replay binds it before any move is made.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyMovePair {
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyMoveTransaction {
+    thread_id: ThreadId,
+    direction: MoveDirection,
+    selected_destination: PathBuf,
+    moves: Vec<LegacyMovePair>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -439,20 +458,24 @@ pub(super) async fn replay_pending_move(
 }
 
 fn validate_move_pair(codex_home: &Path, pair: &MovePair) -> io::Result<()> {
+    validate_move_paths(codex_home, &pair.source, &pair.destination)
+}
+
+fn validate_move_paths(codex_home: &Path, source: &Path, destination: &Path) -> io::Result<()> {
     let sessions = std::fs::canonicalize(codex_home.join(codex_rollout::SESSIONS_SUBDIR))?;
     let archived = std::fs::canonicalize(codex_home.join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR))?;
     let source_parent = std::fs::canonicalize(
-        pair.source
+        source
             .parent()
             .ok_or_else(|| io::Error::other("rollout source has no parent"))?,
     )?;
     let destination_parent = std::fs::canonicalize(
-        pair.destination
+        destination
             .parent()
             .ok_or_else(|| io::Error::other("rollout destination has no parent"))?,
     )?;
-    let same_filename = pair.source.file_name() == pair.destination.file_name()
-        && codex_rollout::rollout_id_from_path(&pair.source).is_some();
+    let same_filename = source.file_name() == destination.file_name()
+        && codex_rollout::rollout_id_from_path(source).is_some();
     let opposite_collections = (source_parent.starts_with(&sessions)
         && destination_parent.starts_with(&archived))
         || (source_parent.starts_with(&archived) && destination_parent.starts_with(&sessions));
@@ -523,9 +546,49 @@ fn load_move(codex_home: &Path, thread_id: ThreadId) -> io::Result<Option<(Pendi
         return Err(io::Error::other("pending rollout move is incomplete"));
     }
     let mut lines = contents.lines();
-    let transaction: MoveTransaction =
-        serde_json::from_str(lines.next().ok_or_else(|| io::Error::other("empty move"))?)
-            .map_err(io::Error::other)?;
+    let record = lines.next().ok_or_else(|| io::Error::other("empty move"))?;
+    let transaction: MoveTransaction = match serde_json::from_str(record) {
+        Ok(transaction) => transaction,
+        Err(_) => {
+            let legacy: LegacyMoveTransaction =
+                serde_json::from_str(record).map_err(io::Error::other)?;
+            if legacy.thread_id != thread_id {
+                return Err(io::Error::other("pending rollout move thread ID mismatch"));
+            }
+            let moves = legacy
+                .moves
+                .into_iter()
+                .map(|pair| {
+                    validate_move_paths(codex_home, &pair.source, &pair.destination)?;
+                    let (source_id, source_digest) = match std::fs::symlink_metadata(&pair.source) {
+                        Ok(metadata) if metadata.file_type().is_file() => (
+                            rollout_file_identity(&pair.source)?,
+                            rollout_file_digest(&pair.source)?,
+                        ),
+                        Ok(_) => {
+                            return Err(io::Error::other("legacy rollout source is not a file"));
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                            published_rollout_source_binding(&pair.source, &pair.destination)?
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    Ok(MovePair {
+                        source: pair.source,
+                        destination: pair.destination,
+                        source_id,
+                        source_digest,
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            MoveTransaction {
+                thread_id: legacy.thread_id,
+                direction: legacy.direction,
+                selected_destination: legacy.selected_destination,
+                moves,
+            }
+        }
+    };
     if transaction.thread_id != thread_id {
         return Err(io::Error::other("pending rollout move thread ID mismatch"));
     }

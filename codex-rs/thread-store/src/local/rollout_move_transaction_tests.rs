@@ -1,5 +1,7 @@
 use std::fs;
 use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -29,6 +31,124 @@ use crate::local::test_support::test_config;
 use crate::local::test_support::write_archived_session_file;
 use crate::local::test_support::write_session_file;
 use crate::local::test_support::write_session_file_with_history_mode;
+
+fn write_legacy_journal(
+    home: &Path,
+    thread_id: ThreadId,
+    direction: MoveDirection,
+    selected_destination: &Path,
+    moves: &[(PathBuf, PathBuf)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pairs = moves
+        .iter()
+        .map(|(source, destination)| {
+            serde_json::json!({
+                "source": source,
+                "destination": destination,
+            })
+        })
+        .collect::<Vec<_>>();
+    let journal = serde_json::json!({
+        "thread_id": thread_id,
+        "direction": direction,
+        "selected_destination": selected_destination,
+        "moves": pairs,
+    });
+    fs::write(
+        home.join("rollout_move_transactions")
+            .join(format!("{thread_id}.json")),
+        format!("{journal}\n"),
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_journal_replays_partially_moved_rollouts() -> Result<(), Box<dyn std::error::Error>>
+{
+    let home = tempfile::tempdir()?;
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let uuid = Uuid::from_u128(530);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let first = write_session_file(home.path(), "2025-01-03T20-00-00", uuid)?;
+    let second = write_session_file(home.path(), "2025-01-03T20-00-01", uuid)?;
+    let archive = home.path().join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR);
+    fs::create_dir(&archive)?;
+    let first_destination = archive.join(first.file_name().expect("first filename"));
+    let second_destination = archive.join(second.file_name().expect("second filename"));
+    let moves = vec![
+        (first.clone(), first_destination.clone()),
+        (second.clone(), second_destination.clone()),
+    ];
+    let pending = begin_move(
+        home.path(),
+        thread_id,
+        MoveDirection::Archive,
+        &first_destination,
+        &moves,
+    )?;
+    move_rollout_noclobber_retained(&first, &first_destination, home.path())?;
+    drop(pending);
+    write_legacy_journal(
+        home.path(),
+        thread_id,
+        MoveDirection::Archive,
+        &first_destination,
+        &moves,
+    )?;
+
+    assert_eq!(
+        replay_pending_move(&store, thread_id).await?,
+        Some(MoveDirection::Archive)
+    );
+    assert_eq!(replay_pending_move(&store, thread_id).await?, None);
+    assert!(!first.exists());
+    assert!(!second.exists());
+    assert!(first_destination.exists());
+    assert!(second_destination.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_journal_rejects_modified_published_destination()
+-> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    let uuid = Uuid::from_u128(531);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let source = write_session_file(home.path(), "2025-01-03T20-00-02", uuid)?;
+    let archive = home.path().join(codex_rollout::ARCHIVED_SESSIONS_SUBDIR);
+    fs::create_dir(&archive)?;
+    let destination = archive.join(source.file_name().expect("filename"));
+    let moves = vec![(source.clone(), destination.clone())];
+    let pending = begin_move(
+        home.path(),
+        thread_id,
+        MoveDirection::Archive,
+        &destination,
+        &moves,
+    )?;
+    move_rollout_noclobber_retained(&source, &destination, home.path())?;
+    drop(pending);
+    write_legacy_journal(
+        home.path(),
+        thread_id,
+        MoveDirection::Archive,
+        &destination,
+        &moves,
+    )?;
+    fs::write(&destination, b"unrelated content")?;
+
+    assert!(replay_pending_move(&store, thread_id).await.is_err());
+    assert_eq!(fs::read(&destination)?, b"unrelated content");
+    assert!(!source.exists());
+    assert!(
+        home.path()
+            .join("rollout_move_transactions")
+            .join(format!("{thread_id}.json"))
+            .exists()
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn destination_only_replay_rejects_in_place_modification()

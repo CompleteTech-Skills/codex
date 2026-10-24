@@ -547,6 +547,43 @@ pub(super) fn published_rollout_move_owned(
     }
 }
 
+/// Recover the source revision from an owned publication when upgrading a
+/// path-only move journal after its source has already been unlinked.
+pub(super) fn published_rollout_source_binding(
+    source: &Path,
+    destination: &Path,
+) -> io::Result<(RolloutFileIdentity, [u8; 32])> {
+    let source_parent = std::fs::canonicalize(
+        source
+            .parent()
+            .ok_or_else(|| io::Error::other("rollout source has no parent"))?,
+    )?;
+    let destination_parent = std::fs::canonicalize(
+        destination
+            .parent()
+            .ok_or_else(|| io::Error::other("rollout destination has no parent"))?,
+    )?;
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| io::Error::other("rollout source has no filename"))?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| io::Error::other("rollout destination has no filename"))?;
+    let destination = destination_parent.join(destination_name);
+    let intent = read_rollout_move_intent(&rollout_move_intent_path(&destination))?;
+    if intent.source != source_parent.join(source_name)
+        || intent.destination != destination
+        || intent.stage_id != rollout_file_identity(&destination)?
+        || intent.stage_digest != rollout_file_digest(&destination)?
+        || intent.stage_digest != intent.source_digest
+    {
+        return Err(io::Error::other(
+            "legacy rollout publication does not match its receipt",
+        ));
+    }
+    Ok((intent.source_id, intent.source_digest))
+}
+
 #[cfg(test)]
 #[path = "rollout_move_file_tests.rs"]
 mod tests;
