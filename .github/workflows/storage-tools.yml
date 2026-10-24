@@ -166,12 +166,12 @@ jobs:
           python scripts/postgres/manage.py --state "$state" up
       - name: Test PostgreSQL v4 to v5 transactional section upgrade
         working-directory: codex-rs
-        run: just test -p codex-postgres-runtime real_v4_upgrade_to_section_catalog_rejects_orphans_and_preserves_join
+        run: just test -p codex-postgres-runtime --run-ignored only real_v4_upgrade_to_section_catalog_rejects_orphans_and_preserves_join
       - name: Provision isolated named schema for v4 to v5 upgrade
         run: python scripts/postgres/isolation_fixture.py --state "$CODEX_TEST_POSTGRES_SECTION_UPGRADE_STATE"
       - name: Test named PostgreSQL v4 to v5 transactional section upgrade
         working-directory: codex-rs
-        run: just test -p codex-postgres-runtime real_named_v4_upgrade_to_section_catalog_is_atomic
+        run: just test -p codex-postgres-runtime --run-ignored only real_named_v4_upgrade_to_section_catalog_is_atomic
       - name: Stop section upgrade fixture and retain receipts
         if: always()
         shell: bash
