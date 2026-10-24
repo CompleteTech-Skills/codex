@@ -5,6 +5,21 @@ Rust adapters, storage selection, migration controller, cross-host history,
 installation lifecycle and release qualification remain separate incomplete work.
 These files must not be used to claim epic #1 or issue #4/#18 is complete.
 
+## Legacy namespace policy
+
+PostgreSQL bootstrap retains strict protected-table privilege checks (#185).
+It does not repair or normalize the broad runtime grants left by pre-hardening
+development fixtures at schema formats 1–4. Such a namespace is refused before
+migration; its grants and data remain the administrator's responsibility.
+There is no supported automatic ACL-normalization path for those fixtures.
+
+Older-format upgrade tests explicitly exercise that refusal before applying the
+known fixture grants and testing an upgrade from the hardened layout. The grants
+are test preparation, not production migration behavior. The unmerged legacy
+catalog implementation remains preserved in `storage/05e1-postgres-thread-sections`;
+it is not enabled by this policy. Real Linux/PostgreSQL validation of this decision
+remains required before #185 can be closed.
+
 ## What is provided
 
 A PostgreSQL 17 development service with TLS-only TCP connections, SCRAM passwords,

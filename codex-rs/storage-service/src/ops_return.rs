@@ -15,6 +15,7 @@ use crate::ops::RecoveryReport;
 use crate::service::StorageService;
 use codex_state::SqliteConfig;
 use codex_storage_authority::read_cutover;
+use codex_storage_migration::CutoverError;
 use codex_storage_migration::Migrator;
 use codex_storage_migration::RecoveryOutcome;
 use codex_storage_migration::ReturnCutover;
@@ -34,6 +35,28 @@ fn internal<E>(_: E) -> StorageError {
 }
 
 impl StorageService {
+    /// Whether this run left a return intent or plan behind. Markers that cannot be read are
+    /// assumed to be this run's, since guessing otherwise would discard recovery evidence.
+    fn markers_remain(&self, run_id: Uuid) -> bool {
+        self.return_markers(Some(run_id)).unwrap_or(true)
+    }
+
+    /// Whether any return marker exists; markers of another run are a conflict.
+    fn return_markers(&self, run_id: Option<Uuid>) -> Result<bool, StorageError> {
+        let intent = read_cutover(&self.inputs.codex_home).map_err(internal)?;
+        let plan = read_plan(&self.inputs.codex_home).map_err(internal)?;
+        if intent
+            .as_ref()
+            .is_some_and(|intent| Some(intent.run_id) != run_id)
+            || plan
+                .as_ref()
+                .is_some_and(|plan| Some(plan.run_id) != run_id)
+        {
+            return Err(StorageError(BlockerCode::OperationConflict));
+        }
+        Ok(intent.is_some() || plan.is_some())
+    }
+
     pub(crate) fn staged_home(&self, operation_id: Uuid) -> PathBuf {
         self.inputs
             .codex_home
@@ -124,14 +147,17 @@ impl StorageService {
     }
 
     async fn export_and_verify(&self, record: &mut OperationRecord) -> Result<(), StorageError> {
+        let staged_home = self.staged_home(record.operation_id);
+        std::fs::create_dir_all(&staged_home).map_err(internal)?;
+        let config = self.staged_config(&staged_home)?;
         let storage = match self.connect().await {
             Ok(storage) => storage,
             Err(error) => return Err(self.fail(record, error.0)),
         };
-        self.save(record, OperationState::Copying)?;
-        let staged_home = self.staged_home(record.operation_id);
-        std::fs::create_dir_all(&staged_home).map_err(internal)?;
-        let config = self.staged_config(&staged_home)?;
+        if let Err(error) = self.save(record, OperationState::Copying) {
+            storage.close().await;
+            return Err(error);
+        }
         let target = match SqliteTarget::create(
             config.clone(),
             self.inputs.codex_home.clone(),
@@ -160,7 +186,11 @@ impl StorageService {
             .iter()
             .map(|(domain, rows)| (domain.name().to_string(), *rows))
             .collect();
-        self.save(record, OperationState::Verifying)?;
+        if let Err(error) = self.save(record, OperationState::Verifying) {
+            target.close().await;
+            storage.close().await;
+            return Err(error);
+        }
         let verified = exporter.verify(summary.run_id).await;
         target.close().await;
         storage.close().await;
@@ -177,10 +207,13 @@ impl StorageService {
         let run_id = record
             .run_id
             .ok_or(StorageError(BlockerCode::OperationConflict))?;
-        let storage = self.connect().await?;
-        self.save(&mut record, OperationState::Committing)?;
         let staged_home = self.staged_home(record.operation_id);
         let config = self.staged_config(&staged_home)?;
+        let storage = self.connect().await?;
+        if let Err(error) = self.save(&mut record, OperationState::Committing) {
+            storage.close().await;
+            return Err(error);
+        }
         let returning = ReturnCutover::new(
             self.inputs.codex_home.clone(),
             staged_home,
@@ -189,7 +222,13 @@ impl StorageService {
         // An interrupted earlier attempt left an intent behind; settle it before starting.
         let result = match returning.recover().await {
             Ok(RecoveryOutcome::RolledForward { .. }) => Ok(()),
-            Ok(_) => returning.execute(run_id).await.map(|_| ()),
+            // No markers left and the exact run already retired: only the journal is behind.
+            Ok(RecoveryOutcome::Idle) => match returning.completed(run_id).await {
+                Ok(Some(_)) => Ok(()),
+                Ok(None) => returning.execute(run_id).await.map(|_| ()),
+                Err(error) => Err(error),
+            },
+            Ok(RecoveryOutcome::RolledBack) => returning.execute(run_id).await.map(|_| ()),
             Err(error) => Err(error),
         };
         storage.close().await;
@@ -198,12 +237,18 @@ impl StorageService {
                 self.save(&mut record, OperationState::Active)?;
                 Ok(record)
             }
-            Err(codex_storage_migration::CutoverError::Uncertain) => {
+            // Once this run left an intent or plan the dataset may already be retired, so only
+            // recovery can settle it; a terminal Failed would invite a re-export.
+            Err(error)
+                if !matches!(error, CutoverError::Uncertain) && !self.markers_remain(run_id) =>
+            {
+                Err(self.fail(&mut record, error.into()))
+            }
+            Err(_) => {
                 record.blocker = Some(BlockerCode::CutoverInProgress);
                 self.save(&mut record, OperationState::Committing)?;
                 Err(StorageError(BlockerCode::CutoverInProgress))
             }
-            Err(error) => Err(self.fail(&mut record, error.into())),
         }
     }
 
@@ -216,8 +261,9 @@ impl StorageService {
                 operations: Vec::new(),
             });
         };
-        let storage = self.connect().await?;
+        let plan_run = plan.run_id;
         let config = self.staged_config(&plan.staged_home)?;
+        let storage = self.connect().await?;
         let returning = ReturnCutover::new(
             self.inputs.codex_home.clone(),
             plan.staged_home,
@@ -228,7 +274,9 @@ impl StorageService {
         let outcome = outcome.map_err(|error| StorageError(error.into()))?;
         let mut touched = Vec::new();
         for mut record in self.journal.list().into_iter().filter(|record| {
-            record.action == PlanAction::Return && record.state == OperationState::Committing
+            record.action == PlanAction::Return
+                && record.state == OperationState::Committing
+                && record.run_id == Some(plan_run)
         }) {
             match outcome {
                 RecoveryOutcome::RolledForward { .. } => {
@@ -254,48 +302,63 @@ impl StorageService {
         })
     }
 
-    /// Cancel a return that has not retired the dataset. The dataset is reopened unchanged.
+    /// Cancel a return. Before retirement the dataset is reopened unchanged; afterwards the
+    /// return can only finish, so the completed handoff is settled as `Active`, never `Cancelled`.
     pub(crate) async fn cancel_return(
         &self,
         mut record: OperationRecord,
     ) -> Result<OperationRecord, StorageError> {
-        let storage = self.connect().await?;
         let staged_home = self.staged_home(record.operation_id);
         let config = self.staged_config(&staged_home)?;
-        let migrator = Migrator::new(self.staged_source(config), storage.pool().clone());
+        let markers = self.return_markers(record.run_id)?;
+        let storage = self.connect().await?;
+        let migrator = Migrator::new(self.staged_source(config.clone()), storage.pool().clone());
         let returning = ReturnCutover::new(
             self.inputs.codex_home.clone(),
             staged_home,
-            Migrator::new(
-                self.staged_source(self.staged_config(&self.staged_home(record.operation_id))?),
-                storage.pool().clone(),
-            ),
+            Migrator::new(self.staged_source(config), storage.pool().clone()),
         );
-        if read_cutover(&self.inputs.codex_home)
-            .map_err(internal)?
-            .is_some()
-        {
-            returning
-                .abort()
-                .await
-                .map_err(|error| StorageError(error.into()))?;
-        }
-        if let Some(run_id) = record.run_id {
-            // A run that was never retired only read the dataset, so abandoning it reopens it.
-            let state = migrator
-                .activation_state()
-                .await
-                .map_err(|error| StorageError(error.into()))?;
-            if state.migrating && state.run_id == Some(run_id) {
-                migrator
-                    .abandon(run_id)
+        let result = async {
+            let finished = if markers {
+                match returning.abort().await {
+                    Ok(RecoveryOutcome::RolledForward { .. }) => true,
+                    Ok(_) => false,
+                    Err(error) => return Err(StorageError(error.into())),
+                }
+            } else if let Some(run_id) = record.run_id {
+                returning
+                    .completed(run_id)
+                    .await
+                    .map_err(|error| StorageError(error.into()))?
+                    .is_some()
+            } else {
+                false
+            };
+            if let Some(run_id) = record.run_id.filter(|_| !finished) {
+                // A run that was never retired only read the dataset, so abandoning it reopens it.
+                let state = migrator
+                    .activation_state()
                     .await
                     .map_err(|error| StorageError(error.into()))?;
+                if state.migrating && state.run_id == Some(run_id) {
+                    migrator
+                        .abandon(run_id)
+                        .await
+                        .map_err(|error| StorageError(error.into()))?;
+                }
             }
+            Ok::<bool, StorageError>(finished)
         }
+        .await;
         storage.close().await;
+        let finished = result?;
         record.blocker = None;
-        self.save(&mut record, OperationState::Cancelled)?;
+        let state = if finished {
+            OperationState::Active
+        } else {
+            OperationState::Cancelled
+        };
+        self.save(&mut record, state)?;
         Ok(record)
     }
 }

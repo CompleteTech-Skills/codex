@@ -9,11 +9,12 @@ from state_io import ServiceError
 
 def _windows_program(program, directories, cwd):
     requested = Path(program)
-    if (
+    explicit_path = (
         requested.is_absolute()
         or requested.parent != Path(".")
         or program.startswith(".")
-    ):
+    )
+    if explicit_path:
         # A path explicitly supplied by the operator is distinct from a bare name.
         candidates = [requested if requested.is_absolute() else cwd / requested]
     else:
@@ -28,7 +29,7 @@ def _windows_program(program, directories, cwd):
     for candidate in candidates:
         names = (
             [candidate]
-            if candidate.suffix
+            if explicit_path or candidate.suffix
             else [candidate.with_suffix(".exe"), candidate]
         )
         for name in names:

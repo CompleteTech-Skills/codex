@@ -30,9 +30,64 @@ fn settings(state: &Path, role: &str) -> ConnectionSettings {
     }
 }
 
+// Required SQL qualification must never pass through the optional-fixture return.
+fn required_fixture_state<'a>(
+    required_mode: Option<&std::ffi::OsStr>,
+    state: Option<&'a std::ffi::OsStr>,
+) -> Result<Option<&'a str>, &'static str> {
+    let required = match required_mode {
+        None => false,
+        Some(mode) if mode == "1" => true,
+        Some(_) => return Err("invalid SQL fixture required mode; use 1 or leave unset"),
+    };
+    let state = state.and_then(std::ffi::OsStr::to_str);
+    if required && state.is_none_or(|value| value.trim().is_empty()) {
+        return Err("required SQL fixture state is absent, empty, or not Unicode");
+    }
+    Ok(state)
+}
+
+#[test]
+fn declared_sql_fixture_admission_is_fail_closed() {
+    use std::ffi::OsStr;
+    assert_eq!(required_fixture_state(None, None), Ok(None));
+    assert_eq!(
+        required_fixture_state(None, Some(OsStr::new(""))),
+        Ok(Some(""))
+    );
+    for state in [None, Some(OsStr::new("")), Some(OsStr::new(" \t"))] {
+        assert!(required_fixture_state(Some(OsStr::new("1")), state).is_err());
+    }
+    for mode in ["", "0", "true", " 1"] {
+        assert!(
+            required_fixture_state(Some(OsStr::new(mode)), Some(OsStr::new("owned-fixture")))
+                .is_err()
+        );
+    }
+    assert_eq!(
+        required_fixture_state(Some(OsStr::new("1")), Some(OsStr::new("owned-fixture"))),
+        Ok(Some("owned-fixture"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn declared_sql_fixture_rejects_non_unicode_mode_and_state() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let invalid = OsStr::from_bytes(&[0xff]);
+    assert_eq!(required_fixture_state(None, Some(invalid)), Ok(None));
+    assert!(required_fixture_state(Some(invalid), Some(OsStr::new("owned-fixture"))).is_err());
+    assert!(required_fixture_state(Some(OsStr::new("1")), Some(invalid)).is_err());
+}
+
 #[tokio::test]
 async fn real_postgres_graph_adapter_preserves_order_and_edge_semantics() {
-    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_GRAPH_STATE") else {
+    let required_mode = std::env::var_os("CODEX_TEST_POSTGRES_GRAPH_REQUIRED");
+    let fixture_state = std::env::var_os("CODEX_TEST_POSTGRES_GRAPH_STATE");
+    let Some(state) = required_fixture_state(required_mode.as_deref(), fixture_state.as_deref())
+        .expect("admit declared SQL fixture")
+    else {
         return;
     };
     let state = Path::new(&state);

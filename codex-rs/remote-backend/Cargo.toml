@@ -16,7 +16,6 @@ codex-keyring-store = { workspace = true }
 codex-remote-storage = { workspace = true }
 codex-storage-authority = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 codex-postgres-runtime = { workspace = true }

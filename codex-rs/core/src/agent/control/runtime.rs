@@ -184,6 +184,11 @@ impl AgentControlInit {
 
 impl LocalAgentRuntime {
     pub(crate) fn admit_start(&self) -> CodexResult<AgentTreeMembership> {
+        // Standalone runtimes preserve their existing tree admission. They are
+        // explicitly outside this manager's evidence, never a home-wide permit.
+        if let Some(manager) = self.manager.upgrade() {
+            manager.retain_storage_session_tree(self)?;
+        }
         if self.shutdown_state.members.is_closed() {
             return Err(CodexErr::InvalidRequest(
                 "agent runtime is shutting down".to_owned(),
@@ -201,6 +206,10 @@ impl LocalAgentRuntime {
             ));
         }
         Ok(membership)
+    }
+
+    pub(crate) fn shares_shutdown_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shutdown_state, &other.shutdown_state)
     }
 
     pub(crate) fn request_shutdown(&self) -> Arc<AgentTreeShutdownState> {

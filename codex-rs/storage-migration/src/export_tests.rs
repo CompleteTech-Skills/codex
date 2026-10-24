@@ -71,10 +71,23 @@ pub(super) async fn export_phase(
             .await,
         Err(MigrationError::TargetBusy)
     ));
+    assert!(matches!(
+        exporter
+            .abandon_export_owned(owned_run, source_identity)
+            .await,
+        Err(MigrationError::TargetBusy)
+    ));
+    {
+        let mut connection = pool.acquire().await.expect("connection");
+        sqlx::query("UPDATE storage_activation SET run_id = NULL WHERE singleton")
+            .execute(&mut *connection)
+            .await
+            .expect("model an open target with no held export");
+    }
     exporter
         .abandon_export_owned(owned_run, source_identity)
         .await
-        .expect("an operation that never fenced can be cancelled without SQL mutation");
+        .expect("an unstarted export is a no-op when no other run holds the target");
     assert_eq!(
         exporter
             .begin(
