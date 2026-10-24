@@ -12,6 +12,7 @@ mod projects;
 mod read_thread;
 mod revert_thread;
 mod rollout_migration;
+mod rollout_move_noclobber_rename;
 // This lands before the reader PRs that consume the shared lineage resolver.
 #[allow(dead_code)]
 mod rollout_lineage;

@@ -131,12 +131,15 @@ It does not prove a coherent capture, remap source paths, or qualify another
 host or storage backend.
 
 Native archive/unarchive collision fixtures exercise occupied canonical target
-paths in both directions. Exclusive file linking refuses to replace an existing
-target, and the fixtures preserve both distinct byte streams and the SQLite
-metadata row on refusal. A crash between link and source unlink can leave two
-hardlinks to the same file; a crash after unlink but before metadata update can
-leave stale SQLite path/status. Capture and recovery must reconcile either
-state, and these fixtures do not establish a cross-store transaction.
+paths in both directions. A same-volume atomic no-replace rename refuses an
+occupied target without requiring hard-link support or publishing a second name
+before a separate source unlink. The fixtures preserve distinct byte streams and
+the SQLite metadata row on refusal. Callers hold lifecycle and cross-process
+writer locks, but a process bypassing those locks can replace a source, and a
+crash after rename before the metadata update can leave stale SQLite path/status.
+Multi-file rollback and durable ownership-checked recovery remain separate
+requirements; these fixtures do not establish a cross-store transaction.
+Cross-volume moves fail without copy fallback and preserve the source.
 
 The remaining #2/#11 inventory must trace every app-server/TUI/exec/daemon read
 entry point, file-backed attachment implementation, ephemeral sessions (which

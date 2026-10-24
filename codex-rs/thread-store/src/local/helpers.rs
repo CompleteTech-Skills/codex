@@ -148,10 +148,12 @@ pub(super) fn move_rollout_noclobber(
         ));
     }
 
-    // Both collections are under one home. Linking publishes the destination only if absent.
-    // If unlink fails, retain both links so neither copy is lost.
-    std::fs::hard_link(source, canonical_destination_parent.join(destination_name))?;
-    std::fs::remove_file(source)
+    // One no-replace rename either moves the name or leaves it untouched. In particular,
+    // publication cannot succeed before a separately failing source unlink.
+    super::rollout_move_noclobber_rename::rename_noclobber(
+        &canonical_source,
+        &canonical_destination_parent.join(destination_name),
+    )
 }
 
 pub(super) fn restore_rollout_moves(

@@ -4685,6 +4685,7 @@ dependencies = [
  "codex-utils-path",
  "codex-utils-path-uri",
  "futures",
+ "libc",
  "pretty_assertions",
  "pulldown-cmark",
  "serde",
@@ -4696,6 +4697,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.52.0",
  "zstd",
 ]
 
