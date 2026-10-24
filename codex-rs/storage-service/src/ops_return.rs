@@ -14,6 +14,7 @@ use crate::ops::RecoveryKind;
 use crate::ops::RecoveryReport;
 use crate::service::StorageService;
 use codex_state::SqliteConfig;
+use codex_storage_authority::ActiveBackend;
 use codex_storage_authority::read_cutover;
 use codex_storage_migration::CutoverError;
 use codex_storage_migration::Migrator;
@@ -37,8 +38,8 @@ fn internal<E>(_: E) -> StorageError {
 impl StorageService {
     /// Whether this run can only be settled by recovery, never re-exported or failed: its
     /// markers remain (unreadable ones are assumed its own) or the home is already Local.
-    fn requires_recovery(&self, run_id: Uuid) -> bool {
-        self.return_markers(Some(run_id)).unwrap_or(true)
+    fn requires_recovery(&self, record: &OperationRecord) -> bool {
+        self.return_markers(record).unwrap_or(true)
             || matches!(
                 codex_storage_authority::authority_state(&self.inputs.codex_home),
                 Ok(codex_storage_authority::AuthorityState::Local(_))
@@ -46,14 +47,17 @@ impl StorageService {
     }
 
     /// Whether any return marker exists; markers of another run are a conflict.
-    fn return_markers(&self, run_id: Option<Uuid>) -> Result<bool, StorageError> {
+    fn return_markers(&self, record: &OperationRecord) -> Result<bool, StorageError> {
         let home = &self.inputs.codex_home;
-        let intent = read_cutover(home).map_err(internal)?.map(|i| i.run_id);
-        let plan = read_plan(home).map_err(internal)?.map(|p| p.run_id);
-        if [intent, plan]
-            .into_iter()
-            .flatten()
-            .any(|owner| Some(owner) != run_id)
+        let intent = read_cutover(home).map_err(internal)?;
+        let plan = read_plan(home).map_err(internal)?;
+        if intent
+            .as_ref()
+            .is_some_and(|i| Some(i.run_id) != record.run_id || i.target != ActiveBackend::Local)
+            || plan.as_ref().is_some_and(|p| {
+                Some(p.run_id) != record.run_id
+                    || p.staged_home != self.staged_home(record.operation_id)
+            })
         {
             return Err(StorageError(BlockerCode::OperationConflict));
         }
@@ -142,11 +146,23 @@ impl StorageService {
         mut record: OperationRecord,
     ) -> Result<OperationRecord, StorageError> {
         let Some(_claim) = self.claim(record.operation_id) else {
-            return Ok(record);
+            return self.operation(record.operation_id);
         };
-        if record.run_id.is_some_and(|run| self.requires_recovery(run)) {
+        let current = self.operation(record.operation_id)?;
+        if current != record
+            || current.action != PlanAction::Return
+            || !matches!(
+                current.state,
+                OperationState::Planned
+                    | OperationState::Copying
+                    | OperationState::Verifying
+                    | OperationState::Failed
+            )
+            || self.requires_recovery(&current)
+        {
             return Err(StorageError(BlockerCode::OperationConflict));
         }
+        record = current;
         self.export_and_verify(&mut record).await?;
         Ok(record)
     }
@@ -215,7 +231,10 @@ impl StorageService {
         let staged_home = self.staged_home(record.operation_id);
         let config = self.staged_config(&staged_home)?;
         let storage = self.connect().await?;
-        if let Err(error) = self.save(&mut record, OperationState::Committing) {
+        if let Err(error) = self
+            .return_markers(&record)
+            .and_then(|_| self.save(&mut record, OperationState::Committing))
+        {
             storage.close().await;
             return Err(error);
         }
@@ -242,7 +261,8 @@ impl StorageService {
             }
             // With markers left the dataset may be retired: only recovery settles it, never Failed.
             Err(error)
-                if !matches!(error, CutoverError::Uncertain) && !self.requires_recovery(run_id) =>
+                if !matches!(error, CutoverError::Uncertain)
+                    && !self.requires_recovery(&record) =>
             {
                 Err(self.fail(&mut record, error.into()))
             }
@@ -316,7 +336,7 @@ impl StorageService {
     ) -> Result<OperationRecord, StorageError> {
         let staged_home = self.staged_home(record.operation_id);
         let config = self.staged_config(&staged_home)?;
-        let markers = self.return_markers(record.run_id)?;
+        let markers = self.return_markers(&record)?;
         let storage = self.connect().await?;
         let refuse = |error: CutoverError| StorageError(error.into());
         let migrator = Migrator::new(self.staged_source(config.clone()), storage.pool().clone());

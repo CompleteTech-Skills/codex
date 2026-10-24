@@ -161,7 +161,14 @@ fn service(
 
 #[tokio::test]
 async fn real_postgres_storage_service() {
-    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE") else {
+    let state = std::env::var("CODEX_TEST_POSTGRES_STORAGE_SERVICE_STATE");
+    if std::env::var("CODEX_TEST_POSTGRES_REQUIRED").as_deref() == Ok("1") {
+        assert!(
+            state.as_ref().is_ok_and(|path| !path.trim().is_empty()),
+            "required service fixture"
+        );
+    }
+    let Ok(state) = state else {
         return;
     };
     let state = Path::new(&state);
@@ -589,7 +596,14 @@ const CONFIRMED: Confirmation = Confirmation {
 };
 
 /// A remote home with a verified export of its dataset waiting in `Ready`.
-async fn ready_return(state: &Path) -> (tempfile::TempDir, StorageService, OperationRecord, Uuid) {
+async fn ready_return(
+    state: &Path,
+) -> (
+    tempfile::TempDir,
+    StorageService,
+    OperationRecord,
+    (Uuid, OperationRecord),
+) {
     reset_target(state).await;
     let home = populated_home().await;
     let profile = Some(profile(state, true));
@@ -603,12 +617,14 @@ async fn ready_return(state: &Path) -> (tempfile::TempDir, StorageService, Opera
     started.expect("migrate");
     svc.activate(migration).await.expect("activate");
     let plan = svc.plan(PlanAction::Return).await.expect("return plan");
-    let ready = svc
-        .start_return(Uuid::new_v4(), plan.plan_id, CONFIRMED)
-        .await;
-    let ready = ready.expect("export");
+    let (prepared, created) = svc
+        .prepare_return(Uuid::new_v4(), plan.plan_id, CONFIRMED)
+        .await
+        .expect("prepare");
+    assert!(created);
+    let ready = svc.run_return(prepared.clone()).await.expect("export");
     assert_eq!(ready.state, OperationState::Ready);
-    (home, svc, ready, plan.plan_id)
+    (home, svc, ready, (plan.plan_id, prepared))
 }
 
 /// Record the cutover intent and retire the exact exported run, as an interrupted return would.
@@ -652,10 +668,39 @@ fn settled(home: &Path) -> bool {
     !markers(home) && matches!(local, Ok(codex_storage_authority::AuthorityState::Local(_)))
 }
 
+fn return_files(path: &Path) -> Vec<(std::path::PathBuf, bool, Vec<u8>)> {
+    let directory = path.is_dir();
+    let bytes = if directory {
+        Vec::new()
+    } else {
+        std::fs::read(path).expect("file evidence")
+    };
+    let mut files = vec![(path.to_path_buf(), directory, bytes)];
+    if directory {
+        for entry in std::fs::read_dir(path).expect("directory evidence") {
+            files.extend(return_files(&entry.expect("entry").path()));
+        }
+    }
+    files.sort();
+    files
+}
+
+async fn return_evidence(
+    svc: &StorageService,
+) -> (Vec<(std::path::PathBuf, bool, Vec<u8>)>, String) {
+    let storage = svc.connect().await.expect("evidence pool");
+    let mut connection = storage.pool().acquire().await.expect("evidence connection");
+    let sql = sqlx::query_scalar("SELECT jsonb_build_object('activation', (SELECT to_jsonb(a) FROM storage_activation a WHERE singleton), 'runs', (SELECT jsonb_agg(to_jsonb(r) ORDER BY run_id) FROM storage_migration_runs r))::text")
+        .fetch_one(&mut *connection).await.expect("SQL evidence");
+    drop(connection);
+    storage.close().await;
+    (return_files(&svc.inputs.codex_home), sql)
+}
+
 async fn return_fault_cases(state: &Path) {
     // A real install fault after retirement keeps the owner Committing, and the legacy Failed
     // owner the old code left for the same fault recovers too; evidence survives the fault.
-    let (home, svc, ready, plan_id) = ready_return(state).await;
+    let (home, svc, ready, (plan_id, prepared)) = ready_return(state).await;
     let id = ready.operation_id;
     let backup = format!("{}-before-return", ready.run_id.expect("run"));
     let fault = home.path().join("storage-backups").join(backup);
@@ -668,14 +713,23 @@ async fn return_fault_cases(state: &Path) {
     let remote = svc.connect().await.expect("remote");
     assert!(remote.activation().await.expect("activation").retired);
     remote.close().await;
+    let before = return_evidence(&svc).await;
+    assert!(matches!(
+        svc.run_return(prepared).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    ));
+    assert_eq!(return_evidence(&svc).await, before);
+    assert_eq!(svc.operation(id).expect("same owner"), held);
     let retry = svc.start_return(id, plan_id, CONFIRMED).await;
     assert_eq!(retry.expect("retry"), held);
     let legacy = saved(&svc, &held, OperationState::Failed);
     let retry = svc.start_return(id, plan_id, CONFIRMED).await;
     assert_eq!(retry.expect("no restart"), legacy);
+    let before = return_evidence(&svc).await;
     assert!(svc.run_return(legacy.clone()).await.is_err());
     assert!(svc.recover().await.is_err());
     assert_eq!(svc.operation(id).expect("kept"), legacy);
+    assert_eq!(return_evidence(&svc).await, before);
     assert!(markers(home.path()));
     std::fs::remove_file(&fault).expect("clear fault");
     let recovered = svc.recover().await.expect("recover");
@@ -689,6 +743,16 @@ async fn return_fault_cases(state: &Path) {
     let (home, svc, ready, _) = ready_return(state).await;
     let id = ready.operation_id;
     retire_export(&svc, home.path(), &ready, false).await;
+    let mut foreign = ready.clone();
+    foreign.run_id = Some(Uuid::new_v4());
+    let foreign = saved(&svc, &foreign, OperationState::Committing);
+    let before = return_evidence(&svc).await;
+    assert!(matches!(
+        svc.activate(id).await,
+        Err(StorageError(BlockerCode::OperationConflict))
+    ));
+    assert_eq!(svc.operation(id).expect("foreign owner retained"), foreign);
+    assert_eq!(return_evidence(&svc).await, before);
     saved(&svc, &ready, OperationState::Committing);
     let done = svc.cancel(id).await.expect("cancel finishes the return");
     assert_eq!(done.state, OperationState::Active);

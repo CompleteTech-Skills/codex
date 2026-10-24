@@ -402,7 +402,85 @@ async fn completed_finish_is_repeatable(
     assert!(staged_home.exists());
 }
 
-/// Cancellation, completion and fault cases once the dataset has been retired.
+/// Mutate evidence only after PostgreSQL reports this transaction blocking recovery.
+async fn blocked_recovery(
+    pool: &PostgresPool,
+    returning: &ReturnCutover,
+    run_id: Uuid,
+    activation_lock: bool,
+    change: impl FnOnce(),
+) -> Result<RecoveryOutcome, CutoverError> {
+    let mut locker = pool.acquire().await.expect("locker");
+    let mut tx = locker.begin().await.expect("lock transaction");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("locker pid");
+    if activation_lock {
+        sqlx::query("LOCK TABLE storage_activation IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await
+            .expect("activation read barrier");
+    } else {
+        sqlx::query("SELECT run_id FROM storage_migration_runs WHERE run_id = $1 FOR UPDATE")
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await
+            .expect("run barrier");
+    }
+    let mut observer = pool.acquire().await.expect("lock observer");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mutate = async {
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted AND $1 = ANY(pg_blocking_pids(pid)))")
+                    .bind(pid).fetch_one(&mut *observer).await.expect("blocking pids");
+                if blocked { break; }
+                tokio::task::yield_now().await;
+            }
+            change();
+            tx.commit().await.expect("release observed lock");
+        };
+        let (result, ()) = tokio::join!(returning.recover(), mutate);
+        result
+    }).await.expect("observed recovery wait within bound")
+}
+
+fn return_files(path: &Path) -> Vec<(PathBuf, bool, Vec<u8>)> {
+    let directory = path.is_dir();
+    let bytes = if directory {
+        Vec::new()
+    } else {
+        std::fs::read(path).expect("file evidence")
+    };
+    let mut files = vec![(path.to_path_buf(), directory, bytes)];
+    if directory {
+        for entry in std::fs::read_dir(path).expect("directory evidence") {
+            files.extend(return_files(&entry.expect("entry").path()));
+        }
+    }
+    files.sort();
+    files
+}
+
+async fn assert_abandoned(
+    pool: &Arc<PostgresPool>,
+    source: &SqliteSource,
+    expected: &ActivationState,
+) {
+    let mut expected = expected.clone();
+    expected.migrating = false;
+    expected.retired = false;
+    assert_eq!(dataset_state(pool, source).await, expected);
+    let mut connection = pool.acquire().await.expect("durable state");
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM storage_migration_runs WHERE run_id = $1")
+            .bind(expected.run_id.expect("owned run"))
+            .fetch_one(&mut *connection)
+            .await
+            .expect("run state");
+    assert_eq!(state, "abandoned");
+}
+
 async fn retired_return_cases(pool: &Arc<PostgresPool>, source: &SqliteSource, home: &Path) {
     // After retirement a return can only finish: cancelling reports the roll-forward.
     remote_authority(pool, source, home).await;
@@ -466,35 +544,111 @@ async fn retired_return_cases(pool: &Arc<PostgresPool>, source: &SqliteSource, h
     // A plan left by a failed cleanup is discarded only for the exact abandoned export.
     remote_authority(pool, source, home).await;
     let (returning, run_id, _) = staged_return(pool, home, "cleanup-fault", true).await;
-    returning.prepare(run_id).expect("prepare");
+    let intent = returning.prepare(run_id).expect("prepare");
     let plan_path = home.join("storage-install.json");
-    let kept = home.join("storage-install.json.kept");
-    std::fs::rename(&plan_path, &kept).expect("keep plan");
-    std::fs::create_dir(&plan_path).expect("cleanup fault");
-    assert!(returning.recover().await.is_err());
-    assert!(!dataset_state(pool, source).await.migrating);
-    assert_eq!(read_cutover(home).expect("intent"), None);
-    std::fs::remove_dir(&plan_path).expect("clear fault");
-    let real = std::fs::read(&kept).expect("plan bytes");
-    for variant in 0..3 {
-        let mut forged: InstallPlan = serde_json::from_slice(&real).expect("plan");
-        match variant {
-            0 => forged.run_id = Uuid::new_v4(),
-            1 => forged.staged_home = home.join("storage-staging").join("elsewhere"),
-            _ => forged.backup_dir = home.join("elsewhere"),
+    let real = std::fs::read(&plan_path).expect("plan bytes");
+    for with_intent in [true, false] {
+        let remote = dataset_state(pool, source).await;
+        for variant in 0..3 {
+            let mut forged: InstallPlan = serde_json::from_slice(&real).expect("plan");
+            match variant {
+                0 => forged.run_id = Uuid::new_v4(),
+                1 => forged.staged_home = home.join("storage-staging").join("elsewhere"),
+                _ => forged.backup_dir = home.join("elsewhere"),
+            }
+            let forged = serde_json::to_vec(&forged).expect("forged plan");
+            std::fs::write(&plan_path, &forged).expect("forged plan");
+            let before = return_files(home);
+            assert!(returning.recover().await.is_err());
+            assert_eq!(return_files(home), before);
+            assert_eq!(dataset_state(pool, source).await, remote);
         }
-        let forged = serde_json::to_vec(&forged).expect("forged plan");
-        std::fs::write(&plan_path, &forged).expect("forged plan");
-        assert!(returning.recover().await.is_err());
-        assert_eq!(std::fs::read(&plan_path).expect("kept"), forged);
+        std::fs::write(&plan_path, &real).expect("restore plan");
+        if with_intent {
+            let kept = home.join("storage-install.json.kept");
+            std::fs::rename(&plan_path, &kept).expect("keep valid plan");
+            std::fs::create_dir(&plan_path).expect("unreadable plan");
+            let before = return_files(home);
+            assert!(returning.recover().await.is_err());
+            assert_eq!(return_files(home), before);
+            assert_eq!(dataset_state(pool, source).await, remote);
+            std::fs::remove_dir(&plan_path).expect("clear fixture directory");
+            std::fs::rename(&kept, &plan_path).expect("restore valid plan");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let permissions = std::fs::metadata(home).unwrap().permissions();
+                let before = return_files(home);
+                // Both markers remain readable/valid; unlink fails only after SQL commits.
+                let result = blocked_recovery(pool, &returning, run_id, false, || {
+                    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o555)).unwrap();
+                })
+                .await;
+                std::fs::set_permissions(home, permissions).unwrap();
+                assert!(matches!(
+                    result,
+                    Err(CutoverError::Destination(MigrationError::Staging(_)))
+                ));
+                assert_eq!(return_files(home), before);
+                assert_abandoned(pool, source, &remote).await;
+            }
+            codex_storage_authority::abandon_cutover(home, &intent)
+                .expect("model intent-only cleanup");
+        }
     }
-    std::fs::write(&plan_path, &real).expect("restore plan");
-    std::fs::remove_file(&kept).expect("drop copy");
+    // Replace a valid captured Remote plan only after an actual SQL lock wait is observed.
+    let mut forged: InstallPlan = serde_json::from_slice(&real).expect("plan");
+    forged.backup_dir = home.join("elsewhere");
+    let mut replaced = Vec::new();
+    let remote = dataset_state(pool, source).await;
+    let result = blocked_recovery(pool, &returning, run_id, false, || {
+        std::fs::write(&plan_path, serde_json::to_vec(&forged).unwrap()).unwrap();
+        replaced = return_files(home);
+    })
+    .await;
+    assert!(matches!(
+        result,
+        Err(CutoverError::Destination(MigrationError::TargetBusy))
+    ));
+    assert_eq!(return_files(home), replaced);
+    assert_abandoned(pool, source, &remote).await;
+    std::fs::write(&plan_path, &real).expect("restore captured plan");
     assert!(matches!(
         returning.recover().await,
         Ok(RecoveryOutcome::RolledBack)
     ));
     assert_eq!(install::read_plan(home).expect("plan"), None);
+
+    // Local plan-only cleanup must retain a newly arrived intent during its SQL read.
+    remote_authority(pool, source, home).await;
+    let (returning, run_id, _) = staged_return(pool, home, "local-evidence", true).await;
+    let intent = returning.prepare(run_id).expect("prepare");
+    returning.publish(&intent).await.expect("retire");
+    returning.install().expect("install");
+    codex_storage_authority::complete_cutover(home, &intent).expect("publish Local, retain plan");
+    let mut foreign = intent;
+    foreign.run_id = Uuid::new_v4();
+    let mut replaced = Vec::new();
+    let result = blocked_recovery(pool, &returning, run_id, true, || {
+        std::fs::write(
+            home.join("storage-cutover.json"),
+            serde_json::to_vec(&foreign).unwrap(),
+        )
+        .unwrap();
+        replaced = return_files(home);
+    })
+    .await;
+    assert!(matches!(
+        result,
+        Err(CutoverError::Destination(MigrationError::TargetBusy))
+    ));
+    assert_eq!(return_files(home), replaced);
+    assert!(dataset_state(pool, source).await.retired);
+    std::fs::remove_file(home.join("storage-cutover.json")).expect("clear fixture foreign intent");
+    assert_eq!(
+        returning.recover().await.expect("Local cleanup retry"),
+        RecoveryOutcome::RolledForward { generation: 3 }
+    );
 }
 
 pub(super) async fn return_phase(
