@@ -93,6 +93,7 @@ members = [
     "ollama",
     "process-hardening",
     "postgres-import-store",
+    "postgres-thread-sections",
     "postgres-runtime",
     "realtime-webrtc",
     "voice-host",
@@ -176,6 +177,7 @@ app_test_support = { path = "app-server/tests/common" }
 codex-analytics = { path = "analytics" }
 codex-agent-graph-store = { path = "agent-graph-store" }
 codex-postgres-import-store = { path = "postgres-import-store" }
+codex-postgres-thread-sections = { path = "postgres-thread-sections" }
 codex-postgres-runtime = { path = "postgres-runtime" }
 codex-storage-candidate-preflight = { path = "storage-candidate-preflight" }
 codex-agent-identity = { path = "agent-identity" }

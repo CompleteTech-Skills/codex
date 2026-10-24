@@ -4229,6 +4229,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-postgres-thread-sections"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "codex-postgres-runtime",
+ "codex-protocol",
+ "codex-state",
+ "codex-utils-absolute-path",
+ "pretty_assertions",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "codex-postgres-runtime"
 version = "0.0.0"
 dependencies = [

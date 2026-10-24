@@ -45,6 +45,11 @@ impl NamedNamespace {
         })
     }
 
+    /// Validated schema identifier for parameterized domain adapters.
+    pub fn schema_name(&self) -> &str {
+        &self.schema
+    }
+
     pub(crate) fn quoted_schema(&self) -> String {
         format!("\"{}\"", self.schema)
     }
