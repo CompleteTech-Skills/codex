@@ -22,6 +22,8 @@ use tokio::task::JoinHandle;
 
 #[path = "administrative_catalog.rs"]
 mod catalog;
+#[path = "administrative_columns.rs"]
+mod columns;
 
 type CloseOutcome = Result<(), Arc<dyn std::error::Error + Send + Sync>>;
 const CAUSES: usize = 8;
@@ -42,6 +44,7 @@ pub(super) enum CommandCause {
     Relations(catalog::RelationRefusal),
     RetainedDriver(Arc<sqlx::Error>),
     History(Arc<catalog::HistoryRefusal>),
+    Columns(columns::ColumnRefusal),
 }
 
 struct State {
@@ -64,6 +67,8 @@ struct State {
     structural_history: Option<Result<Vec<PgRow>, Arc<sqlx::Error>>>,
     structural_refusal: Option<Arc<catalog::HistoryRefusal>>,
     structural_history_accepted: bool,
+    structural_columns: Option<Result<Vec<PgRow>, Arc<sqlx::Error>>>,
+    structural_columns_accepted: bool,
     #[cfg(test)]
     history_probe: Option<catalog::NativeHistoryProbe>,
     #[cfg(test)]
@@ -137,6 +142,15 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
                 CommandCause::History(raw) => {
                     let _ = raw;
                 }
+                CommandCause::Columns(raw) => match raw {
+                    columns::ColumnRefusal::Count { observed } => {
+                        let _ = observed;
+                    }
+                    columns::ColumnRefusal::Driver(raw) => {
+                        let _ = raw;
+                    }
+                    columns::ColumnRefusal::Mismatch => {}
+                },
                 CommandCause::MissingSession | CommandCause::UnknownStatus => {}
             }
         }
@@ -152,6 +166,8 @@ impl std::fmt::Debug for AdministrativeCommandRefusal {
             &state.structural_history,
             &state.structural_refusal,
             state.structural_history_accepted,
+            &state.structural_columns,
+            state.structural_columns_accepted,
             &state.raw_stamp,
             &state.native_baseline,
             &state.xid,
@@ -283,6 +299,8 @@ impl OriginalAdministrativeCommand {
                 structural_history: None,
                 structural_refusal: None,
                 structural_history_accepted: false,
+                structural_columns: None,
+                structural_columns_accepted: false,
                 #[cfg(test)]
                 history_probe: None,
                 #[cfg(test)]
@@ -584,6 +602,60 @@ impl OriginalAdministrativeCommand {
         Ok(())
     }
 
+    async fn capture_structural_columns(
+        &self,
+        connection: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+        namespace: &str,
+    ) {
+        let admitted = {
+            let state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+            !state.refused
+                && !self.state.is_poisoned()
+                && state.structural_history_accepted
+                && state.catalog_relations.is_some()
+                && state.structural_columns.is_none()
+        };
+        if !admitted {
+            return;
+        }
+        let sql = columns::observation_sql();
+        let observed = sqlx::query(&sql)
+            .bind(namespace)
+            .fetch_all(&mut **connection)
+            .await
+            .map_err(Arc::new);
+        // Raw native result belongs to the SAME command before classification or next await.
+        let classified = {
+            let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+            state.structural_columns = Some(observed);
+            state.refused |= self.state.is_poisoned();
+            match state.structural_columns.as_ref() {
+                Some(Ok(rows)) => {
+                    match catalog::retained_payload_bytes(rows, state.catalog_payload_bytes) {
+                        Ok(bytes) => {
+                            let inspected = columns::inspect(rows);
+                            state.catalog_payload_bytes = bytes;
+                            inspected.map_err(CommandCause::Columns)
+                        }
+                        Err(raw) => Err(CommandCause::Catalog(raw)),
+                    }
+                }
+                Some(Err(raw)) => Err(CommandCause::RetainedDriver(Arc::clone(raw))),
+                None => Err(CommandCause::UnknownStatus),
+            }
+        };
+        match classified {
+            Ok(()) => {
+                let mut state = self.state.lock().unwrap_or_else(|raw| raw.into_inner());
+                state.refused |= self.state.is_poisoned();
+                if !state.refused {
+                    state.structural_columns_accepted = true;
+                }
+            }
+            Err(raw) => self.cause(raw),
+        }
+    }
+
     async fn run_preflight(&self) {
         let mut original = Arc::clone(&self.original).lock_owned().await;
         let Some(frame) = original.as_mut() else {
@@ -796,6 +868,10 @@ impl OriginalAdministrativeCommand {
                 }
                 Err(raw) => self.cause(CommandCause::Driver(raw)),
             }
+        }
+        if structural {
+            self.capture_structural_columns(connection, &namespace)
+                .await;
         }
         // This preflight reads application data but BEGIN and xid allocation
         // affect native transaction state. Always explicitly rollback the
