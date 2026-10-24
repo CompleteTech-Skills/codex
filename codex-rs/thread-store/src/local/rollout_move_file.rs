@@ -148,39 +148,7 @@ fn move_rollout_with_hooks(
             // Give the published file an identity distinct from the source before the
             // no-clobber publication. The durable intent can then distinguish our file
             // from even an unrelated hard link to the source after a crash.
-            let stage = tempfile::Builder::new()
-                .prefix(".codex-rollout-stage-")
-                .tempfile_in(&canonical_destination_parent)?;
-            let stage_path = stage.path().to_path_buf();
-            let stage_id = rollout_file_identity(&stage_path)?;
-            let (stage_file, stage_path) = stage.keep().map_err(|err| err.error)?;
-            drop(stage_file);
-            sync_parent_directory(&stage_path)?;
-            let quarantine_dir = tempfile::Builder::new()
-                .prefix(".codex-rollout-quarantine-")
-                .tempdir_in(
-                    canonical_source
-                        .parent()
-                        .ok_or_else(|| io::Error::other("rollout source has no parent"))?,
-                )?
-                .keep();
-            sync_parent_directory(&quarantine_dir)?;
-            // Recursive rollout discovery recognizes production filenames even inside hidden
-            // directories. Keep a quarantined source out of those scans after a crash.
-            let quarantine_path = quarantine_dir.join("quarantined-source");
-            let intent = RolloutMoveIntent {
-                source: canonical_source,
-                destination: canonical_destination.clone(),
-                source_len: source_metadata.len(),
-                source_modified: source_metadata.modified()?,
-                source_id,
-                source_digest,
-                stage_path,
-                stage_id,
-                stage_digest: source_digest,
-                quarantine_path,
-                receipt_publication: None,
-            };
+            let intent = allocate_resources(&canonical_source, &canonical_destination)?;
             // Publication errors can follow a durable receipt. Retain its resources.
             write_rollout_move_intent(&intent_path, &intent, sync_intent_parent)?;
             // The receipt must be durable before any rollout bytes enter the stage.
@@ -373,8 +341,8 @@ fn stage_has_single_link(file: &std::fs::File) -> io::Result<bool> {
     Ok(info.NumberOfLinks == 1)
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct RolloutMoveIntent {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct RolloutMoveIntent {
     #[serde(with = "super::rollout_move_path_json")]
     source: PathBuf,
     #[serde(with = "super::rollout_move_path_json")]
@@ -389,6 +357,8 @@ struct RolloutMoveIntent {
     stage_digest: [u8; 32],
     #[serde(with = "super::rollout_move_path_json")]
     quarantine_path: PathBuf,
+    #[serde(default)]
+    quarantine_id: Option<RolloutFileIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt_publication: Option<receipt_publication::ReceiptPublication>,
 }
@@ -408,6 +378,14 @@ fn quarantine_directory(intent: &RolloutMoveIntent) -> io::Result<&Path> {
         return Err(io::Error::other(
             "rollout move has an invalid quarantine path",
         ));
+    }
+    if let Some(expected) = intent.quarantine_id {
+        match super::rollout_move_identity::rollout_directory_identity(directory) {
+            Ok(actual) if actual == expected => {}
+            Ok(_) => return Err(io::Error::other("quarantine directory was replaced")),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
     Ok(directory)
 }
@@ -675,3 +653,131 @@ pub(super) fn published_rollout_move_owned(
 #[cfg(test)]
 #[path = "rollout_move_file_tests.rs"]
 pub(super) mod tests;
+
+
+fn allocate_resources(source: &Path, destination: &Path) -> io::Result<RolloutMoveIntent> {
+    let destination_parent = destination.parent().ok_or_else(|| io::Error::other("missing destination parent"))?;
+    let source_metadata = std::fs::metadata(source)?;
+    let source_id = rollout_file_identity(source)?;
+    let source_digest = rollout_file_digest(source)?;
+    let stage = tempfile::Builder::new()
+        .prefix(".codex-rollout-stage-")
+        .tempfile_in(&destination_parent)?;
+    let stage_path = stage.path().to_path_buf();
+    let stage_id = rollout_file_identity(&stage_path)?;
+    let (stage_file, stage_path) = stage.keep().map_err(|err| err.error)?;
+    drop(stage_file);
+    sync_parent_directory(&stage_path)?;
+    let quarantine_dir = tempfile::Builder::new()
+        .prefix(".codex-rollout-quarantine-")
+        .tempdir_in(
+            source
+        .parent()
+        .ok_or_else(|| io::Error::other("rollout source has no parent"))?,
+        )?
+        .keep();
+    sync_parent_directory(&quarantine_dir)?;
+    // Recursive rollout discovery recognizes production filenames even inside hidden
+    // directories. Keep a quarantined source out of those scans after a crash.
+    let quarantine_path = quarantine_dir.join("quarantined-source");
+    let intent = RolloutMoveIntent {
+        source: source.to_path_buf(),
+        destination: destination.to_path_buf(),
+        source_len: source_metadata.len(),
+        source_modified: source_metadata.modified()?,
+        source_id,
+        source_digest,
+        stage_path,
+        stage_id,
+        stage_digest: source_digest,
+        quarantine_path,
+        quarantine_id: Some(super::rollout_move_identity::rollout_directory_identity(&quarantine_dir)?),
+    receipt_publication: None,
+    };
+    Ok(intent)
+}
+
+pub(super) fn prepare_rollout_resources(source: &Path, destination: &Path) -> io::Result<RolloutMoveIntent> {
+    let source = std::fs::canonicalize(source)?;
+    let destination_parent = std::fs::canonicalize(destination.parent().ok_or_else(|| io::Error::other("missing destination parent"))?)?;
+    let destination = destination_parent.join(destination.file_name().ok_or_else(|| io::Error::other("missing destination name"))?);
+    let mut intent = allocate_resources(&source, &destination)?;
+    let (publication, file) = receipt_publication::prepare(&intent.stage_path)?;
+    drop(file);
+    intent.receipt_publication = Some(publication);
+    Ok(intent)
+}
+
+pub(super) fn publish_prepared_resources(intent: &RolloutMoveIntent, source: &Path, destination: &Path,
+    source_id: RolloutFileIdentity, source_digest: [u8; 32]) -> io::Result<()> {
+    let source = std::fs::canonicalize(source)?;
+    let destination_parent = std::fs::canonicalize(destination.parent().ok_or_else(|| io::Error::other("missing destination parent"))?)?;
+    let destination = destination_parent.join(destination.file_name().ok_or_else(|| io::Error::other("missing destination name"))?);
+    if intent.source != source || intent.destination != destination
+        || intent.source_id != source_id || intent.source_digest != source_digest
+        || intent.stage_path.parent() != Some(destination_parent.as_path())
+        || !intent.stage_path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(".codex-rollout-stage-"))
+    { return Err(io::Error::other("prepared rollout does not match its journal pair")); }
+
+    let path = rollout_move_intent_path(&intent.destination);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let current = read_rollout_move_intent(&path)?;
+            if current != *intent { return Err(io::Error::other("prepared rollout receipt changed")); }
+            receipt_publication::validate(&path, &current)?;
+            return Ok(());
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    if rollout_file_identity(&intent.source)? != intent.source_id
+        || rollout_file_digest(&intent.source)? != intent.source_digest
+        || rollout_file_identity(&intent.stage_path)? != intent.stage_id
+        || std::fs::metadata(&intent.stage_path)?.len() != 0
+    { return Err(io::Error::other("prepared rollout resources changed")); }
+    let directory = quarantine_directory(intent)?;
+    if intent.quarantine_id != Some(super::rollout_move_identity::rollout_directory_identity(directory)?) {
+        return Err(io::Error::other("prepared quarantine identity changed"));
+    }
+    receipt_publication::verify_prepared(intent)?;
+    write_rollout_move_intent(&path, intent, sync_parent_directory)
+}
+
+
+pub(super) fn discard_prepared_resources(intent: &RolloutMoveIntent) -> io::Result<()> {
+    let publication = intent.receipt_publication.as_ref().ok_or_else(|| io::Error::other("preparation has no receipt ownership"))?;
+    // Validate every surviving resource before deleting any of them.
+    match std::fs::symlink_metadata(&intent.stage_path) {
+        Ok(metadata) if metadata.file_type().is_file() && metadata.len() == 0
+            && rollout_file_identity(&intent.stage_path)? == intent.stage_id => {}
+        Ok(_) => return Err(io::Error::other("prepared stage was replaced or filled")),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    match receipt_publication::verify_empty(publication, &intent.stage_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    let directory = quarantine_directory(intent)?;
+    match std::fs::read_dir(directory) {
+        Ok(mut entries) => {
+            if entries.next().is_some() {
+                return Err(io::Error::other("prepared quarantine is not empty"));
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    receipt_publication::remove_prepared(publication, &intent.stage_path)?;
+    match std::fs::remove_file(&intent.stage_path) {
+        Ok(()) => sync_parent_directory(&intent.stage_path)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    match std::fs::remove_dir(directory) {
+        Ok(()) => sync_parent_directory(directory),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}

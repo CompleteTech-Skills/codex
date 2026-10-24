@@ -4,7 +4,6 @@
 
 use std::io;
 use std::io::Read;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -25,6 +24,9 @@ use super::rollout_move_identity::rollout_file_identity;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
+#[path = "rollout_move_seed.rs"]
+mod seed;
+
 const MAX_MOVE_JOURNAL_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -41,9 +43,11 @@ struct MovePair {
     destination: PathBuf,
     source_id: RolloutFileIdentity,
     source_digest: [u8; 32],
+    #[serde(default)]
+    preparation: Option<super::rollout_move_file::RolloutMoveIntent>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct MoveTransaction {
     thread_id: ThreadId,
     direction: MoveDirection,
@@ -73,7 +77,7 @@ pub(super) fn begin_move(
             "selected rollout is missing from move plan",
         ));
     }
-    let transaction = MoveTransaction {
+    let mut transaction = MoveTransaction {
         thread_id,
         direction,
         selected_destination: selected_destination.to_path_buf(),
@@ -85,11 +89,15 @@ pub(super) fn begin_move(
                     destination: destination.clone(),
                     source_id: rollout_file_identity(source)?,
                     source_digest: rollout_file_digest(source)?,
+                    preparation: None,
                 })
             })
             .collect::<io::Result<Vec<_>>>()?,
     };
-    let path = transaction_path(codex_home, thread_id);
+    if pending_move_exists(codex_home, thread_id)? {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
+    let path = seed::claim_path(codex_home, thread_id);
     match std::fs::symlink_metadata(&path) {
         Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -115,51 +123,60 @@ pub(super) fn begin_move(
             }
         }
     }
-    let mut journal = serde_json::to_vec(&transaction).map_err(io::Error::other)?;
-    journal.push(b'\n');
+    for pair in &mut transaction.moves {
+        let preparation = super::rollout_move_file::prepare_rollout_resources(&pair.source, &pair.destination)?;
+        verify_planned_source(pair)?;
+        pair.preparation = Some(preparation);
+    }
+    let journal = serde_json::to_vec(&transaction).map_err(io::Error::other)?;
     if journal.len() > MAX_MOVE_JOURNAL_BYTES {
         return Err(io::Error::other("pending rollout move is too large"));
     }
-    let journal_parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("missing journal parent"))?;
-    std::fs::create_dir_all(journal_parent)?;
-    #[cfg(unix)]
-    std::fs::File::open(codex_home)?.sync_all()?;
-    if !std::fs::canonicalize(journal_parent)?.starts_with(std::fs::canonicalize(codex_home)?) {
-        return Err(io::Error::other("rollout move journal escapes Codex home"));
-    }
-    let mut file = tempfile::Builder::new()
-        .prefix(".codex-move-transaction-")
-        .tempfile_in(journal_parent)?;
-    file.write_all(&journal)?;
-    file.as_file().sync_all()?;
-    file.persist_noclobber(&path).map_err(|err| err.error)?;
-    #[cfg(unix)]
-    std::fs::File::open(
-        path.parent()
-            .ok_or_else(|| io::Error::other("missing journal parent"))?,
-    )?
-    .sync_all()?;
+    // This exact-path, self-bound claim is durable before any mover allocates,
+    // publishes or quarantines resources. No random journal alias is created.
+    let mut claim = seed::create_with_plan(codex_home, thread_id, direction, &journal)?;
+    claim.complete(&journal)?;
+    drop(claim); // Release the owned handle before Windows cleanup can unlink it.
     Ok(PendingMove { path, transaction })
 }
 
 impl PendingMove {
+    fn validate_seed(&self) -> io::Result<()> {
+        if self.path.extension().is_some_and(|extension| extension == "seed") {
+            let home = self.path.parent().and_then(Path::parent)
+                .ok_or_else(|| io::Error::other("missing seed home"))?;
+            let seed::SeedRecord::Prepared(bytes) = seed::read(home, self.transaction.thread_id)? else {
+                return Err(io::Error::other("rollout move preparation is incomplete"));
+            };
+            let current: MoveTransaction = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            if current != self.transaction {
+                return Err(io::Error::other("rollout move claim changed"));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn move_all(&self, codex_home: &Path) -> io::Result<()> {
+        self.validate_seed()?;
         // A later replacement must not leave an earlier file published and quarantined.
         for pair in &self.transaction.moves {
             verify_planned_source(pair)?;
         }
         for pair in &self.transaction.moves {
-            move_rollout_noclobber_retained_bound(
-                &pair.source,
-                &pair.destination,
-                codex_home,
-                pair.source_id,
-                pair.source_digest,
-            )?;
+            self.validate_seed()?;
+            self.move_pair(pair, codex_home)?;
         }
         Ok(())
+    }
+
+    fn move_pair(&self, pair: &MovePair, home: &Path) -> io::Result<()> {
+        self.validate_seed()?;
+        if let Some(preparation) = &pair.preparation {
+            super::rollout_move_file::publish_prepared_resources(preparation, &pair.source,
+                &pair.destination, pair.source_id, pair.source_digest)?;
+        }
+        move_rollout_noclobber_retained_bound(&pair.source, &pair.destination, home,
+            pair.source_id, pair.source_digest)
     }
 
     pub(super) fn complete(self) -> io::Result<()> {
@@ -169,6 +186,12 @@ impl PendingMove {
     }
 
     fn abandon_unmoved(self) -> io::Result<()> {
+        self.validate_seed()?;
+        for pair in &self.transaction.moves {
+            if let Some(preparation) = &pair.preparation {
+                super::rollout_move_file::discard_prepared_resources(preparation)?;
+            }
+        }
         std::fs::remove_file(&self.path)?;
         #[cfg(unix)]
         std::fs::File::open(
@@ -181,6 +204,7 @@ impl PendingMove {
     }
 
     fn cleanup(self) -> io::Result<()> {
+        self.validate_seed()?;
         // Remove the transaction first. If cleanup stops here, the SQLite update is committed
         // and the remaining sidecars are harmless; begin_move clears them before reuse.
         std::fs::remove_file(&self.path)?;
@@ -208,6 +232,14 @@ impl PendingMove {
 pub(super) async fn replay_pending_move(
     store: &LocalThreadStore,
     thread_id: ThreadId,
+) -> ThreadStoreResult<Option<MoveDirection>> {
+    replay_pending_move_before_mutation(store, thread_id, || Ok(())).await
+}
+
+async fn replay_pending_move_before_mutation(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    before_mutation: impl FnOnce() -> io::Result<()>,
 ) -> ThreadStoreResult<Option<MoveDirection>> {
     let Some((pending, committed)) = load_move(store.config.codex_home.as_path(), thread_id)
         .map_err(|err| ThreadStoreError::Internal {
@@ -336,15 +368,15 @@ pub(super) async fn replay_pending_move(
                 });
             }
         }
+        before_mutation().map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed before pending rollout mutation: {err}"),
+        })?;
         for pair in &pending.transaction.moves {
+            pending.validate_seed().map_err(|err| ThreadStoreError::Internal {
+                message: format!("pending rollout claim changed before move: {err}"),
+            })?;
             if pair.source.exists() {
-                move_rollout_noclobber_retained_bound(
-                    &pair.source,
-                    &pair.destination,
-                    home,
-                    pair.source_id,
-                    pair.source_digest,
-                )
+                pending.move_pair(pair, home)
                 .map_err(|err| ThreadStoreError::Internal {
                     message: format!("failed to replay rollout move: {err}"),
                 })?;
@@ -369,6 +401,9 @@ pub(super) async fn replay_pending_move(
         } else {
             false
         };
+        pending.validate_seed().map_err(|err| ThreadStoreError::Internal {
+            message: format!("pending rollout claim changed before metadata transition: {err}"),
+        })?;
         if direction == MoveDirection::Unarchive && !already_updated {
             touch_modified_time(selected).map_err(|err| ThreadStoreError::Internal {
                 message: format!("failed to touch restored rollout: {err}"),
@@ -501,14 +536,39 @@ fn transaction_path(codex_home: &Path, thread_id: ThreadId) -> PathBuf {
 }
 
 pub(super) fn pending_move_exists(codex_home: &Path, thread_id: ThreadId) -> io::Result<bool> {
-    match std::fs::symlink_metadata(transaction_path(codex_home, thread_id)) {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
+    let mut present = false;
+    for path in [transaction_path(codex_home, thread_id), seed::claim_path(codex_home, thread_id)] {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                if present {
+                    return Err(io::Error::other("multiple rollout move claims for one thread"));
+                }
+                present = true;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
+    Ok(present)
 }
 
 fn load_move(codex_home: &Path, thread_id: ThreadId) -> io::Result<Option<(PendingMove, bool)>> {
+    if !pending_move_exists(codex_home, thread_id)? {
+        return Ok(None);
+    }
+    let seed_path = seed::claim_path(codex_home, thread_id);
+    match std::fs::symlink_metadata(&seed_path) {
+        Ok(_) => {
+            let bytes = match seed::read(codex_home, thread_id)? {
+                seed::SeedRecord::Prepared(bytes) => bytes,
+                seed::SeedRecord::Preparing => seed::recover_preparing(codex_home, thread_id)?,
+            };
+            let transaction: MoveTransaction = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+            return Ok(Some((PendingMove { path: seed_path, transaction }, false)));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
     let path = transaction_path(codex_home, thread_id);
     let Some(parent) = path.parent() else {
         return Err(io::Error::other("missing journal parent"));

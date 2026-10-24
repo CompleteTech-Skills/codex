@@ -71,3 +71,34 @@ pub(super) fn rollout_file_digest(path: &Path) -> io::Result<[u8; 32]> {
 #[cfg(test)]
 #[path = "rollout_move_identity_tests.rs"]
 mod tests;
+
+
+pub(super) fn rollout_directory_identity(path: &Path) -> io::Result<RolloutFileIdentity> {
+    if !std::fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(io::Error::other("rollout resource is not a directory"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_dir() || !std::fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(io::Error::other("rollout directory changed while opening"));
+    }
+    let identity = rollout_file_identity_from_handle(&file)?;
+    let current = options.open(path)?;
+    if !current.metadata()?.file_type().is_dir() || rollout_file_identity_from_handle(&current)? != identity {
+        return Err(io::Error::other("rollout directory identity changed while opening"));
+    }
+    Ok(identity)
+}

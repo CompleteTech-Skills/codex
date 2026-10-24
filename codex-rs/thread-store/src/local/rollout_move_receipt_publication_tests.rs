@@ -27,6 +27,7 @@ fn fixture() -> io::Result<(tempfile::TempDir, RolloutMoveIntent)> {
         stage_digest: rollout_file_digest(&stage_path)?,
         stage_path,
         quarantine_path: quarantine.join("quarantined-source"),
+        quarantine_id: None,
         receipt_publication: None,
     };
     Ok((home, intent))

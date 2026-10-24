@@ -177,10 +177,11 @@ fn pending_move_ids(codex_home: &Path) -> io::Result<Vec<ThreadId>> {
         }
         let stem = name
             .strip_suffix(".json")
+            .or_else(|| name.strip_suffix(".seed"))
             .ok_or_else(|| io::Error::other("invalid rollout move journal name"))?;
         let id = ThreadId::from_string(stem)
             .map_err(|_| io::Error::other("invalid rollout move journal thread ID"))?;
-        if name != format!("{id}.json") {
+        if name != format!("{id}.json") && name != format!("{id}.seed") {
             return Err(io::Error::other("noncanonical rollout move journal name"));
         }
         ids.push(id);
@@ -441,7 +442,6 @@ mod tests {
     use crate::MoveThreadToSectionParams;
     use crate::ThreadStore;
     use crate::local::LocalThreadStore;
-    use crate::local::rollout_move_file::tests::move_rollout_noclobber_retained;
     use crate::local::rollout_move_transaction::MoveDirection;
     use crate::local::rollout_move_transaction::begin_move;
     use crate::local::test_support::test_config;
@@ -481,7 +481,7 @@ mod tests {
             &destination,
             &[(source.clone(), destination.clone())],
         )?;
-        move_rollout_noclobber_retained(&source, &destination, home.path())?;
+        pending.move_all(home.path())?;
         drop(pending); // Simulate a crash before updating SQLite.
 
         let params = ListThreadsParams {
@@ -601,7 +601,7 @@ mod tests {
         assert!(
             home.path()
                 .join("rollout_move_transactions")
-                .join(format!("{thread_id}.json"))
+                .join(format!("{thread_id}.seed"))
                 .exists()
         );
         Ok(())
