@@ -91,12 +91,12 @@ async fn restore_overview_draft_after_blank_cache_is_lost(stale_pending: bool) -
 
 #[tokio::test]
 async fn pending_settings_override_saved_draft_after_blank_cache_is_lost() -> Result<()> {
-    restore_overview_draft_after_blank_cache_is_lost(false).await
+    restore_overview_draft_after_blank_cache_is_lost(/*stale_pending*/ false).await
 }
 
 #[tokio::test]
 async fn resumed_overview_prefers_server_settings_to_stale_pending_notification() -> Result<()> {
-    restore_overview_draft_after_blank_cache_is_lost(true).await
+    restore_overview_draft_after_blank_cache_is_lost(/*stale_pending*/ true).await
 }
 
 #[tokio::test]
