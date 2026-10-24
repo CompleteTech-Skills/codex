@@ -1,10 +1,14 @@
 use super::*;
+use crate::NamedNamespace;
+use crate::bootstrap_named_namespace;
+use crate::check_named_namespace_compatibility;
+use crate::named_bootstrap::namespaced_migrations;
 
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL v4 upgrade fixture"]
 async fn real_named_v4_upgrade_to_section_catalog_is_atomic() {
-    let Ok(state) = std::env::var("CODEX_TEST_POSTGRES_SECTION_UPGRADE_STATE") else {
-        return;
-    };
+    let state = std::env::var("CODEX_TEST_POSTGRES_SECTION_UPGRADE_STATE")
+        .expect("required disposable v4 upgrade fixture");
     let state = Path::new(&state);
     let namespace = NamedNamespace::new("codex_storage_isolation").expect("named fixture schema");
     let first = PostgresPool::connect(settings(state, "isolation_migrator"))
